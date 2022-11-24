@@ -155,7 +155,7 @@ namespace {
     }
 
     // Wrapper around oxenc::get_int that returns nullopt if the type is not an integer.
-    constexpr std::optional<int64_t> get_bt_int(const oxenc::bt_value& v) {
+    std::optional<int64_t> get_bt_int(const oxenc::bt_value& v) {
         if (!(std::holds_alternative<int64_t>(v) || std::holds_alternative<uint64_t>(v)))
             return std::nullopt;
         return oxenc::get_int<int64_t>(v);
