@@ -41,7 +41,7 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
 
     // Since it's empty there shouldn't be a name.
     const char* name = user_profile_get_name(conf);
-    CHECK(name == NULL);
+    CHECK(name == nullptr); // (should be NULL instead of nullptr in C)
 
     char* to_push;
     size_t to_push_len;
@@ -55,8 +55,8 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
 
     // This should also be unset:
     auto pic = user_profile_get_pic(conf);
-    CHECK(pic.url == NULL);
-    CHECK(pic.key == NULL);
+    CHECK(pic.url == nullptr); // (should be NULL instead of nullptr in C)
+    CHECK(pic.key == nullptr); // (should be NULL instead of nullptr in C)
     CHECK(pic.keylen == 0);
 
     // Now let's go set a profile name and picture:
@@ -69,7 +69,7 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
 
     // Retrieve them just to make sure they set properly:
     name = user_profile_get_name(conf);
-    REQUIRE(name != NULL);
+    REQUIRE(name != nullptr); // (should be NULL instead of nullptr in C)
     CHECK(name == "Kallie"sv);
 
     pic = user_profile_get_pic(conf);
