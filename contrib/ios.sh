@@ -19,7 +19,7 @@ for i in "ios-arm64 OS64" "sim-arm64 SIMULATORARM64" "sim-x86_64 SIMULATOR64"; d
     platform="${i[1]}"
     echo "Building ${i[0]} for $platform in $build"
     mkdir -p "$build"
-    cd "$build"
+    pushd "$build"
     cmake -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=../../external/ios-cmake/ios.toolchain.cmake \
         -DPLATFORM=$platform \
@@ -34,10 +34,10 @@ for i in "ios-arm64 OS64" "sim-arm64 SIMULATORARM64" "sim-x86_64 SIMULATOR64"; d
         ../..
 
     ninja -j${JOBS:-$(nproc)} -v libsession-util.a
-    cd ..
+    popd
 done
 
-pkg=libsession-util_ios_$(date --utc +%Y%m%d%H%M%S)
+pkg=libsession-util-ios
 pkg_dir=build-ios/$pkg
 
 # Combine simulator builds into a multi-arch lib
