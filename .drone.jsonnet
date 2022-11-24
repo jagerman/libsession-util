@@ -257,7 +257,7 @@ local mac_builder(name,
   {
     kind: 'pipeline',
     type: 'exec',
-    name: name,
+    name: 'iOS static lib',
     platform: { os: 'darwin', arch: 'amd64' },
     steps: [
       { name: 'submodules', commands: submodule_commands },
