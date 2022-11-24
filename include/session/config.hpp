@@ -3,6 +3,7 @@
 #include <oxenc/bt_serialize.h>
 #include <oxenc/bt_value.h>
 
+#include <array>
 #include <cassert>
 #include <optional>
 #include <set>
