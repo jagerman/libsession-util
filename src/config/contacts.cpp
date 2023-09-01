@@ -6,6 +6,7 @@
 #include <variant>
 
 #include "internal.hpp"
+#include "protos.hpp"
 #include "session/config/contacts.h"
 #include "session/config/error.h"
 #include "session/export.h"
@@ -14,6 +15,7 @@
 
 using namespace std::literals;
 using namespace session::config;
+using session::ustring;
 using session::ustring_view;
 
 LIBSESSION_C_API const size_t CONTACT_MAX_NAME_LENGTH = contact_info::MAX_NAME_LENGTH;

@@ -58,7 +58,7 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
     config_push_data* to_push = config_push(conf);
     REQUIRE(to_push);
     CHECK(to_push->seqno == 0);
-    CHECK(to_push->config_len == 256);
+    CHECK(to_push->config_len == 284);
     const char* enc_domain = "UserProfile";
     REQUIRE(config_encryption_domain(conf) == std::string_view{enc_domain});
     size_t to_push_decr_size;

@@ -414,7 +414,7 @@ TEST_CASE("huge contacts compression", "[config][compression][contacts]") {
 
     auto [seqno, to_push, obs] = contacts.push();
     CHECK(seqno == 1);
-    CHECK(to_push.size() == 46'080);
+    CHECK(to_push.size() == 46'112);
     auto dump = contacts.dump();
     // With tons of duplicate info the push should have been nicely compressible:
     CHECK(dump.size() > 1'320'000);

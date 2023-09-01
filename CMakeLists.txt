@@ -93,6 +93,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(external)
 add_subdirectory(src)
+add_subdirectory(proto)
 
 if(STATIC_BUNDLE)
     include(combine_archives)

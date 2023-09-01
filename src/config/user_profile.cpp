@@ -3,6 +3,7 @@
 #include <sodium/crypto_generichash_blake2b.h>
 
 #include "internal.hpp"
+#include "protos.hpp"
 #include "session/config/error.h"
 #include "session/config/user_profile.hpp"
 #include "session/export.h"

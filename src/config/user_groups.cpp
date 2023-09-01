@@ -13,6 +13,7 @@
 #include <variant>
 
 #include "internal.hpp"
+#include "protos.hpp"
 #include "session/config/error.h"
 #include "session/config/user_groups.h"
 #include "session/export.h"

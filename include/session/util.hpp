@@ -1,5 +1,8 @@
 #pragma once
+#include <sodium/randombytes.h>
+
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -37,6 +40,10 @@ inline std::string_view from_unsigned_sv(const std::array<unsigned char, N>& v) 
 template <typename T, typename A>
 inline std::string_view from_unsigned_sv(const std::vector<T, A>& v) {
     return {from_unsigned(v.data()), v.size()};
+}
+
+inline uint64_t get_timestamp() {
+    return std::chrono::steady_clock::now().time_since_epoch().count();
 }
 
 /// Returns true if the first string is equal to the second string, compared case-insensitively.

@@ -12,6 +12,7 @@
 #include <variant>
 
 #include "internal.hpp"
+#include "protos.hpp"
 #include "session/config/convo_info_volatile.h"
 #include "session/config/error.h"
 #include "session/export.h"
