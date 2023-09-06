@@ -1,7 +1,5 @@
 #include "protos.hpp"
 
-#include <iostream>
-
 #include "SessionProtos.pb.h"
 #include "WebSocketResources.pb.h"
 
