@@ -4,6 +4,13 @@ add_library(common INTERFACE)
 target_include_directories(common INTERFACE ../include ../proto)
 if(WARNINGS_AS_ERRORS)
     target_compile_options(common INTERFACE -Werror)
+    if (CMAKE_CXX_COMPILER_ID STREQUAL GNU AND
+            CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12 AND
+            CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+        # This warning is notoriously horrible for false positives (and the protobuf headers trigger
+        # it)
+        target_compile_options(common INTERFACE -Wno-error=stringop-overflow)
+    endif()
 endif()
 
 add_library(crypto
