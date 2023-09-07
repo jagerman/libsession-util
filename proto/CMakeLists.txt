@@ -15,6 +15,7 @@ FetchContent_Declare(
     GIT_PROGRESS    TRUE
 )
 
+set(protobuf_VERBOSE ON CACHE BOOL "" FORCE)
 set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
 set(protobuf_WITH_ZLIB OFF CACHE BOOL "" FORCE)
 set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
