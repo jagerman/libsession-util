@@ -141,6 +141,7 @@ local windows_cross_pipeline(name,
     '-DWITH_TESTS=' + (if tests then 'ON ' else 'OFF ') +
     '-DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-' + winarch + '-toolchain.cmake ' +
     cmake_extra,
+    'winecfg',  // Make sure a wine prefix is set up because otherwise the parallel wine protoc.exe can collide with each other trying to create the prefix
     'make VERBOSE=1 -j' + jobs,
   ],
   extra_steps=(if tests then
