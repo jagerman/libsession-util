@@ -66,11 +66,11 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
     size_t to_push_decr_size;
 
     // Get the de-protobufed pointer and length:
-    auto inner_data = to_push->config + PROTOBUF_DATA_OFFSET;
-    auto inner_len = to_push->config_len - PROTOBUF_OVERHEAD;
+    ustring_view inner{
+            to_push->config + PROTOBUF_DATA_OFFSET, to_push->config_len - PROTOBUF_OVERHEAD};
 
-    unsigned char* to_push_decrypted =
-            config_decrypt(inner_data, inner_len, ed_sk.data(), enc_domain, &to_push_decr_size);
+    unsigned char* to_push_decrypted = config_decrypt(
+            inner.data(), inner.size(), ed_sk.data(), enc_domain, &to_push_decr_size);
     REQUIRE(to_push_decrypted);
     CHECK(to_push_decr_size == 216);  // 256 - 40 overhead
     CHECK(printable(to_push_decrypted, to_push_decr_size) ==
@@ -153,11 +153,12 @@ TEST_CASE("user profile C API", "[config][user_profile][c]") {
             "056009a9ebf58d45d7d696b74e0c7ff0499c4d23204976f19561dc0dba6dc53a2497d28ce03498ea"
             "49bf122762d7bc1d6d9c02f6d54f8384"_hexbytes;
 
-    CHECK(oxenc::to_hex(inner_data, inner_data + inner_len) == to_hex(exp_push1_encrypted));
+    inner = {to_push->config + PROTOBUF_DATA_OFFSET, to_push->config_len - PROTOBUF_OVERHEAD};
+    CHECK(oxenc::to_hex(inner) == to_hex(exp_push1_encrypted));
 
     // Raw decryption doesn't unpad (i.e. the padding is part of the encrypted data)
-    to_push_decrypted =
-            config_decrypt(inner_data, inner_len, ed_sk.data(), enc_domain, &to_push_decr_size);
+    to_push_decrypted = config_decrypt(
+            inner.data(), inner.size(), ed_sk.data(), enc_domain, &to_push_decr_size);
     CHECK(to_push_decr_size == 256 - 40);
     CHECK(printable(to_push_decrypted, to_push_decr_size) ==
           printable(ustring(256 - 40 - exp_push1_decrypted.size(), '\0') + exp_push1_decrypted));
