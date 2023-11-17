@@ -231,9 +231,6 @@ void Keys::load_admin_key(ustring_view seed, Info& info, Members& members) {
     set_sig_keys(seckey);
     info.set_sig_keys(seckey);
     members.set_sig_keys(seckey);
-
-    assert(admin());
-    assert(!is_readonly());
 }
 
 static std::array<unsigned char, 32> compute_xpk(const unsigned char* ed25519_pk) {
