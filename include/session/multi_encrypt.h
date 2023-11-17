@@ -6,7 +6,7 @@ extern "C" {
 
 #include <stddef.h>
 
-#include "session/export.h"
+#include "export.h"
 
 /// API: crypto/session_encrypt_for_multiple_simple
 ///
