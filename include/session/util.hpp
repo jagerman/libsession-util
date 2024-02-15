@@ -87,6 +87,29 @@ inline constexpr bool end_with(std::string_view str, std::string_view suffix) {
     return str.size() >= suffix.size() && str.substr(str.size() - suffix.size()) == suffix;
 }
 
+/// Splits a string on some delimiter string and returns a vector of string_view's pointing into the
+/// pieces of the original string.  The pieces are valid only as long as the original string remains
+/// valid.  Leading and trailing empty substrings are not removed.  If delim is empty you get back a
+/// vector of string_views each viewing one character.  If `trim` is true then leading and trailing
+/// empty values will be suppressed.
+///
+///     auto v = split("ab--c----de", "--"); // v is {"ab", "c", "", "de"}
+///     auto v = split("abc", ""); // v is {"a", "b", "c"}
+///     auto v = split("abc", "c"); // v is {"ab", ""}
+///     auto v = split("abc", "c", true); // v is {"ab"}
+///     auto v = split("-a--b--", "-"); // v is {"", "a", "", "b", "", ""}
+///     auto v = split("-a--b--", "-", true); // v is {"a", "", "b"}
+///
+std::vector<std::string_view> split(std::string_view str, std::string_view delim, bool trim = false);
+
+/// Splits a string on any 1 or more of the given delimiter characters and returns a vector of
+/// string_view's pointing into the pieces of the original string.  If delims is empty this works
+/// the same as split().  `trim` works like split (suppresses leading and trailing empty string
+/// pieces).
+///
+///     auto v = split_any("abcdedf", "dcx"); // v is {"ab", "e", "f"}
+std::vector<std::string_view> split_any(std::string_view str, std::string_view delims, bool trim = false);
+
 // Calls sodium_malloc for secure allocation; throws a std::bad_alloc on allocation failure
 void* sodium_buffer_allocate(size_t size);
 // Frees a pointer constructed with sodium_buffer_allocate.  Does nothing if `p` is nullptr.

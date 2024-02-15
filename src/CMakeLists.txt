@@ -31,6 +31,8 @@ macro(add_libsession_util_library name)
     libsession_static_bundle(${name})
 
     list(APPEND export_targets ${name})
+
+    target_link_libraries(${name} PUBLIC common)
 endmacro()
 
 
@@ -76,11 +78,21 @@ add_libsession_util_library(config
     fields.cpp
 )
 
+add_libsession_util_library(onionreq
+    onionreq/builder.cpp
+    onionreq/hop_encryption.cpp
+    onionreq/key_types.cpp
+    onionreq/parser.cpp
+    onionreq/response_parser.cpp
+)
+
+add_libsession_util_library(comms
+    comms/quic.cpp
+)
+
 
 
 target_link_libraries(crypto
-    PUBLIC
-    common
     PRIVATE
     libsodium::sodium-internal
 )
@@ -88,33 +100,27 @@ target_link_libraries(crypto
 target_link_libraries(config
     PUBLIC
     crypto
-    common
     libsession::protos
     PRIVATE
     libsodium::sodium-internal
     libzstd::static
 )
 
-if(ENABLE_ONIONREQ)
-    add_libsession_util_library(onionreq
-        onionreq/builder.cpp
-        onionreq/hop_encryption.cpp
-        onionreq/key_types.cpp
-        onionreq/parser.cpp
-        onionreq/response_parser.cpp
-    )
+target_link_libraries(onionreq
+    PUBLIC
+    crypto
+    PRIVATE
+    nlohmann_json::nlohmann_json
+    libsodium::sodium-internal
+    nettle
+)
 
-    target_link_libraries(onionreq
-        PUBLIC
-        crypto
-        common
-        PRIVATE
-        nlohmann_json::nlohmann_json
-        libsodium::sodium-internal
-        nettle
-    )
-endif()
-
+target_link_libraries(comms
+    PUBLIC
+    onionreq
+    PRIVATE
+    quic
+)
 
 if(WARNINGS_AS_ERRORS AND NOT USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION MATCHES "^11\\.")
     # GCC 11 has an overzealous (and false) stringop-overread warning, but only when LTO is off.

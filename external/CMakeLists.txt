@@ -27,6 +27,7 @@ if(SUBMODULE_CHECK)
     check_submodule(ios-cmake)
     check_submodule(libsodium-internal)
     check_submodule(oxen-encoding)
+    check_submodule(oxen-libquic)
     check_submodule(nlohmann-json)
     check_submodule(zstd)
   endif()
@@ -104,6 +105,7 @@ endif()
 
 
 system_or_submodule(OXENC oxenc liboxenc>=1.0.10 oxen-encoding)
+system_or_submodule(QUIC quic liboxenquic>=1.0.0 oxen-libquic)
 
 
 if(CMAKE_C_COMPILER_LAUNCHER)
