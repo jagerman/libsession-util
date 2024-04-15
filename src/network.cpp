@@ -202,10 +202,8 @@ std::shared_ptr<oxen::quic::BTRequestStream> Network::get_btstream(const service
 
         target_path->conn = std::move(c);
     });
-    std::__1::shared_ptr<oxen::quic::BTRequestStream> str =
-            c->open_stream<oxen::quic::BTRequestStream>();
 
-    return str;
+    return c->open_stream<oxen::quic::BTRequestStream>();
 }
 
 void Network::send_request(const request_info info, network_response_callback_t handle_response) {
