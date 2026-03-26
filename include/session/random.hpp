@@ -20,7 +20,7 @@ struct CSRNG {
 
     uint64_t operator()() const {
         uint64_t i;
-        randombytes((uint8_t*)&i, sizeof(i));
+        randombytes_buf(&i, sizeof(i));
         return i;
     };
 };
