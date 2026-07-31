@@ -382,92 +382,9 @@ local static_build(name,
     }],
   },
 
-  {
-    name: 'API Documentation',
-    kind: 'pipeline',
-    type: 'docker',
-    steps: [{
-      name: 'build',
-      image: docker_base + 'debian-stable',
-      pull: 'always',
-      environment: { SSH_KEY: { from_secret: 'SSH_KEY' } },
-      commands: [
-        'echo "Building on ${DRONE_STAGE_MACHINE}"',
-        apt_get_quiet + ' update',
-        apt_get_quiet + ' install -y rsync python3-venv',
-        'cd docs/api/',
-        'python3 -m venv .venv',
-        '. .venv/bin/activate',
-        'pip install -r requirements.txt',
-        'make build-all',
-        '../../utils/ci/drone-docs-upload.sh',
-      ],
-    }],
-    trigger: { branch: ['dev'], event: ['push'] },
-  },
-
-  // Various debian builds
-  debian_build('Debian sid', docker_base + 'debian-sid'),
 
   // Live Pro-backend integration tests (ephemeral backend + [pro_live]).
   pro_backend_live_pipeline('Debian sid (Pro backend live)', docker_base + 'debian-sid'),
 
-  debian_build('Debian sid/Debug', docker_base + 'debian-sid', build_type='Debug'),
-  debian_build('Debian testing', docker_base + 'debian-testing'),
-  clang(19),
-  full_llvm(19),
-  debian_build('Debian stable (i386)', docker_base + 'debian-stable/i386'),
-  debian_build('Debian 12', docker_base + 'debian-bookworm'),
-  debian_build('Ubuntu latest', docker_base + 'ubuntu-rolling'),
-  debian_build('Ubuntu LTS', docker_base + 'ubuntu-lts'),
 
-  // ARM builds (ARM64 and armhf)
-  debian_build('Debian sid (ARM64)', docker_base + 'debian-sid', arch='arm64', jobs=4),
-  debian_build('Debian stable (armhf)', docker_base + 'debian-stable/arm32v7', arch='arm64', jobs=4),
-
-  // Macos builds:
-  mac_builder('macOS Intel (Release)', allow_test_fail=true/*the current intel mac has issues*/),
-  mac_builder('macOS Arm64 (Release)', arch='arm64'),
-  mac_builder('macOS Arm64 (Debug)', arch='arm64', build_type='Debug'),
-
-  // Static lib builds
-  static_build('Static Linux/amd64', docker_base + 'debian-stable', 'libsession-util-linux-amd64-TAG.tar.xz'),
-  static_build('Static Linux/i386', docker_base + 'debian-stable', 'libsession-util-linux-i386-TAG.tar.xz'),
-  static_build('Static Linux/arm64', docker_base + 'debian-stable', 'libsession-util-linux-arm64-TAG.tar.xz', arch='arm64'),
-  static_build('Static Linux/armhf', docker_base + 'debian-stable/arm32v7', 'libsession-util-linux-armhf-TAG.tar.xz', arch='arm64'),
-  static_build('Static Windows x64',
-               docker_base + 'debian-win32-cross',
-               'libsession-util-windows-x64-TAG.zip',
-               deps=['g++-mingw-w64-x86-64-posix'],
-               cmake_extra='-DCMAKE_CXX_FLAGS=-fdiagnostics-color=always -DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-x86-64-toolchain.cmake -DENABLE_NETWORKING_SROUTER=OFF'),
-  /*  currently broken:
-  static_build('Static Windows x86',
-               docker_base + 'debian-win32-cross',
-               'libsession-util-windows-x86-TAG.zip',
-               deps=['g++-mingw-w64-i686-posix'],
-               allow_fail=true,
-               cmake_extra='-DCMAKE_CXX_FLAGS=-fdiagnostics-color=always -DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-i686-toolchain.cmake'),
-  */
-  debian_pipeline(
-    'Static Android',
-    docker_base + 'android',
-    build=[
-      'export JOBS=6',
-      'export NDK=/usr/lib/android-ndk',
-      './utils/android.sh libsession-util-android-TAG.tar.xz',
-      'cd build-android && ../utils/ci/drone-static-upload.sh',
-    ]
-  ),
-
-  mac_pipeline('Static macOS', arch='arm64', build=[
-    'export JOBS=6',
-    './utils/macos.sh',
-    'cd build-macos && ../utils/ci/drone-static-upload.sh',
-  ]),
-
-  mac_pipeline('Static iOS', arch='arm64', build=[
-    'export JOBS=6',
-    './utils/ios.sh libsession-util-ios-TAG',
-    'cd build-ios && ../utils/ci/drone-static-upload.sh',
-  ]),
 ]
