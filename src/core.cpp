@@ -64,15 +64,13 @@ predefined_seed::predefined_seed(
         std::span<const std::string_view> words, std::string_view lang_name) :
         predefined_seed{words, mnemonics::get_language(lang_name)} {}
 
-void Core::LoopDeleter::operator()(quic::Loop* p) const {
+void Core::NetworkDeleter::operator()(network::Network* p) const {
     delete p;
 }
 
 void Core::init() {
     if (sodium_init() < 0)
         throw std::runtime_error{"libsodium initialization failed!"};
-
-    _loop.reset(new quic::Loop());
 
     apply_migrations();
 
@@ -89,23 +87,27 @@ void Core::register_comp_init(detail::CoreComponent* c) {
 }
 
 quic::Loop& Core::loop() {
-    return *_loop;
+    return _loop;
 }
 
-void Core::set_network(std::shared_ptr<network::Network> network) {
+void Core::set_network(std::unique_ptr<network::Network> network) {
     // Polling signs its retrieve requests with the account key, so attaching a network before the
     // account has an identity would fail inside a background poll rather than here.  Refuse at the
     // call site, where the ordering mistake actually is.
     if (network && !globals.have_account())
         throw no_account{};
 
-    _network = std::move(network);
+    // Ownership moves in via release() because the two pointer types differ deliberately: the
+    // parameter is a plain unique_ptr so callers can hand over a std::make_unique, while the
+    // member's deleter (which is just `delete`) is what keeps Network an incomplete type in
+    // core.hpp -- including session_network.hpp there costs ~6x the compile time per file.
+    _network.reset(network.release());
     _update_polling();
 }
 
 void Core::_update_polling() {
     if (_network && !_poll_ticker) {
-        _poll_ticker = _loop->call_every(_poll_interval, [this] { _poll(); });
+        _poll_ticker = _loop.call_every(_poll_interval, [this] { _poll(); });
     } else if (!_network && _poll_ticker) {
         _poll_ticker->stop();
         _poll_ticker.reset();
@@ -119,11 +121,13 @@ void Core::set_poll_interval(std::chrono::milliseconds interval) {
         _poll_ticker.reset();
     }
     if (_network)
-        _poll_ticker = _loop->call_every(_poll_interval, [this] { _poll(); });
+        _poll_ticker = _loop.call_every(_poll_interval, [this] { _poll(); });
 }
 
 void Core::_poll() {
-    auto net = _network;
+    // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
+    // could make the loop thread the last owner and run ~Network there.
+    auto* net = _network.get();
     if (!net) {
         log::debug(cat, "Not polling: no network attached");
         return;
@@ -330,7 +334,9 @@ ON CONFLICT(namespace, sn_pubkey) DO UPDATE SET last_hash = excluded.last_hash
 }
 
 PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
-    auto net = _network;
+    // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
+    // could make the loop thread the last owner and run ~Network there.
+    auto* net = _network.get();
     if (!net)
         throw std::logic_error{"prefetch_pfs_keys called without a network object"};
 
@@ -559,7 +565,9 @@ void Core::_send_to_swarm(
         std::vector<std::byte> payload,
         std::chrono::milliseconds ttl,
         std::function<void(bool success, std::optional<std::string_view> swarm_hash)> on_complete) {
-    auto net = _network;
+    // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
+    // could make the loop thread the last owner and run ~Network there.
+    auto* net = _network.get();
     if (!net)
         throw std::logic_error{"_send_to_swarm: no network object"};
 
