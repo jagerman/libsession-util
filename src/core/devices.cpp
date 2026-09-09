@@ -22,6 +22,7 @@
 #include <session/encrypt.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
+#include <session/placeholders.hpp>
 #include <session/random.hpp>
 #include <session/sqlite.hpp>
 #include <session/types.hpp>
@@ -1610,6 +1611,11 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     c.prepared_exec(
             "DELETE FROM device_link_requests WHERE received_at < ?",
             epoch_seconds(clock_now_s() - LINK_REQUEST_MAX_AGE));
+
+    // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
+    // on top of everything this fetch merged.  A local change made between fetches waits for the
+    // next one, which is what stops two devices answering the same update with duelling pushes.
+    push_device_group();
 }
 
 void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool /*is_final*/) {
@@ -1670,13 +1676,77 @@ Devices::NeedsPush Devices::needs_push() {
     return {.device_group = bool(dg), .account_pubkey = bool(ap)};
 }
 
-void Devices::mark_device_group_pushed(int64_t seqno) {
+void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
-    c.prepared_exec("UPDATE devices SET pushed_seqno = ? WHERE unique_id = ?", seqno, self_id);
-    c.prepared_exec("UPDATE devices SET broadcast_needed = 0");
-    c.prepared_exec("UPDATE device_account_keys SET distributed = 1");
+    c.prepared_exec(
+            "UPDATE devices SET pushed_seqno = ?, pushed_hash = ? WHERE unique_id = ?",
+            push.seqno,
+            hash,
+            self_id);
+
+    if (!push.broadcast.empty())
+        c.prepared_exec(
+                "UPDATE devices SET broadcast_needed = 0 WHERE unique_id IN ({})"_format(
+                        sqlite::placeholders(push.broadcast.size())),
+                sqlite::bind_each{push.broadcast});
+
+    if (!push.keys.empty())
+        c.prepared_exec(
+                "UPDATE device_account_keys SET distributed = 1 WHERE id IN ({})"_format(
+                        sqlite::placeholders(push.keys.size())),
+                sqlite::bind_each{push.keys});
+
     tx.commit();
+}
+
+void Devices::push_device_group() {
+    if (_push_in_flight)
+        return;
+    if (!needs_push().device_group)
+        return;
+
+    DeviceGroupPush push;
+    try {
+        push = build_device_group_message();
+    } catch (const std::exception& e) {
+        log::warning(cat, "Not pushing device group: {}", e.what());
+        return;
+    }
+
+    // The message this one replaces, if we have ever landed one.  Namespace 21 holds every message
+    // rather than only the newest, and the group is the union of what every device published, so
+    // only our own predecessor may be deleted -- never another device's.
+    std::vector<std::string> obsolete;
+    if (auto prev = conn().prepared_maybe_get<std::optional<std::string>>(
+                                  "SELECT pushed_hash FROM devices WHERE unique_id = ?", self_id)
+                            .value_or(std::nullopt))
+        obsolete.push_back(std::move(*prev));
+
+    std::vector<SwarmStore> stores;
+    stores.push_back(
+            {.ns = config::Namespace::Devices,
+             .data = push.message,
+             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+
+    _push_in_flight = true;
+
+    core._swarm_push(
+            std::move(stores),
+            std::move(obsolete),
+            [this, alive = std::weak_ptr<int>{_alive}, push = std::move(push)](
+                    std::optional<std::vector<SwarmStoreResult>> results) {
+                if (alive.expired())
+                    return;
+                _push_in_flight = false;
+
+                if (!results || results->empty() || !results->front().stored) {
+                    log::warning(cat, "Device group push was not stored; leaving it owed");
+                    return;
+                }
+
+                mark_device_group_pushed(push, std::move(results->front().hash));
+            });
 }
 
 std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotation() {
@@ -1737,7 +1807,21 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     if (self == devs.end() || self->second.state != device::State::Registered)
         throw std::logic_error{"Cannot build device group message: this device is not registered"};
 
-    return {encrypt_device_data(devs), self->second.seqno};
+    DeviceGroupPush push;
+    push.seqno = self->second.seqno;
+
+    // Read in the same breath as the payload, so that what the confirm clears is what the message
+    // actually contains rather than whatever is owed by the time the swarm answers.
+    auto c = conn();
+    for (auto id : c.prepared_results<sqlite::blob_guts<std::array<std::byte, 32>>>(
+                 "SELECT unique_id FROM devices WHERE broadcast_needed"))
+        push.broadcast.push_back(id);
+    for (auto id :
+         c.prepared_results<int64_t>("SELECT id FROM device_account_keys WHERE NOT distributed"))
+        push.keys.push_back(id);
+
+    push.message = encrypt_device_data(devs);
+    return push;
 }
 
 std::vector<std::byte> Devices::build_account_pubkey_message() {

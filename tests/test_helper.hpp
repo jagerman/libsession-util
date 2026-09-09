@@ -238,6 +238,36 @@ inline std::vector<MockNetwork::SentRequest*> stores(MockNetwork& net) {
     return found;
 }
 
+/// The swarm polls a MockNetwork has captured.  Filtered rather than taken wholesale for the same
+/// reason as `stores()`: a poll is a "batch" of retrieves and a push is a "sequence", so a test
+/// that counts requests to check how many times it polled also counts whatever the poll went on to
+/// send.
+inline std::vector<MockNetwork::SentRequest*> polls(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "batch")
+            found.push_back(&r);
+    return found;
+}
+
+/// The swarm pushes a MockNetwork has captured.  A push is a "sequence" of store subrequests
+/// followed by at most one delete, so its payload is inside the body rather than in the request
+/// itself the way a bare "store" endpoint's is.
+inline std::vector<MockNetwork::SentRequest*> pushes(MockNetwork& net) {
+    std::vector<MockNetwork::SentRequest*> found;
+    for (auto& r : net.sent_requests)
+        if (r.request.endpoint == "sequence")
+            found.push_back(&r);
+    return found;
+}
+
+/// The subrequests a push carries, in the order they will be applied.
+inline nlohmann::json push_requests(const MockNetwork::SentRequest& r) {
+    if (!r.request.body)
+        throw std::logic_error{"push request has no body"};
+    return parse_json(*r.request.body)["requests"];
+}
+
 /// The JSON a store request carries, which is where the namespace and the payload are.
 inline nlohmann::json store_body(const MockNetwork::SentRequest& r) {
     if (!r.request.body)

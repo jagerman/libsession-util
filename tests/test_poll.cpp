@@ -310,14 +310,15 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     // The request is stored, but the batch was not final, so nothing has been reported yet.
     CHECK(calls == 0);
 
-    REQUIRE(mock_net->sent_requests.size() == 2);
-    auto second = *mock_net->sent_requests[1].request.body;
+    auto sent = polls(*mock_net);
+    REQUIRE(sent.size() == 2);
+    auto second = *sent[1]->request.body;
     CHECK(namespaces_in(second) == std::vector<int16_t>{21});
     CHECK(params_for(second, 21)["last_hash"] == "hash1");
 
     // Nothing left behind it: an empty answer is still an answer, and is what makes the batch
     // final.
-    auto reply2 = mock_net->sent_requests[1].callback;
+    auto reply2 = sent[1]->callback;
     reply2(true, false, 200, {}, make_empty_response(second).dump());
     TestHelper::drain(*core);
 
@@ -340,5 +341,105 @@ TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]"
     TestHelper::drain(*core);
 
     // There is no new hash to move the cursor to, so another round would ask the same question.
-    CHECK(mock_net->sent_requests.size() == 1);
+    // Counting polls rather than requests: a completed fetch also pushes whatever the group owes,
+    // which a fresh account always does.
+    CHECK(polls(*mock_net).size() == 1);
+}
+
+// Answers the poll for namespace 21 with nothing, which is what makes the fetch final and is what
+// the group push hangs off.
+static void finish_poll(core::Core& core, MockNetwork& net) {
+    auto p = polls(net);
+    REQUIRE(!p.empty());
+    auto& last = *p.back();
+    auto body = *last.request.body;
+    auto reply = last.callback;
+    reply(true, false, 200, {}, make_empty_response(body).dump());
+    TestHelper::drain(core);
+}
+
+TEST_CASE(
+        "Devices: a completed fetch pushes the group, and the next push replaces it",
+        "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    // A generated account registers itself and mints its first account key seed, so a push is owed
+    // from the start and nothing has to dirty it first.
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto reqs = push_requests(*sent[0]);
+
+    // One store and no delete: there is no earlier message of ours to replace yet.
+    REQUIRE(reqs.size() == 1);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[0]["params"]["namespace"] == 21);
+    CHECK(reqs[0]["params"]["ttl"] ==
+          std::chrono::milliseconds{core::Devices::DEVICE_GROUP_TTL}.count());
+
+    auto confirm = sent[0]->callback;
+    confirm(true,
+            false,
+            200,
+            {},
+            nlohmann::json{{"results", {{{"code", 200}, {"body", {{"hash", "group1"}}}}}}}.dump());
+    TestHelper::drain(*core);
+
+    // Confirmed, so nothing is owed and a second fetch pushes nothing.
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+    CHECK(pushes(*mock_net).size() == 1);
+
+    // Dirty it again: our own record changed, so the group has something new to say.
+    core::device::Info info{};
+    info.type = core::device::Type::Session_CLI;
+    info.description = "a second thing to say";
+    core->devices.update_info(info, await);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 2);
+    reqs = push_requests(*sent[1]);
+
+    // The store, then a delete naming what the first push left in the swarm.  Namespace 21 keeps
+    // every message, so without this the old one sits there for its whole TTL.
+    REQUIRE(reqs.size() == 2);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[1]["method"] == "delete");
+    CHECK(reqs[1]["params"]["messages"] == nlohmann::json::array({"group1"}));
+}
+
+TEST_CASE(
+        "Devices: a key minted while a push is in flight is still owed", "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto confirm = sent[0]->callback;
+
+    // Between the message being built and the swarm answering.  This seed is in no message that has
+    // been sent, so confirming the one in flight must not mark it distributed -- no other device
+    // would ever receive it, and messages encrypted to it would be undecryptable for them.
+    core->devices.rotate_account_keys();
+
+    confirm(true,
+            false,
+            200,
+            {},
+            nlohmann::json{{"results", {{{"code", 200}, {"body", {{"hash", "group1"}}}}}}}.dump());
+    TestHelper::drain(*core);
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    CHECK(pushes(*mock_net).size() == 2);
 }

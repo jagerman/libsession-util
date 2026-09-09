@@ -16,6 +16,10 @@ CREATE TABLE devices (
     processing INTEGER,  -- non-null during batch processing: 1=new link request, 2=newly registered, 3=newly removed
     seqno INTEGER NOT NULL DEFAULT 1,
     pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
+    -- Swarm hash of that push, so the next one can delete it.  Namespace 21 keeps every message and
+    -- a new push does not displace its predecessor, so without this each push leaves a copy behind
+    -- for the whole 30-day TTL.  Only ever set on this device's own row.
+    pushed_hash TEXT,
     broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER,  -- set when the device was kicked from the device group

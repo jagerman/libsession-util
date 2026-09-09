@@ -175,6 +175,12 @@ class Devices final : detail::CoreComponent {
 
     void init() override;
 
+    // Guards against a second push being built before the first is confirmed; see
+    // push_device_group().  `_alive` is what a push callback checks before touching us, since it
+    // returns on the network's thread and this component does not outlive its Core.
+    bool _push_in_flight = false;
+    std::shared_ptr<int> _alive = std::make_shared<int>(0);
+
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence
     // a stored flag rather than doing the work there.
@@ -317,6 +323,11 @@ class Devices final : detail::CoreComponent {
     static constexpr auto ACCOUNT_KEY_ROTATION_PERIOD = 12h;
     static constexpr auto ACCOUNT_KEY_ROTATION_WINDOW = 2h;
 
+    // How long the swarm holds a device group message.  The maximum a private namespace allows: the
+    // group is what a device that has been away comes back to, and an account whose devices are all
+    // offline for longer than this loses the only record of what its group is.
+    static constexpr auto DEVICE_GROUP_TTL = 30 * 24h;
+
     // How long to keep a pending link request before pruning it as stale.
     static constexpr auto LINK_REQUEST_MAX_AGE = 10min;
 
@@ -358,6 +369,12 @@ class Devices final : detail::CoreComponent {
     struct DeviceGroupPush {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
         int64_t seqno;                   // this device's seqno at the moment the message was built
+
+        // What this message carries that was owed, so that confirming it clears exactly that and no
+        // more.  A device kicked, or a key minted, while the push was in flight is not in these and
+        // therefore stays owed -- it would otherwise be marked clean by a message it never reached.
+        std::vector<std::array<std::byte, 32>> broadcast;  // device ids whose transition it carries
+        std::vector<int64_t> keys;  // device_account_keys rows it distributes
     };
 
     // Builds the account's device group ("G") message for upload to Namespace::Devices.
@@ -396,10 +413,17 @@ class Devices final : detail::CoreComponent {
     // on the swarm (i.e. neither we nor another device has pushed it and we've received it back).
     NeedsPush needs_push();
 
-    // Marks the device group message as successfully pushed with the given own-device seqno (which
-    // the caller reads from device_info() before building the push message).  Updates pushed_seqno,
-    // clears broadcast_needed on all device rows, and marks all account key seeds as distributed.
-    void mark_device_group_pushed(int64_t seqno);
+    // Records that a built device group message reached the swarm: stores its seqno and hash
+    // against this device's row, and clears what `push` said it carried.  `hash` is what the next
+    // push names to delete this one.
+    void mark_device_group_pushed(const DeviceGroupPush& push, std::string hash);
+
+    // Builds and uploads the device group message, if one is owed and this device is registered.
+    //
+    // Does nothing while a push is already in flight: the message is built from a snapshot of the
+    // database, so a second one built before the first is confirmed would carry the same records
+    // and race it to say what was pushed.
+    void push_device_group();
 };
 
 }  // namespace session::core
