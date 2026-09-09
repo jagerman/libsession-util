@@ -16,10 +16,6 @@ CREATE TABLE devices (
     processing INTEGER,  -- non-null during batch processing: 1=new link request, 2=newly registered, 3=newly removed
     seqno INTEGER NOT NULL DEFAULT 1,
     pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
-    -- Swarm hash of that push, so the next one can delete it.  Namespace 21 keeps every message and
-    -- a new push does not displace its predecessor, so without this each push leaves a copy behind
-    -- for the whole 30-day TTL.  Only ever set on this device's own row.
-    pushed_hash TEXT,
     broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER,  -- set when the device was kicked from the device group
@@ -61,6 +57,22 @@ CREATE TABLE device_link_requests (
     device INTEGER UNIQUE NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     received_at INTEGER NOT NULL,  -- unix timestamp of when this request was stored locally
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16)  -- 16-byte Argon2id output for SAS display
+) STRICT;
+
+-- Device group messages whose contents we have taken in, and which our own next push therefore
+-- makes redundant.
+--
+-- A "G" is not one device's contribution but a complete snapshot of the whole group as its author
+-- saw it, so obsolescence has nothing to do with who wrote it: once we have merged one, the message
+-- we push next carries everything it said, and a device that never fetched it gets the same content
+-- from ours.  Leaving them costs a copy per push per device for the full 30-day TTL, and leaves a
+-- device that goes away permanently littering the namespace with snapshots nobody can clear.
+--
+-- Only messages we could decrypt are ever listed.  One we cannot read belongs to a group we are not
+-- in, and our push carries none of it -- deleting that would destroy another group's state rather
+-- than tidy up our own.
+CREATE TABLE device_group_merged (
+    hash TEXT PRIMARY KEY NOT NULL
 ) STRICT;
 
 -- This table holds current and recent device private keys for *this* device, including the

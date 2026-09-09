@@ -415,6 +415,31 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices: a push obsoletes what it merged, not only what it wrote",
+        "[core][poll][devices]") {
+    TempCore core;
+    auto* mock_net = attach_mock_network(*core);
+
+    // A snapshot from another device, arriving under a hash of its own.  A "G" carries the whole
+    // group rather than its author's part of it, so once we have taken its contents in, the message
+    // we push next says everything it said -- which is what makes it redundant, whoever wrote it.
+    auto theirs = core->devices.build_device_group_message().message;
+    TestHelper::receive_device_group_message(core->devices, theirs, "theirs1");
+
+    TestHelper::poll(*core);
+    finish_poll(*core, *mock_net);
+
+    auto sent = pushes(*mock_net);
+    REQUIRE(sent.size() == 1);
+    auto reqs = push_requests(*sent[0]);
+
+    REQUIRE(reqs.size() == 2);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[1]["method"] == "delete");
+    CHECK(reqs[1]["params"]["messages"] == nlohmann::json::array({"theirs1"}));
+}
+
+TEST_CASE(
         "Devices: a key minted while a push is in flight is still owed", "[core][poll][devices]") {
     TempCore core;
     auto* mock_net = attach_mock_network(*core);

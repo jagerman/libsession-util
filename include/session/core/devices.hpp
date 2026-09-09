@@ -193,7 +193,11 @@ class Devices final : detail::CoreComponent {
 
     // Processes a single incoming device group ("D") or link request ("L") message.  `data` is the
     // full raw message bytes including the outer bt-dict wrapper with the "" type key.
-    void receive_device_group_message(std::span<const std::byte> data);
+    //
+    // The group message takes the swarm hash as well, because merging one is what makes it
+    // redundant: our next push carries its contents forward, and that is when it can be deleted.
+    // Recorded only on a message we could decrypt -- see `device_group_merged`.
+    void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
     void receive_link_request(std::span<const std::byte> data);
 
     // Handlers for incoming swarm messages by namespace, called from Core::receive_messages.
@@ -375,6 +379,12 @@ class Devices final : detail::CoreComponent {
         // therefore stays owed -- it would otherwise be marked clean by a message it never reached.
         std::vector<std::array<std::byte, 32>> broadcast;  // device ids whose transition it carries
         std::vector<int64_t> keys;  // device_account_keys rows it distributes
+
+        // Messages this one makes redundant: everything we had merged when it was built, whoever
+        // wrote it.  A "G" is a snapshot of the whole group rather than one device's contribution,
+        // so what obsoletes it is having taken its contents in, not having written it.  Deleted in
+        // the same sequence that stores this one, after it.
+        std::vector<std::string> obsolete;
     };
 
     // Builds the account's device group ("G") message for upload to Namespace::Devices.

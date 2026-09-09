@@ -566,9 +566,12 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return d.decrypt_device_data(data);
     }
 
-    // Feeds an encrypted device group message through the receive path, as a poll would.
-    static void receive_device_group_message(core::Devices& d, std::span<const std::byte> data) {
-        d.receive_device_group_message(data);
+    // Feeds an encrypted device group message through the receive path, as a poll would.  The hash
+    // defaults to empty, which is a message with no swarm identity: merged, but never recorded as
+    // something a push supersedes.
+    static void receive_device_group_message(
+            core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
+        d.receive_device_group_message(data, hash);
     }
 
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.

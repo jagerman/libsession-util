@@ -1088,7 +1088,8 @@ static const std::string REGISTER_DEVICE_SQL =
 static const std::string REASSERT_KICK_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
-void Devices::receive_device_group_message(std::span<const std::byte> data) {
+void Devices::receive_device_group_message(
+        std::span<const std::byte> data, const std::string& hash) {
     GroupPayload payload;
     try {
         auto raw = decrypt_device_data(std::as_bytes(data));
@@ -1165,6 +1166,13 @@ void Devices::receive_device_group_message(std::span<const std::byte> data) {
         if (!was_registered)
             c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
     }
+
+    // Recorded whether or not the merge changed anything: a message that told us only what we
+    // already knew is just as redundant as one that told us something new, and our next push
+    // carries its contents either way.  A message we could not decrypt never reaches here.
+    if (!hash.empty())
+        c.prepared_exec(
+                "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
     tx.commit();
 }
@@ -1480,7 +1488,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             oxenc::bt_dict_consumer in{msg.data};
             auto type = in.require<std::string_view>("");
             if (type == "G")
-                receive_device_group_message(msg.data);
+                receive_device_group_message(msg.data, msg.hash);
             else if (type == "L")
                 receive_link_request(msg.data);
             else
@@ -1679,11 +1687,22 @@ Devices::NeedsPush Devices::needs_push() {
 void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
-    c.prepared_exec(
-            "UPDATE devices SET pushed_seqno = ?, pushed_hash = ? WHERE unique_id = ?",
-            push.seqno,
-            hash,
-            self_id);
+    c.prepared_exec("UPDATE devices SET pushed_seqno = ? WHERE unique_id = ?", push.seqno, self_id);
+
+    // Gone from the swarm, so stop naming them.  Scoped to what this message carried: one merged
+    // while the push was in flight was not deleted and is not superseded by it.
+    if (!push.obsolete.empty())
+        c.prepared_exec(
+                "DELETE FROM device_group_merged WHERE hash IN ({})"_format(
+                        sqlite::placeholders(push.obsolete.size())),
+                sqlite::bind_each{push.obsolete});
+
+    // Our own message is now the newest snapshot, and the next push supersedes it in turn -- by the
+    // same rule as everyone else's, since what makes a snapshot redundant is that its contents have
+    // been carried forward, not who wrote it.
+    if (!hash.empty())
+        c.prepared_exec(
+                "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
     if (!push.broadcast.empty())
         c.prepared_exec(
@@ -1714,15 +1733,6 @@ void Devices::push_device_group() {
         return;
     }
 
-    // The message this one replaces, if we have ever landed one.  Namespace 21 holds every message
-    // rather than only the newest, and the group is the union of what every device published, so
-    // only our own predecessor may be deleted -- never another device's.
-    std::vector<std::string> obsolete;
-    if (auto prev = conn().prepared_maybe_get<std::optional<std::string>>(
-                                  "SELECT pushed_hash FROM devices WHERE unique_id = ?", self_id)
-                            .value_or(std::nullopt))
-        obsolete.push_back(std::move(*prev));
-
     std::vector<SwarmStore> stores;
     stores.push_back(
             {.ns = config::Namespace::Devices,
@@ -1730,6 +1740,11 @@ void Devices::push_device_group() {
              .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
 
     _push_in_flight = true;
+
+    // Copied out before the call rather than passed as `push.obsolete`: the callback below captures
+    // `push` by move, and the order the two arguments are evaluated in is unspecified, so reading
+    // it inline can hand over an empty list from an already-moved-from struct.
+    auto obsolete = push.obsolete;
 
     core._swarm_push(
             std::move(stores),
@@ -1819,6 +1834,8 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     for (auto id :
          c.prepared_results<int64_t>("SELECT id FROM device_account_keys WHERE NOT distributed"))
         push.keys.push_back(id);
+    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        push.obsolete.push_back(std::move(hash));
 
     push.message = encrypt_device_data(devs);
     return push;
