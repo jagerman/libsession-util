@@ -553,6 +553,9 @@ class Client {
     /// called at all on a cache hit: there is no progress to draw when the bytes are already here,
     /// and a progress bar that flashes for a cached read is worse than none.
     ///
+    /// Our own account's picture is read from the account rather than from the note-to-self
+    /// conversation, so it is there on an account that has never used that conversation.
+    ///
     /// Returns nullopt when there is no picture to fetch — nobody has told us of one, or this is a
     /// group or community, whose pictures are real but not wired up yet.  An actual failure to
     /// fetch reports through `cb`'s error rather than as nullopt, so "there isn't one" and "we
@@ -567,6 +570,47 @@ class Client {
             result_function<std::optional<std::vector<std::byte>>> cb);
     void profile_picture(
             const ConversationId& id, result_function<std::optional<std::vector<std::byte>>> cb);
+
+    /// Uploads `path` to the file server and publishes it as this account's display picture.
+    ///
+    /// The file is encrypted before it leaves, keyed on the account and the bytes together, so
+    /// re-uploading an unchanged picture produces identical ciphertext and the file server keeps
+    /// one copy of it.  What reaches the config, and through it every other device, is the
+    /// download url and the key that opens it.
+    ///
+    /// Whatever bytes it is handed are the bytes that go up: nothing here decodes, scales or
+    /// re-encodes the image, because libsession has no image decoder and a client that has one has
+    /// already made the choices — crop, square, format — that a picture needs.  A file too large to
+    /// encrypt is refused rather than shrunk.
+    ///
+    /// `on_progress` reports the upload as `profile_picture` reports a download — `done`/`total` in
+    /// encrypted bytes while it runs, then `result` holding success once the picture is published,
+    /// or the same error `cb` gets.
+    ///
+    /// `cb` fires when the config has been written, which is when the picture becomes ours as far
+    /// as the rest of the account is concerned; pushing that config to the swarm follows on its
+    /// own and is not waited for here.  There is deliberately no waiting form: this is a network
+    /// round trip, and the loop a caller would block on is the one that has to run for it to
+    /// finish.
+    ///
+    /// Fails with `err::network_unavailable` if no network is attached, and `err::upload_failed`
+    /// with the status in the message if the file server does not take the file.
+    ///
+    /// @throws std::invalid_argument if `path` is not a regular file; thrown on the calling thread,
+    /// before anything is uploaded.
+    void set_profile_picture(
+            std::filesystem::path path,
+            std::function<void(int64_t done, int64_t total, std::optional<Expected<void>> result)>
+                    on_progress,
+            result_function<> cb);
+    void set_profile_picture(std::filesystem::path path, result_function<> cb);
+
+    /// Publishes having no display picture.
+    ///
+    /// Config only, and immediate: whatever was uploaded stays on the file server until it expires
+    /// there, since nothing here can withdraw it and another device may still be showing it.
+    void clear_profile_picture(result_function<> cb);
+    void clear_profile_picture(await_t);
 
     /// How much disk the cached attachments may occupy in total, or nullopt for no limit.
     ///
@@ -1157,6 +1201,11 @@ class Client {
             const ConversationId& id,
             transfer_progress on_progress,
             result_function<std::optional<std::vector<std::byte>>> cb);
+    void _set_profile_picture(
+            std::filesystem::path path, transfer_progress on_progress, result_function<> cb);
+    // Writes our own picture into the config and applies it locally, which a local change does not
+    // otherwise get.  An empty url is having none.
+    void _set_own_picture(std::string_view url, std::span<const std::byte> key);
     std::vector<Message> _messages(
             const ConversationId& id,
             int limit,

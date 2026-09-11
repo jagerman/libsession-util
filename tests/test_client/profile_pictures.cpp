@@ -1,6 +1,7 @@
 #include <nettle/gcm.h>
 
 #include <session/attachments.hpp>
+#include <session/client/error_codes.hpp>
 #include <session/network/backends/session_file_server.hpp>
 #include <session/random.hpp>
 
@@ -309,4 +310,119 @@ TEST_CASE("Client: learning a picture's url fetches it unasked", "[client][pictu
     CHECK(net->downloads.empty());
     REQUIRE(got);
     CHECK(*got == image);
+}
+
+namespace {
+
+// A file on disk holding `bytes`, removed again when the test is done with it.
+struct TempPicture {
+    std::filesystem::path path;
+    TempPicture(std::string_view name, std::span<const std::byte> bytes) :
+            path{std::filesystem::temp_directory_path() / name} {
+        std::ofstream out{path, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    ~TempPicture() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("Client: our own picture goes up and comes back", "[client][pictures]") {
+    TempCacheDir dir;
+    TempClient c;
+    auto* net = attach_mock_network(c->core);
+    c->set_cache_dir(dir.path);
+
+    std::vector<std::byte> image(5000);
+    session::random::fill(image);
+    TempPicture file{"libsession_own_picture.bin", image};
+
+    std::vector<std::optional<Expected<void>>> progress;
+    std::optional<Expected<void>> done;
+    c->set_profile_picture(
+            file.path,
+            [&](int64_t, int64_t, std::optional<Expected<void>> r) {
+                progress.push_back(std::move(r));
+            },
+            [&](Expected<void> r) { done = std::move(r); });
+    sync(*c);
+
+    REQUIRE(done);
+    CHECK(done->has_value());
+    REQUIRE_FALSE(progress.empty());
+    CHECK(succeeded(progress.back()));
+
+    // What reaches the config is a url saying it is stream-encrypted and the key that opens it --
+    // which is what every other device will fetch it by.
+    auto pic = in_configs(*c, [](auto& cfg) { return cfg.user_profile().get_profile_pic(); });
+    REQUIRE_FALSE(pic.url.empty());
+    CHECK(pic.key.size() == 32);
+    CHECK(net->served.size() == 1);
+
+    // Our own conversation shows it straight away, and from the copy kept on the way up: the file
+    // came off this disk, so nothing is downloaded to draw it -- neither by the fetch that learning
+    // a new url sets off, nor by asking for it.
+    auto me = ConversationId::dm(own_sid(*c));
+    std::optional<Expected<std::optional<std::vector<std::byte>>>> got;
+    c->profile_picture(me, [&](auto r) { got = std::move(r); });
+    sync(*c);
+
+    CHECK(net->downloads.empty());
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    REQUIRE(**got);
+    CHECK(***got == image);
+
+    // Clearing it is a config change and nothing else: the url goes, and so does our
+    // conversation's picture.
+    c->clear_profile_picture(await);
+    pic = in_configs(*c, [](auto& cfg) { return cfg.user_profile().get_profile_pic(); });
+    CHECK(pic.url.empty());
+
+    got.reset();
+    c->profile_picture(me, [&](auto r) { got = std::move(r); });
+    sync(*c);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    CHECK_FALSE(**got);
+}
+
+TEST_CASE("Client: setting our picture with no network says so", "[client][pictures]") {
+    TempClient c;
+
+    std::vector<std::byte> image(100);
+    session::random::fill(image);
+    TempPicture file{"libsession_own_picture_offline.bin", image};
+
+    std::vector<std::optional<Expected<void>>> progress;
+    std::optional<Expected<void>> done;
+    c->set_profile_picture(
+            file.path,
+            [&](int64_t, int64_t, std::optional<Expected<void>> r) {
+                progress.push_back(std::move(r));
+            },
+            [&](Expected<void> r) { done = std::move(r); });
+    sync(*c);
+
+    // Both halves hear it: the handler, and the progress display, whose last report is always how
+    // the transfer ended even when it never started.
+    REQUIRE(done);
+    REQUIRE_FALSE(done->has_value());
+    CHECK(done->error().code == err::network_unavailable);
+    REQUIRE(progress.size() == 1);
+    CHECK(failure_code(progress.front()) == err::network_unavailable);
+
+    auto pic = in_configs(*c, [](auto& cfg) { return cfg.user_profile().get_profile_pic(); });
+    CHECK(pic.url.empty());
+}
+
+TEST_CASE(
+        "Client: setting our picture from a path that is not a file throws", "[client][pictures]") {
+    TempClient c;
+    CHECK_THROWS_AS(
+            c->set_profile_picture(std::filesystem::temp_directory_path(), [](Expected<void>) {}),
+            std::invalid_argument);
 }

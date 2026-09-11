@@ -86,6 +86,60 @@ constexpr int ATTACHMENT_FLAG_VOICE_MESSAGE = 1;
 constexpr auto ATTACHMENT_REQUEST_TIMEOUT = 60s;
 constexpr auto ATTACHMENT_OVERALL_TIMEOUT = 10min;
 
+/// Copies a file we have just uploaded into the cache as `file`, encrypted under `key`, a chunk at
+/// a time, and returns what the copy takes on disk.  Nullopt, leaving nothing behind, when there is
+/// nothing it can safely keep; `what` names the file in the log when that happens.
+///
+/// On the disk loop.  Re-read rather than kept from the upload, which streams the file rather than
+/// holding it.  Best effort: a file moved or replaced between the upload finishing and this leaves
+/// nothing cached, which costs a download if it is ever drawn again and nothing else.
+///
+/// The length has to still match what was uploaded.  A url names one particular encrypted body, so
+/// storing something else under it would leave the cache answering for that url with bytes that
+/// are not the ones it identifies -- and unlike a missing cache entry, that is wrong rather than
+/// merely slow.
+static std::optional<int64_t> copy_upload_to_cache(
+        const std::filesystem::path& source,
+        int64_t size,
+        const std::filesystem::path& file,
+        std::span<const std::byte, 32> key,
+        std::string_view what) {
+    std::error_code ec;
+    if (size < 0 || std::filesystem::file_size(source, ec) != static_cast<uintmax_t>(size) || ec) {
+        log::debug(
+                cat,
+                "Not caching {}: {} is no longer the file that was uploaded",
+                what,
+                source.string());
+        return std::nullopt;
+    }
+
+    try {
+        std::ifstream in;
+        in.exceptions(std::ios::badbit);
+        in.open(source, std::ios::binary);
+        cache::Writer w{file, key, attachment::encrypted_padding(static_cast<size_t>(size))};
+        std::vector<std::byte> chunk(attachment::ENCRYPT_CHUNK_SIZE);
+        int64_t copied = 0;
+        while (copied < size) {
+            in.read(reinterpret_cast<char*>(chunk.data()),
+                    static_cast<std::streamsize>(chunk.size()));
+            auto got = static_cast<size_t>(in.gcount());
+            if (got == 0)
+                throw std::runtime_error{"{} ended early"_format(source.string())};
+            w.write(std::span{chunk}.first(got));
+            copied += static_cast<int64_t>(got);
+        }
+        w.commit();
+        return static_cast<int64_t>(std::filesystem::file_size(file));
+    } catch (const std::exception& e) {
+        // A cache that cannot be written is a cache that misses next time, which is not worth
+        // anything more than a note.
+        log::warning(cat, "Could not cache {}: {}", what, e.what());
+        return std::nullopt;
+    }
+}
+
 // Rate limits one stream of updates, so that a producer reporting faster than a consumer can
 // usefully act on cannot flood it.  `allow()` is true at most once per interval.
 //
@@ -899,8 +953,15 @@ void Client::_profile_picture(
         transfer_progress on_progress,
         result_function<std::optional<std::vector<std::byte>>> cb) {
 
-    auto convo = _conversation(id);
-    if (!convo || convo->picture().url.empty()) {
+    // Ours is account state, as `display_name` is, and the note-to-self conversation that would
+    // otherwise carry it does not exist until something uses it.
+    config::profile_pic pic;
+    if (id.type() == ConversationId::Type::dm && is_me(id.session_id()))
+        pic = core.configs.user_profile().get_profile_pic();
+    else if (auto convo = _conversation(id))
+        pic = convo->picture();
+
+    if (pic.url.empty()) {
         // Nobody has told us of one, or it is a kind whose picture is not wired up yet.  Not an
         // error: there is simply nothing to show.
         _report(cb, Expected<std::optional<std::vector<std::byte>>>{std::nullopt});
@@ -910,8 +971,6 @@ void Client::_profile_picture(
     // No check on the key here: a missing one is not malformed, it means the file is stored in the
     // clear, which is how a community's image is kept.  A key of the wrong length *is* malformed,
     // and the download reports it as the error it is rather than as an absent picture.
-
-    auto pic = convo->picture();
 
     // A caller of this deals in an optional, because an absent picture is not an error -- but that
     // case was answered above, so from here anything that is not an error is a picture.
@@ -929,6 +988,150 @@ void Client::_profile_picture(
             true,
             {.progress = on_progress ? _dispatch_progress(std::move(on_progress)) : nullptr,
              .cb = std::move(bytes)});
+}
+
+void Client::set_profile_picture(
+        std::filesystem::path path, transfer_progress on_progress, result_function<> cb) {
+
+    // Checked on the calling thread so a caller's own mistake surfaces at the call site, where they
+    // still have a stack to make sense of it.
+    if (!std::filesystem::is_regular_file(path))
+        throw std::invalid_argument{"set_profile_picture: {} is not a file"_format(path.string())};
+
+    // Not _async: what that reports is the upload *starting*, and the answer a caller wants is
+    // whether the picture is published, which is a round trip to the file server away.  So the
+    // callback is carried down to the upload's own completion, and only the failures that happen
+    // before it starts come back here.
+    call([this, path = std::move(path), on_progress = std::move(on_progress), cb]() mutable {
+        try {
+            _set_profile_picture(std::move(path), std::move(on_progress), cb);
+        } catch (const std::exception& e) {
+            log_operation_failure(e);
+            _fail(cb, error_from(e));
+        }
+    });
+}
+
+void Client::set_profile_picture(std::filesystem::path path, result_function<> cb) {
+    set_profile_picture(std::move(path), nullptr, std::move(cb));
+}
+
+void Client::clear_profile_picture(result_function<> cb) {
+    _async([this] { _set_own_picture("", {}); }, std::move(cb));
+}
+
+void Client::clear_profile_picture(await_t) {
+    call_get([this] { _set_own_picture("", {}); });
+}
+
+void Client::_set_own_picture(std::string_view url, std::span<const std::byte> key) {
+    core.configs.user_profile().set_profile_pic(url, key);
+    // A local change is not a merge, so nothing reports it back to us: our own account's row, which
+    // is what our conversation draws its picture from, has to be brought up to date here.
+    _reconcile_user_profile();
+}
+
+void Client::_set_profile_picture(
+        std::filesystem::path path, transfer_progress on_progress, result_function<> cb) {
+
+    auto report = _dispatch_progress(std::move(on_progress));
+
+    auto net = core.network();
+    if (!net) {
+        Error failure{err::network_unavailable, "no network is attached"};
+        if (report)
+            report(0, 0, unexpected{failure});
+        return _fail(cb, std::move(failure));
+    }
+
+    // Copied rather than read back off the Network in the continuation: this comes back on the
+    // network's loop and hops to ours, and the Network can be gone by then.
+    auto fs_config = net->file_server_config;
+
+    // Taken now for the copy kept once it is up, which has to be this file: see
+    // `copy_upload_to_cache`.
+    std::error_code ec;
+    auto size = static_cast<int64_t>(std::filesystem::file_size(path, ec));
+
+    network::FileUploadRequest req;
+    req.file = path;
+    req.domain = attachment::Domain::PROFILE_PIC;
+    req.request_timeout = ATTACHMENT_REQUEST_TIMEOUT;
+    req.overall_timeout = ATTACHMENT_OVERALL_TIMEOUT;
+
+    if (report) {
+        // Only the in-flight reports are throttled; the one that says the picture is up goes
+        // through regardless, because that is the one a caller cannot afford to miss.
+        auto throttle = std::make_shared<update_throttle>(_high_freq_dispatch_interval);
+        req.on_progress = [report, throttle](int64_t sent, int64_t total) {
+            if (throttle->allow())
+                report(sent, total, std::nullopt);
+        };
+    }
+
+    req.on_complete = [this,
+                       cb,
+                       report,
+                       fs_config = std::move(fs_config),
+                       path = std::move(path),
+                       size = ec ? -1 : size](
+                              std::variant<std::pair<network::file_metadata, cleared_b32>, int16_t>
+                                      result,
+                              bool /*timeout*/) {
+        // Delivered on the network's loop; the config write below is Core's loop's alone.
+        call([this, cb, report, fs_config, path, size, result = std::move(result)] {
+            try {
+                if (auto* status = std::get_if<int16_t>(&result)) {
+                    Error failure{
+                            err::upload_failed,
+                            "uploading the display picture failed with status {}"_format(*status)};
+                    log::warning(cat, "{}", failure.message);
+                    if (report)
+                        report(0, 0, unexpected{failure});
+                    return _fail(cb, std::move(failure));
+                }
+
+                const auto& [meta, key] = std::get<0>(result);
+                // upload_file always encrypts with the stream scheme, so the url has to say so:
+                // without the fragment whoever fetches it reaches for the legacy scheme instead and
+                // cannot open the picture at all.
+                auto url = network::file_server::generate_download_url(
+                        meta.id, fs_config, /*stream_encrypted=*/true);
+
+                // Kept, so that the fetch the new url sets off finds it rather than downloading a
+                // file that came off this disk a moment ago.  Posted before the config names the
+                // url, and the disk loop runs in order, so the copy is committed before that fetch
+                // looks.  Unrecorded, as every picture is: a picture's cache entry is found by
+                // name.
+                if (!_cache_dir.empty())
+                    _post_disk([path,
+                                size,
+                                file = _cache_path(cache::PROFILE_DIR, url),
+                                key = _cache_encryption_key()] {
+                        copy_upload_to_cache(path, size, file, key, "our display picture");
+                    });
+
+                _set_own_picture(url, std::span<const std::byte>{key});
+
+                log::debug(cat, "Published a new display picture ({} bytes) at {}", meta.size, url);
+
+                if (report)
+                    report(meta.size, meta.size, Expected<void>{});
+                _report(cb, Expected<void>{});
+            } catch (const std::exception& e) {
+                log_operation_failure(e);
+                auto failure = error_from(e);
+                if (report)
+                    report(0, 0, unexpected{failure});
+                _fail(cb, std::move(failure));
+            }
+        });
+    };
+
+    log::debug(cat, "Uploading display picture {}", req.file.string());
+    // Bound to a name: the accessor's span is deliberately unavailable on a temporary.
+    auto seed_access = core.globals.account_seed();
+    net->upload_file(std::move(req), seed_access.seed());
 }
 
 namespace {
@@ -5310,10 +5513,7 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
     if (!stored)
         return;
 
-    // Copied on the disk loop, a chunk at a time, and recorded back here.  Re-read rather than kept
-    // from the upload, which streams the file rather than holding it.  Best effort throughout: a
-    // file moved or replaced between the upload finishing and this leaves nothing cached, which
-    // costs a download if the message is ever drawn again and nothing else.
+    // Copied on the disk loop and recorded back here.
     _post_disk([this,
                 client_id,
                 url,
@@ -5321,48 +5521,10 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
                 source = std::filesystem::path{*stored},
                 file = _cache_path(cache::ATTACHMENT_DIR, url),
                 key = _cache_encryption_key()] {
-        // The length has to still match what was uploaded.  A url names one particular encrypted
-        // body, so storing something else under it would leave the cache answering for that url
-        // with bytes that are not the ones it identifies -- and unlike a missing cache entry, that
-        // is wrong rather than merely slow.
-        std::error_code ec;
-        if (std::filesystem::file_size(source, ec) != static_cast<uintmax_t>(size) || ec) {
-            log::debug(
-                    cat,
-                    "Not caching attachment of message {}: {} is no longer the file that was "
-                    "uploaded",
-                    client_id,
-                    source.string());
-            return;
-        }
-
-        int64_t on_disk;
-        try {
-            std::ifstream in;
-            in.exceptions(std::ios::badbit);
-            in.open(source, std::ios::binary);
-            cache::Writer w{file, key, attachment::encrypted_padding(static_cast<size_t>(size))};
-            std::vector<std::byte> chunk(attachment::ENCRYPT_CHUNK_SIZE);
-            int64_t copied = 0;
-            while (copied < size) {
-                in.read(reinterpret_cast<char*>(chunk.data()),
-                        static_cast<std::streamsize>(chunk.size()));
-                auto got = static_cast<size_t>(in.gcount());
-                if (got == 0)
-                    throw std::runtime_error{"{} ended early"_format(source.string())};
-                w.write(std::span{chunk}.first(got));
-                copied += static_cast<int64_t>(got);
-            }
-            w.commit();
-            on_disk = static_cast<int64_t>(std::filesystem::file_size(file));
-        } catch (const std::exception& e) {
-            // A cache that cannot be written is a cache that misses next time, which is not worth
-            // anything more than a note.
-            log::warning(cat, "Could not cache attachment of message {}: {}", client_id, e.what());
-            return;
-        }
-
-        call([this, url, file, on_disk] { _record_cached(url, file, on_disk); });
+        auto on_disk = copy_upload_to_cache(
+                source, size, file, key, "attachment of message {}"_format(client_id));
+        if (on_disk)
+            call([this, url, file, on_disk = *on_disk] { _record_cached(url, file, on_disk); });
     });
 }
 
