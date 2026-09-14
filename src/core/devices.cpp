@@ -371,8 +371,8 @@ namespace {
         auto dev_id = c.prepared_maybe_get<int64_t>(
                 R"(INSERT INTO devices
                     (unique_id, state, seqno, timestamp, device_type, description, version,
-                     pubkey_mlkem768, pubkey_x25519)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     pubkey_mlkem768, pubkey_x25519, digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(unique_id) DO UPDATE SET
                        state = excluded.state,
                        seqno = excluded.seqno,
@@ -381,8 +381,9 @@ namespace {
                        description = excluded.description,
                        version = excluded.version,
                        pubkey_mlkem768 = excluded.pubkey_mlkem768,
-                       pubkey_x25519 = excluded.pubkey_x25519
-                   WHERE (excluded.state, excluded.seqno) > (state, seqno)
+                       pubkey_x25519 = excluded.pubkey_x25519,
+                       digest = excluded.digest
+                   WHERE (excluded.state, excluded.seqno, excluded.digest) > (state, seqno, digest)
                    RETURNING id)",
                 info.id,
                 static_cast<int>(info.state),
@@ -392,7 +393,8 @@ namespace {
                 info.description,
                 ver,
                 info.pk_mlkem768,
-                info.pk_x25519);
+                info.pk_x25519,
+                info.digest);
 
         if (!dev_id)
             return std::nullopt;
@@ -782,7 +784,11 @@ namespace {
                 info.state = device::State::Kicked;
                 info.kicked.emplace(std::chrono::seconds{devs.consume_integer<int64_t>()});
             } else {
-                decode_one(info, devs.consume_dict_consumer(), device::State::Registered);
+                // The encoded record itself, rather than what we would make of it again: taking the
+                // view costs nothing here, and re-encoding to hash would.
+                auto raw = devs.consume_dict_data();
+                decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Registered);
+                info.digest = hash::blake2b<8>(raw);
             }
         }
 
@@ -1399,7 +1405,7 @@ std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> e
     return plaintext_devices;
 }
 
-void Devices::receive_link_request(std::span<const std::byte> data) {
+void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expiry) {
     // Parse outer bt-dict: {"": "L", "L": <encrypted>}
     oxenc::bt_dict_consumer outer{data};
     outer.require<std::string_view>("");  // skip type indicator
@@ -1428,7 +1434,9 @@ void Devices::receive_link_request(std::span<const std::byte> data) {
             consume_extra(pt, extra_outer);
         if (pt.is_finished() || pt.key() != "i")
             throw std::runtime_error{"missing 'i' device info dict"};
-        decode_one(info, pt.consume_dict_consumer(), device::State::Pending);
+        auto raw = pt.consume_dict_data();
+        decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Pending);
+        info.digest = hash::blake2b<8>(raw);
     } catch (const std::exception& e) {
         log::warning(cat, "Ignoring incoming link request: failed to parse: {}", e.what());
         return;
@@ -1462,14 +1470,21 @@ void Devices::receive_link_request(std::span<const std::byte> data) {
 
     auto sas_seed = derive_sas_seed(as_span<std::byte>(std::span{plaintext}));
 
+    // A newer request from the same device replaces the earlier one for the user's purposes, but
+    // does not erase it: the older row stays readable as something this device saw.  Marked before
+    // the insert so that exactly one request per device is ever pending.
     c.prepared_exec(
-            R"(INSERT INTO device_link_requests (device, received_at, sas_seed)
-               VALUES (?, ?, ?)
-               ON CONFLICT(device) DO UPDATE SET
-                   received_at = excluded.received_at,
-                   sas_seed = excluded.sas_seed)",
+            "UPDATE device_link_requests SET status = {} WHERE device = ? AND status = {}"_format(
+                    static_cast<int>(device::LinkStatus::Superseded),
+                    static_cast<int>(device::LinkStatus::Pending)),
+            *dev_id);
+
+    c.prepared_exec(
+            R"(INSERT INTO device_link_requests (device, received_at, expires_at, sas_seed)
+               VALUES (?, ?, ?, ?))",
             *dev_id,
             epoch_seconds(clock_now_s()),
+            epoch_seconds(expiry),
             sas_seed);
 
     // Set processing=LinkRequest only if not already set to a higher-priority value by a
@@ -1490,7 +1505,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             if (type == "G")
                 receive_device_group_message(msg.data, msg.hash);
             else if (type == "L")
-                receive_link_request(msg.data);
+                receive_link_request(msg.data, msg.expiry);
             else
                 log::warning(cat, "Ignoring device message with unknown type '{}'", type);
         } catch (const std::exception& e) {
@@ -1567,10 +1582,14 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             switch (item.processing) {
                 case Processing::LinkRequest:
                     if (auto& f = cb().device_link_request) {
+                        // The live one, since the table now keeps the answered and superseded ones
+                        // beside it.
                         auto [lr_id, sas_seed] = c.prepared_get<
                                 int64_t,
                                 sqlite::blob_guts<std::array<std::byte, 16>>>(
-                                "SELECT id, sas_seed FROM device_link_requests WHERE device = ?",
+                                "SELECT id, sas_seed FROM device_link_requests"
+                                " WHERE device = ? AND status = {} ORDER BY id DESC LIMIT 1"_format(
+                                        static_cast<int>(device::LinkStatus::Pending)),
                                 item.row_id);
                         f(static_cast<int>(lr_id), std::move(item.info), sas_from_seed(sas_seed));
                     }
@@ -1583,14 +1602,22 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
                         if (auto& f = cb().device_added) {
                             auto reqid =
                                     c.prepared_maybe_get<int64_t>(
-                                             "SELECT id FROM device_link_requests WHERE device = ?",
+                                             "SELECT id FROM device_link_requests"
+                                             " WHERE device = ? AND status = {}"
+                                             " ORDER BY id DESC LIMIT 1"_format(
+                                                     static_cast<int>(device::LinkStatus::Pending)),
                                              item.row_id)
                                             .value_or(0LL);
                             f(static_cast<int>(reqid), std::move(item.info));
                         }
-                        // Clean up any link request row (whether callback was set or not)
+                        // Answered rather than removed: a request that led to a device joining is
+                        // the one most worth being able to look back at.
                         c.prepared_exec(
-                                "DELETE FROM device_link_requests WHERE device = ?", item.row_id);
+                                "UPDATE device_link_requests SET status = {}"
+                                " WHERE device = ? AND status = {}"_format(
+                                        static_cast<int>(device::LinkStatus::Accepted),
+                                        static_cast<int>(device::LinkStatus::Pending)),
+                                item.row_id);
                     }
                     break;
                 case Processing::Removed:
@@ -1614,11 +1641,6 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             // Don't clear processing so the callback will be retried
         }
     }
-
-    // Prune stale link requests (older than 10 minutes)
-    c.prepared_exec(
-            "DELETE FROM device_link_requests WHERE received_at < ?",
-            epoch_seconds(clock_now_s() - LINK_REQUEST_MAX_AGE));
 
     // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
     // on top of everything this fetch merged.  A local change made between fetches waits for the

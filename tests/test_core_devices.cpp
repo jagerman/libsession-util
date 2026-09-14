@@ -673,6 +673,59 @@ TEST_CASE("Devices - a removal cannot be undone by a message", "[core][devices]"
     CHECK(c->devices.needs_push().device_group);
 }
 
+TEST_CASE(
+        "Devices - two records at one seqno settle the same way either way round",
+        "[core][devices]") {
+    // Only a bug or a forgery produces two different records at the same state and seqno -- a
+    // device bumps its own seqno whenever it changes.  What matters is that two devices seeing them
+    // in opposite orders still end up holding the same thing, rather than each keeping whichever
+    // arrived first and disagreeing from then on.
+    auto make_variant = [](const device::Info& base, std::string description) {
+        auto v = base;
+        v.description = std::move(description);
+        return v;
+    };
+
+    // Every field fixed, including the pubkeys: the tie is broken on the encoded record, so a
+    // record that differs between the two runs is two different questions rather than one asked
+    // twice. These keys are never used to decrypt anything -- this core reads the message as
+    // itself.
+    auto settle = [&](bool reversed) {
+        TempCore c;
+
+        device::Info other{};
+        for (size_t i = 0; i < other.id.size(); i++)
+            other.id[i] = std::byte{static_cast<unsigned char>(i)};
+        other.seqno = 1;
+        other.timestamp = std::chrono::sys_seconds{1700000000s};
+        other.type = device::Type::Session_Android;
+        other.state = device::State::Registered;
+        other.version = {1, 0, 0};
+        other.pk_x25519.fill(std::byte{0x11});
+        other.pk_mlkem768.fill(std::byte{0x22});
+
+        auto [self, registered] = c->devices.device_info(await);
+        REQUIRE(registered);
+
+        auto a = make_variant(other, "first description");
+        auto b = make_variant(other, "second description");
+        if (reversed)
+            std::swap(a, b);
+
+        for (const auto& v : {a, b})
+            TestHelper::receive_device_group_message(
+                    c->devices,
+                    TestHelper::encrypt_device_data(c->devices, {{self.id, self}, {v.id, v}}));
+
+        auto devs = c->devices.devices(true, true, true);
+        auto found = devs.find(other.id);
+        REQUIRE(found != devs.end());
+        return found->second.description;
+    };
+
+    CHECK(settle(false) == settle(true));
+}
+
 TEST_CASE("Devices - a tombstone for an unknown device is kept", "[core][devices]") {
     TempCore c;
 

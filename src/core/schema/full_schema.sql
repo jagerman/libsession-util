@@ -25,6 +25,12 @@ CREATE TABLE devices (
     pubkey_mlkem768 BLOB NOT NULL CHECK(length(pubkey_mlkem768) == 1184),
     pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
 
+    -- Blake2b over the record as it was encoded, and the last term of the merge comparison: two
+    -- records at the same state and seqno are the same record unless their contents differ, and
+    -- without this the earlier arrival simply wins and two devices disagree forever.  Only a bug or
+    -- a forgery produces that, so the ordering only has to be consistent, not meaningful.
+    digest BLOB CHECK(digest IS NULL OR length(digest) == 8),
+
     -- A kick is the one state that carries a timestamp, and is meaningless without one, so the two
     -- are tied together here rather than left to each call site to remember.
     CHECK((state == 3) == (kicked_timestamp IS NOT NULL))
@@ -50,14 +56,25 @@ CREATE TABLE device_unknown (
 -- hash on every display).
 CREATE TABLE device_link_requests (
     -- The `reqid` the application is given to tell requests apart, and to match a request to the
-    -- device_added that follows it.  AUTOINCREMENT because rows go -- accepted, or aged out -- and
-    -- without it the next request would take the id of the newest one gone, so an application
-    -- still holding that id would take one device's request for another's.
+    -- device_added that follows it.  AUTOINCREMENT because rows go once they are answered and aged
+    -- out, and without it the next request would take the id of the newest one gone, so an
+    -- application still holding that id would take one device's request for another's.
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    device INTEGER UNIQUE NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    -- Not unique: a device that asks twice gets two rows.  This is the log of requests this device
+    -- saw, not the set of requests outstanding, so a superseded or answered one stays readable.
+    device INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     received_at INTEGER NOT NULL,  -- unix timestamp of when this request was stored locally
+    -- When the swarm said it would drop the message.  Authoritative for the deadline shown to a
+    -- user: a request published shortly before we polled has less time left than its full TTL, and
+    -- counting from received_at would show a countdown that outlives the request itself.
+    expires_at INTEGER NOT NULL,
+    -- 0 pending, 1 accepted, 2 ignored, 3 superseded.  Expiry is deliberately not among them: it is
+    -- `status = 0 AND expires_at <= now`, so there is no flag to fall out of step with the
+    -- timestamp that decides it.
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status >= 0 AND status <= 3),
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16)  -- 16-byte Argon2id output for SAS display
 ) STRICT;
+CREATE INDEX device_link_requests_device ON device_link_requests(device);
 
 -- Device group messages whose contents we have taken in, and which our own next push therefore
 -- makes redundant.

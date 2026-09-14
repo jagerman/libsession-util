@@ -81,6 +81,18 @@ namespace device {
                          ///< schema enforces.
     };
 
+    /// What became of a link request this device saw.
+    ///
+    /// Expiry is not among these: a request is expired when it is still `Pending` and its deadline
+    /// has passed, so there is nothing to keep in step with the timestamp that decides it.
+    enum class LinkStatus {
+        Pending = 0,     ///< Awaiting an answer, here or on another device.
+        Accepted = 1,    ///< Admitted to the group, by us or by another device.
+        Ignored = 2,     ///< Dismissed here.  Local and silent: nothing is sent, and another device
+                         ///< can still accept the same request.
+        Superseded = 3,  ///< The same device asked again; the newer request is the live one.
+    };
+
     // Value returned to indicate the push status of a device info or account keys update.
     enum class PushStatus {
         Synced = 0,      // We have pushed and confirmed (i.e. fetched the update)
@@ -131,6 +143,13 @@ namespace device {
 
         // The current device-specific MLKEM-768 pubkey
         std::array<std::byte, 1184> pk_mlkem768;
+
+        // Blake2b over this record as it was encoded, and the last term the merge compares.  Unset
+        // for a record that never came off the wire: our own, and a tombstone for a device we never
+        // knew.  A stored NULL makes the comparison NULL at equal state and seqno, so such a row
+        // cannot be displaced by an equal-ranked arrival -- which for our own row is the point,
+        // since only we author it.
+        std::optional<std::array<std::byte, 8>> digest;
 
         // Fields from a device running a newer libsession than ours, kept so that we republish them
         // rather than silently dropping what we do not understand.
@@ -198,7 +217,10 @@ class Devices final : detail::CoreComponent {
     // redundant: our next push carries its contents forward, and that is when it can be deleted.
     // Recorded only on a message we could decrypt -- see `device_group_merged`.
     void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
-    void receive_link_request(std::span<const std::byte> data);
+    //
+    // The link request takes the swarm's expiry, which is what bounds the request: it is when the
+    // message stops being fetchable, so after it no device can accept the request at all.
+    void receive_link_request(std::span<const std::byte> data, sys_ms expiry);
 
     // Handlers for incoming swarm messages by namespace, called from Core::receive_messages.
     void parse_device_messages(std::span<const SwarmMessage> messages, bool is_final);
