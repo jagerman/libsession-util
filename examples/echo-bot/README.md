@@ -38,9 +38,12 @@ but never retries a message on its own — `MessageSendStatus::retrying` is decl
 implemented — so the policy belongs to the client. Only while the bot runs, though: a reply still
 unsent when it exits is left alone on the next start.
 
+`authorized = ALL` in place of a session ID lets anyone who messages the bot run the command.
+
 No shell is involved: the message body is split into arguments (with shell-style quoting, so
 `"two words"` is one argument) and passed to the binary directly, so shell syntax in a message is
 just text.  The trust boundary is the whitelist and the binary: an authorized sender can run the
 configured binary with *any* arguments, so `command = /bin/sh` hands them a shell, and a binary
 that takes a filename as an argument hands them every file the bot can read.  Point it at
-something that only does what you want done.
+something that only does what you want done — and note that with `ALL`, "an authorized sender" is
+anyone who learns the bot's Session ID.
