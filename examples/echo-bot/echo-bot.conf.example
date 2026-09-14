@@ -32,6 +32,12 @@ command = /bin/echo ARGS
 #authorized = 05aaaa...
 #authorized = 05bbbb...
 
+# `ALL` instead of a session ID lets anyone who messages the bot run the command, and makes any
+# session IDs listed here redundant.  Whoever knows the bot's Session ID then chooses its
+# arguments, so use it only where that is harmless -- with a command taking no ARGS, say, or one
+# that is safe for a stranger to run with anything.
+#authorized = ALL
+
 # mainnet (default) or testnet.
 #network = mainnet
 

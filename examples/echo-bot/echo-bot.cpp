@@ -70,6 +70,9 @@ constexpr std::chrono::seconds MAX_RETRY_DELAY = 10min;
 /// cannot -- which is the price of it needing no punctuation to be recognisable.
 constexpr auto ARGS_SLUG = "ARGS"sv;
 
+/// The `authorized` value that stands for everybody rather than one session ID.
+constexpr auto AUTHORIZE_ALL = "ALL"sv;
+
 // -- Configuration --------------------------------------------------------------------------
 
 struct Config {
@@ -81,6 +84,7 @@ struct Config {
     std::vector<std::string> command;
     bool uses_args = false;  ///< Whether `command` contains the ARGS slug.
     std::unordered_set<std::string> authorized;
+    bool authorize_all = false;  ///< `authorized = ALL`: anyone who writes to us may run it.
     bool testnet = false;
     opt::router router = opt::router::onion_requests();
     std::chrono::seconds timeout = 30s;
@@ -194,12 +198,16 @@ Config parse_config(const fs::path& path) {
             else if (key == "command")
                 cfg.command = split_args(value);
             else if (key == "authorized") {
-                if (value.size() != 66 || !value.starts_with("05") || !oxenc::is_hex(value))
+                if (value == AUTHORIZE_ALL)
+                    cfg.authorize_all = true;
+                else if (value.size() != 66 || !value.starts_with("05") || !oxenc::is_hex(value))
                     throw std::runtime_error{fmt::format(
                             "invalid authorized session ID '{}': expected 66 hex digits "
-                            "beginning with 05",
-                            value)};
-                cfg.authorized.emplace(value);
+                            "beginning with 05, or {}",
+                            value,
+                            AUTHORIZE_ALL)};
+                else
+                    cfg.authorized.emplace(value);
             } else if (key == "network")
                 cfg.testnet = parse_enum<bool>(key, value, {{"mainnet", false}, {"testnet", true}});
             else if (key == "router")
@@ -439,11 +447,12 @@ class EchoBot {
 
         fmt::print("Session ID: {}\n", _client->core.globals.session_id_hex());
         fmt::print(
-                "Database:   {}\nCommand:    {}{}\nAuthorized: {} session ID(s)\n",
+                "Database:   {}\nCommand:    {}{}\nAuthorized: {}\n",
                 _config.database,
                 fmt::join(_config.command, " "),
                 _config.uses_args ? "" : "  (message arguments not passed: no ARGS)",
-                _config.authorized.size());
+                _config.authorize_all ? "ALL -- anyone who messages this bot runs the command"s
+                                      : fmt::format("{} session ID(s)", _config.authorized.size()));
         std::fflush(stdout);
 
         _worker = std::thread{[this] { _run_jobs(); }};
@@ -489,7 +498,7 @@ class EchoBot {
             return;
 
         auto sender = oxenc::to_hex(msg.sender);
-        bool authorized = _config.authorized.count(sender) > 0;
+        bool authorized = _config.authorize_all || _config.authorized.contains(sender);
         // An empty message asks for nothing -- unless the body is not what is being asked with, in
         // which case any message at all is the whole request.
         if (authorized && _config.uses_args && trim(msg.body).empty()) {
