@@ -1,0 +1,74 @@
+# Configuration for session-echo-bot.
+#
+# Everything is `key = value`, one per line; `#` starts a comment.
+
+# The bot's database: its account seed (and so its Session ID), its contacts and its message
+# history.  Created on first run, and reused on every run after that; delete it and the bot comes
+# back as a brand new account with a new Session ID.
+database = echo-bot.db
+
+# Where the network layer caches its service node pool.  Defaults to "<database>.cache".
+#cache_dir = echo-bot.db.cache
+
+# The command to run for messages from an authorized sender: a binary (looked up in $PATH if it is
+# not a path) and any arguments to pass it, quoted as in a shell.  No shell is involved in running
+# it, though: the arguments go to the binary directly, so shell syntax here or in a message means
+# nothing.
+#
+# The bare argument `ARGS` is where the message's own arguments go, and is the only thing a message
+# contributes:
+#
+#     command = /bin/echo ARGS          # echoes the message back
+#     command = /bin/echo hello ARGS    # echoes "hello" followed by the message
+#     command = /bin/echo               # ignores the message; answers the same thing every time
+#
+# So a command that takes no input simply has no ARGS, and the message is then only the trigger --
+# an empty message will do, and is answered rather than ignored.  A literal `ARGS` argument cannot
+# be passed to the command.
+command = /bin/echo ARGS
+
+# Session IDs allowed to run the command, one line each.  A DM from anyone else is answered with
+# "Unauthorized." and runs nothing.  With none set the bot runs nothing for anybody.
+#authorized = 05aaaa...
+#authorized = 05bbbb...
+
+# mainnet (default) or testnet.
+#network = mainnet
+
+# How requests are routed: onionreq (default), srouter, or direct.  `direct` talks to service
+# nodes without onion routing, which exposes this bot's IP to them.
+#router = onionreq
+
+# Seconds to let the command run before killing it, or 0 to wait forever.
+#timeout = 30
+
+# How often to poll the swarm for new messages, in seconds.
+#poll_interval = 20
+
+# Bytes of command output to send back; anything beyond this is dropped and the reply says so.
+#max_output = 2000
+
+# A reply whose send fails (an unreachable swarm node, say) is not retried by libsession: it stays
+# failed until something asks for it again, which is what these do.  `retry_attempts` is how many
+# times to ask, and `retry_delay` the wait before the first one; the wait doubles per attempt, to a
+# ceiling of 10 minutes.  Set retry_attempts = 0 to leave a failed reply alone.
+#
+# Retries only happen while the bot is running: a reply still unsent when it exits is not picked up
+# again on the next start.
+#retry_attempts = 5
+#retry_delay = 10
+
+# oxen-logging levels.  A bare level (critical, error, warning, info, debug, trace) applies to
+# everything; a full category spec works as well, applied left to right:
+#
+#     log_level = *=warning, echo-bot=info, quic=error
+#
+# The bot logs to the `echo-bot` category: every message it receives, and what it decided to do
+# with it, at info; a command it could not run or a reply it could not send at error; and messages
+# dropped from the queue at shutdown at warning.  So the default below shows what the bot is doing
+# and stays quiet about the library unless something there fails.
+#
+# Glob patterns (`core.*=debug`) only match categories that already exist when this is applied,
+# which is before the library has created most of its own; naming a category outright has no such
+# limitation.
+#log_level = *=error,echo-bot=info
