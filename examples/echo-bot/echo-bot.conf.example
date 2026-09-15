@@ -56,13 +56,16 @@ command = /bin/echo ARGS
 
 # A reply whose send fails (an unreachable swarm node, say) is not retried by libsession: it stays
 # failed until something asks for it again, which is what these do.  `retry_attempts` is how many
-# times to ask, and `retry_delay` the wait before the first one; the wait doubles per attempt, to a
-# ceiling of 10 minutes.  Set retry_attempts = 0 to leave a failed reply alone.
+# times to ask.  The first retry is immediate, since one bad swarm member is the usual cause and
+# another is picked straight away; `retry_delay` is the wait before the second, doubling for each
+# one after that to a ceiling of 10 minutes.  So the default is: at once, 2s, 4s, 8s, 16s.
+#
+# Set retry_attempts = 0 to leave a failed reply alone.
 #
 # Retries only happen while the bot is running: a reply still unsent when it exits is not picked up
 # again on the next start.
 #retry_attempts = 5
-#retry_delay = 10
+#retry_delay = 2
 
 # oxen-logging levels.  A bare level (critical, error, warning, info, debug, trace) applies to
 # everything; a full category spec works as well, applied left to right:
