@@ -90,7 +90,7 @@ struct Config {
     std::chrono::seconds timeout = 30s;
     std::chrono::seconds poll_interval = 20s;
     int retry_attempts = 5;
-    std::chrono::seconds retry_delay = 10s;
+    std::chrono::seconds retry_delay = 2s;  ///< Before the *second* retry; the first is immediate.
     size_t max_output = 2000;
     std::string log_level = "*=error,echo-bot=info";
 };
@@ -563,15 +563,20 @@ class EchoBot {
             return;
         }
 
-        // Doubling, because what makes a send fail is usually not over by the time the first retry
-        // would go out, and a bot with nobody watching it should not spend an outage retrying at
-        // full speed.
-        auto delay = std::min(_config.retry_delay * (1 << (attempt - 1)), MAX_RETRY_DELAY);
+        // The first retry goes out immediately: the commonest failure is one unlucky swarm member
+        // -- a node not relaying for session router, say -- and picking a different one is worth
+        // trying at once rather than after a wait that a person is sitting through.  Only once
+        // that has not worked does the doubling backoff start, on the assumption that what is
+        // wrong is no longer one node and a bot with nobody watching it should not spend an
+        // outage retrying at full speed.
+        auto delay = attempt == 1
+                           ? 0s
+                           : std::min(_config.retry_delay * (1 << (attempt - 2)), MAX_RETRY_DELAY);
         oxen::log::info(
                 cat,
-                "Reply to {} failed to send; retrying in {} (attempt {} of {})",
+                "Reply to {} failed to send; retrying {} (attempt {} of {})",
                 id.to_string(),
-                delay,
+                delay > 0s ? fmt::format("in {}", delay) : "immediately"s,
                 attempt,
                 _config.retry_attempts);
 
