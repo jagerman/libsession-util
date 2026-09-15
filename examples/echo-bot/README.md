@@ -32,9 +32,11 @@ It prints its own Session ID at startup; that is what you message it at.  `--run
 message through the configured command and prints the reply it would have sent, without touching
 the database or the network, which is the quick way to check a `command` setting.
 
-A reply whose send fails is retried by the bot itself, on a doubling backoff (`retry_attempts`,
-`retry_delay`): libsession reports the failure through `message_updated` and offers `retry_send()`,
-but never retries a message on its own — `MessageSendStatus::retrying` is declared and not yet
+A reply whose send fails is retried by the bot itself: at once, and then on a doubling backoff —
+by default immediately, 2s, 4s, 8s, 16s (`retry_attempts`, `retry_delay`).  The immediate one is
+there because the usual cause is a single swarm member that cannot be reached, and the retry picks
+another.  libsession reports the failure through `message_updated` and offers `retry_send()`, but
+never retries a message on its own — `MessageSendStatus::retrying` is declared and not yet
 implemented — so the policy belongs to the client. Only while the bot runs, though: a reply still
 unsent when it exits is left alone on the next start.
 
