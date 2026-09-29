@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "component.hpp"
@@ -179,6 +180,41 @@ namespace device {
 
     using map = std::map<std::array<std::byte, 32>, Info>;
 
+    /// A link request this device saw, and what became of it.
+    ///
+    /// Read rather than cached: a request can be superseded, accepted elsewhere, or expire between
+    /// one draw and the next, and the SAS shown to a user must always belong to the record
+    /// currently stored.  Holding one of these across a redraw is how a user ends up comparing
+    /// emoji against a request that has since been replaced.
+    struct LinkRequest {
+        /// Identifies this request to `accept_request` and friends.
+        ///
+        /// Valid only within this Core session: it comes from a counter rather than the database,
+        /// and a later run gives the same request a different one.  Never persist it.
+        int id;
+
+        /// The requesting device, as it described itself.
+        Info device;
+
+        /// The 21 emoji to compare against what the requesting device is showing.  The first 7 are
+        /// the standard display; all 21 are there for an extended view.
+        std::array<std::string_view, 21> sas;
+
+        /// When we stored it, and when the swarm drops the message it arrived in.  The deadline is
+        /// the swarm's rather than ours: past it the message cannot be fetched, so no device can
+        /// accept the request at all.
+        std::chrono::sys_seconds received;
+        std::chrono::sys_seconds expires;
+
+        LinkStatus status;
+
+        /// True once an unanswered request is past its deadline.  Derived rather than stored, so it
+        /// cannot disagree with the timestamp it comes from.
+        bool expired(std::chrono::system_clock::time_point now) const {
+            return status == LinkStatus::Pending && expires <= now;
+        }
+    };
+
     struct decryption_failed : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
@@ -199,6 +235,20 @@ class Devices final : detail::CoreComponent {
     // returns on the network's thread and this component does not outlive its Core.
     bool _push_in_flight = false;
     std::shared_ptr<int> _alive = std::make_shared<int>(0);
+
+    // The ids handed out for link requests this session, both ways round.  Issued from a counter
+    // rather than exposing the row id, so that nothing can take one for something that survives a
+    // restart.  Loop-only, like everything that reaches them.
+    int _next_reqid = 1;
+    std::unordered_map<int64_t, int> _reqid_by_row;
+    std::unordered_map<int, int64_t> _row_by_reqid;
+
+    int _reqid_for(int64_t row);
+    std::optional<int64_t> _row_for(int reqid);
+
+    // Reads link requests with the device each came from.  `pending_only` restricts to those still
+    // awaiting an answer and not yet past their deadline.
+    std::vector<device::LinkRequest> _link_requests(bool pending_only);
 
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence
@@ -274,8 +324,55 @@ class Devices final : detail::CoreComponent {
     void build_link_request(result_function<LinkRequestResult> cb);
     LinkRequestResult build_link_request(await_t);
 
+    // Every link request this device has seen, newest first: pending, answered, superseded and
+    // expired alike.  For a history view.
+    //
+    // `device` is the requesting device's record as it now stands, which for an older request may
+    // have moved on since -- a device that asked twice appears in both rows with its later
+    // description.  The SAS always belongs to that row's own request.
+    //
+    // These and the calls below read and write the device tables and hand out request ids, all of
+    // which the loop owns, so they happen there either way.
+    void link_requests(result_function<std::vector<device::LinkRequest>> cb);
+    std::vector<device::LinkRequest> link_requests(await_t);
+
+    // The link requests still awaiting an answer: pending and not yet past their deadline.  What a
+    // prompt is drawn from, and meant to be asked for each time one is drawn, since a request can
+    // be superseded or answered elsewhere between two draws.
+    void incoming_link_requests(result_function<std::vector<device::LinkRequest>> cb);
+    std::vector<device::LinkRequest> incoming_link_requests(await_t);
+
+    // Admits the requesting device to the group.  The acceptance reaches the other devices with the
+    // next group push, which happens once the next fetch completes.
+    //
+    // Answers false if the request can no longer be accepted: answered here or elsewhere,
+    // superseded by a newer request from the same device, past its deadline, or this device is no
+    // longer in the group itself.  None of those is an error -- each can happen between a prompt
+    // being drawn and the user answering it.  An id this session never handed out is an error
+    // (std::invalid_argument).
+    void accept_request(int reqid, result_function<bool> cb);
+    bool accept_request(int reqid, await_t);
+
+    // Dismisses a request here.  Local and silent: nothing is sent, and another device may still
+    // accept it.  Answers false if it was no longer pending.  An id this session never handed out
+    // is an error (std::invalid_argument).
+    void ignore_request(int reqid, result_function<bool> cb);
+    bool ignore_request(int reqid, await_t);
+
+    // Removes link requests from the log, for a user tidying up ones already dealt with.  Answers
+    // how many were removed.
+    //
+    // A request still awaiting an answer is never removed, named or not: dismissing one is
+    // `ignore_request`, and a list the user acted on may have been drawn before it arrived.  Ids
+    // this session never handed out are skipped.
+    void forget_link_requests(std::vector<int> reqids, result_function<size_t> cb);
+    size_t forget_link_requests(std::span<const int> reqids, await_t);
+
   private:
     LinkRequestResult _build_link_request();
+    bool _accept_request(int reqid);
+    bool _ignore_request(int reqid);
+    size_t _forget_link_requests(std::span<const int> reqids);
 
   public:
     // Updates this device's info locally to match the given info; if the current device is

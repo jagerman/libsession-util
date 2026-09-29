@@ -55,10 +55,10 @@ CREATE TABLE device_unknown (
 -- the short authentication string emoji are derived (stored to avoid re-running the expensive
 -- hash on every display).
 CREATE TABLE device_link_requests (
-    -- The `reqid` the application is given to tell requests apart, and to match a request to the
-    -- device_added that follows it.  AUTOINCREMENT because rows go once they are answered and aged
-    -- out, and without it the next request would take the id of the newest one gone, so an
-    -- application still holding that id would take one device's request for another's.
+    -- What the `reqid` an application is given maps to, for as long as this run holds it.
+    -- AUTOINCREMENT because rows are deleted, and without it the next request would take the id of
+    -- the newest one gone, and with it anything still held against that id: the reqid an
+    -- application knows the old request by, and whether that request has ended.
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     -- Not unique: a device that asks twice gets two rows.  This is the log of requests this device
     -- saw, not the set of requests outstanding, so a superseded or answered one stays readable.

@@ -554,9 +554,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
                 epoch_ms(clock_now_ms()));
     }
 
-    // Device group payload encryption/decryption.  These are private to Devices and currently have
-    // no production caller (nothing yet builds or pushes a device group message), so tests are the
-    // only thing exercising them.
+    // Device group payload encryption/decryption, which are private to Devices, for tests that need
+    // to build a group message with contents of their choosing.
     static std::vector<std::byte> encrypt_device_data(
             core::Devices& d, const core::device::map& devices) {
         return d.encrypt_device_data(devices);
@@ -572,6 +571,24 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     static void receive_device_group_message(
             core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
         d.receive_device_group_message(data, hash);
+    }
+
+    // Delivers one namespace-21 message as a completed fetch would: through the same dispatch, with
+    // `is_final` set so the deferred work -- the prompts, and the ids they carry -- happens too,
+    // and with the expiry the swarm assigned it, which a link request takes as its deadline.
+    static void deliver_device_message(
+            core::Core& core,
+            std::span<const std::byte> data,
+            sys_ms expiry,
+            std::string hash = "hash") {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .data = data,
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = expiry};
+            core.devices.parse_device_messages(std::span{&m, 1}, true);
+        });
     }
 
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.

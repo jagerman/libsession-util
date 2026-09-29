@@ -800,3 +800,165 @@ TEST_CASE("Devices - a single-recipient group is readable", "[core][devices]") {
     std::string_view self_key{reinterpret_cast<const char*>(self.id.data()), self.id.size()};
     CHECK(devs.skip_until(self_key));
 }
+
+namespace {
+
+/// An account's existing device, and a second one on the same account asking to join it.
+struct Linking {
+    TempCore core;  // generated, so it is in the group and can admit others
+    std::array<std::byte, 32> seed = seed_of(core);
+    TempCore applicant{core::predefined_seed{std::span<const std::byte, 32>{seed}}};
+
+    static std::array<std::byte, 32> seed_of(TempCore& c) {
+        std::array<std::byte, 32> out;
+        auto s = c->globals.account_seed();
+        std::ranges::copy(std::as_bytes(s.seed()), out.begin());
+        return out;
+    }
+
+    std::array<std::byte, 32> applicant_id() {
+        auto hex = applicant->devices.device_id();
+        std::array<std::byte, 32> id;
+        oxenc::from_hex(hex.begin(), hex.end(), reinterpret_cast<unsigned char*>(id.data()));
+        return id;
+    }
+
+    // The applicant's request, as the existing device receives it.  Whole seconds, because that is
+    // what the deadline is stored in, so a test can compare it exactly.
+    Devices::LinkRequestResult
+    ask(std::chrono::sys_seconds expiry = std::chrono::floor<std::chrono::seconds>(clock_now_s()) +
+                                          10min,
+        std::string hash = "L1") {
+        auto req = applicant->devices.build_link_request(await);
+        TestHelper::deliver_device_message(*core, req.message, expiry, std::move(hash));
+        return req;
+    }
+
+    device::Info state_of_applicant() {
+        auto devs = core->devices.devices(true, true, true);
+        auto found = devs.find(applicant_id());
+        REQUIRE(found != devs.end());
+        return found->second;
+    }
+};
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a link request is listed with its SAS and the swarm's deadline",
+        "[core][devices][linking]") {
+    Linking l;
+    auto expiry = std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 7min;
+    auto sent = l.ask(expiry);
+
+    auto incoming = l.core->devices.incoming_link_requests(await);
+    REQUIRE(incoming.size() == 1);
+    CHECK(incoming[0].sas == sent.sas);
+    CHECK(incoming[0].expires == expiry);
+    CHECK(incoming[0].status == device::LinkStatus::Pending);
+    CHECK(oxenc::to_hex(incoming[0].device.id) == l.applicant->devices.device_id());
+
+    // One id per request for the whole session, however many times it is read.
+    CHECK(l.core->devices.incoming_link_requests(await)[0].id == incoming[0].id);
+    CHECK(l.core->devices.link_requests(await)[0].id == incoming[0].id);
+}
+
+TEST_CASE("Devices - accepting a request admits the device, once", "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto id = l.core->devices.incoming_link_requests(await).at(0).id;
+
+    CHECK(l.core->devices.accept_request(id, await));
+    CHECK(l.state_of_applicant().state == device::State::Registered);
+
+    // Kept, not removed: it is the request most worth being able to look back at.
+    CHECK(l.core->devices.incoming_link_requests(await).empty());
+    auto all = l.core->devices.link_requests(await);
+    REQUIRE(all.size() == 1);
+    CHECK(all[0].status == device::LinkStatus::Accepted);
+
+    // Carried by the next push as a transition to broadcast, which is how every other device hears
+    // of it.  Asked of the message rather than of needs_push(), which a fresh account's first push
+    // already makes true whether or not anything was accepted.
+    auto push = l.core->devices.build_device_group_message();
+    CHECK(std::ranges::find(push.broadcast, l.applicant_id()) != push.broadcast.end());
+
+    CHECK_FALSE(l.core->devices.accept_request(id, await));
+}
+
+TEST_CASE(
+        "Devices - ignoring a request is local and leaves the device pending",
+        "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto id = l.core->devices.incoming_link_requests(await).at(0).id;
+
+    CHECK(l.core->devices.ignore_request(id, await));
+    CHECK(l.core->devices.incoming_link_requests(await).empty());
+    CHECK(l.core->devices.link_requests(await).at(0).status == device::LinkStatus::Ignored);
+
+    // Pending rather than removed or kicked, so the same request redelivered does not prompt again
+    // but a real retry from the applicant still can.
+    CHECK(l.state_of_applicant().state == device::State::Pending);
+
+    CHECK_FALSE(l.core->devices.ignore_request(id, await));
+    CHECK_FALSE(l.core->devices.accept_request(id, await));
+}
+
+TEST_CASE("Devices - a request past its deadline cannot be accepted", "[core][devices][linking]") {
+    Linking l;
+    auto expiry = std::chrono::floor<std::chrono::seconds>(clock_now_s()) - 1s;
+    l.ask(expiry);
+
+    CHECK(l.core->devices.incoming_link_requests(await).empty());
+
+    auto all = l.core->devices.link_requests(await);
+    REQUIRE(all.size() == 1);
+    CHECK(all[0].status == device::LinkStatus::Pending);
+    CHECK(all[0].expired(std::chrono::system_clock::now()));
+    CHECK_FALSE(l.core->devices.accept_request(all[0].id, await));
+}
+
+TEST_CASE("Devices - a resent request replaces the one on screen", "[core][devices][linking]") {
+    Linking l;
+    auto first = l.ask();
+    auto first_id = l.core->devices.incoming_link_requests(await).at(0).id;
+
+    auto second = l.ask(std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min, "L2");
+    REQUIRE(second.sas != first.sas);
+
+    // One live request, and it is the new one: a user comparing emoji must be shown the SAS of the
+    // record that would actually be admitted.
+    auto incoming = l.core->devices.incoming_link_requests(await);
+    REQUIRE(incoming.size() == 1);
+    CHECK(incoming[0].id != first_id);
+    CHECK(incoming[0].sas == second.sas);
+
+    auto all = l.core->devices.link_requests(await);
+    REQUIRE(all.size() == 2);
+    CHECK(all[1].status == device::LinkStatus::Superseded);
+
+    CHECK_FALSE(l.core->devices.accept_request(first_id, await));
+    CHECK(l.core->devices.accept_request(incoming[0].id, await));
+}
+
+TEST_CASE(
+        "Devices - forgetting requests never takes one still waiting", "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto id = l.core->devices.incoming_link_requests(await).at(0).id;
+
+    std::vector<int> ids{id, id + 1000};  // the second was never handed out
+    CHECK(l.core->devices.forget_link_requests(ids, await) == 0);
+    CHECK(l.core->devices.link_requests(await).size() == 1);
+
+    l.core->devices.ignore_request(id, await);
+    CHECK(l.core->devices.forget_link_requests(ids, await) == 1);
+    CHECK(l.core->devices.link_requests(await).empty());
+}
+
+TEST_CASE("Devices - an id this session never handed out is an error", "[core][devices][linking]") {
+    Linking l;
+    CHECK_THROWS_AS(l.core->devices.accept_request(12345, await), std::invalid_argument);
+    CHECK_THROWS_AS(l.core->devices.ignore_request(12345, await), std::invalid_argument);
+}

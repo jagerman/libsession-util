@@ -1497,6 +1497,229 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
     tx.commit();
 }
 
+int Devices::_reqid_for(int64_t row) {
+    assert(on_loop());
+    auto [it, inserted] = _reqid_by_row.try_emplace(row, _next_reqid);
+    if (inserted)
+        _row_by_reqid.emplace(_next_reqid++, row);
+    return it->second;
+}
+
+std::optional<int64_t> Devices::_row_for(int reqid) {
+    assert(on_loop());
+    if (auto it = _row_by_reqid.find(reqid); it != _row_by_reqid.end())
+        return it->second;
+    return std::nullopt;
+}
+
+std::vector<device::LinkRequest> Devices::_link_requests(bool pending_only) {
+    assert(on_loop());
+    auto c = conn();
+    std::vector<device::LinkRequest> out;
+
+    for (auto [row,
+               received,
+               expires,
+               status,
+               sas_seed,
+               dev_row,
+               devid,
+               state,
+               seqno,
+               timestamp,
+               type,
+               desc,
+               ver,
+               pk_ml,
+               pk_x,
+               kicked] :
+         c.prepared_results<
+                 int64_t,
+                 int64_t,
+                 int64_t,
+                 int,
+                 sqlite::blob_guts<std::array<std::byte, 16>>,
+                 int64_t,
+                 sqlite::blob_guts<std::array<std::byte, 32>>,
+                 int,
+                 int,
+                 int64_t,
+                 std::string,
+                 std::string,
+                 int64_t,
+                 sqlite::blobn<mlkem768::PUBLICKEYBYTES>,
+                 sqlite::blobn<32>,
+                 std::optional<int64_t>>(
+                 "SELECT r.id, r.received_at, r.expires_at, r.status, r.sas_seed,"
+                 "       d.id, d.unique_id, d.state, d.seqno, d.timestamp, d.device_type,"
+                 "       d.description, d.version, d.pubkey_mlkem768, d.pubkey_x25519,"
+                 "       d.kicked_timestamp"
+                 "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
+                 " WHERE ? = 0 OR (r.status = {} AND r.expires_at > ?)"
+                 " ORDER BY r.id DESC"_format(static_cast<int>(device::LinkStatus::Pending)),
+                 pending_only ? 1 : 0,
+                 epoch_seconds(clock_now_s()))) {
+        auto info = fill_device_info(
+                devid, state, seqno, timestamp, std::move(type), std::move(desc), ver, pk_ml, pk_x);
+        if (kicked)
+            info.kicked.emplace(std::chrono::seconds{*kicked});
+        load_device_extras(c, dev_row, info);
+
+        out.push_back(
+                {.id = _reqid_for(row),
+                 .device = std::move(info),
+                 .sas = sas_from_seed(sas_seed),
+                 .received = std::chrono::sys_seconds{std::chrono::seconds{received}},
+                 .expires = std::chrono::sys_seconds{std::chrono::seconds{expires}},
+                 .status = static_cast<device::LinkStatus>(status)});
+    }
+    return out;
+}
+
+void Devices::link_requests(result_function<std::vector<device::LinkRequest>> cb) {
+    async([this] { return _link_requests(false); }, std::move(cb));
+}
+
+std::vector<device::LinkRequest> Devices::link_requests(await_t) {
+    return jq().call_get([this] { return _link_requests(false); });
+}
+
+void Devices::incoming_link_requests(result_function<std::vector<device::LinkRequest>> cb) {
+    async([this] { return _link_requests(true); }, std::move(cb));
+}
+
+std::vector<device::LinkRequest> Devices::incoming_link_requests(await_t) {
+    return jq().call_get([this] { return _link_requests(true); });
+}
+
+void Devices::accept_request(int reqid, result_function<bool> cb) {
+    async([this, reqid] { return _accept_request(reqid); }, std::move(cb));
+}
+
+bool Devices::accept_request(int reqid, await_t) {
+    return jq().call_get([this, reqid] { return _accept_request(reqid); });
+}
+
+bool Devices::_accept_request(int reqid) {
+    assert(on_loop());
+    auto row = _row_for(reqid);
+    if (!row)
+        throw std::invalid_argument{"accept_request: no such link request in this session"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    // A device outside the group has nobody to admit anyone to.  Checked here rather than left to
+    // the push, which would simply never happen and leave the request looking accepted.
+    if (!c.prepared_maybe_get<int>(
+                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                self_id,
+                static_cast<int>(device::State::Registered)))
+        return false;
+
+    auto dev = c.prepared_maybe_get<int64_t>(
+            "SELECT device FROM device_link_requests"
+            " WHERE id = ? AND status = {} AND expires_at > ?"_format(
+                    static_cast<int>(device::LinkStatus::Pending)),
+            *row,
+            epoch_seconds(clock_now_s()));
+    if (!dev)
+        return false;
+
+    // Only from Pending: a device kicked since the request arrived is gone for good, and the rank
+    // rule would refuse to lower it anyway.
+    if (!c.prepared_maybe_get<int64_t>(
+                "UPDATE devices SET state = ?, broadcast_needed = 1, processing = ?"
+                " WHERE id = ? AND state = ? RETURNING id",
+                static_cast<int>(device::State::Registered),
+                static_cast<int>(Processing::Registered),
+                *dev,
+                static_cast<int>(device::State::Pending)))
+        return false;
+
+    c.prepared_exec(
+            "UPDATE device_link_requests SET status = ? WHERE id = ?",
+            static_cast<int>(device::LinkStatus::Accepted),
+            *row);
+
+    tx.commit();
+    return true;
+}
+
+void Devices::ignore_request(int reqid, result_function<bool> cb) {
+    async([this, reqid] { return _ignore_request(reqid); }, std::move(cb));
+}
+
+bool Devices::ignore_request(int reqid, await_t) {
+    return jq().call_get([this, reqid] { return _ignore_request(reqid); });
+}
+
+bool Devices::_ignore_request(int reqid) {
+    assert(on_loop());
+    auto row = _row_for(reqid);
+    if (!row)
+        throw std::invalid_argument{"ignore_request: no such link request in this session"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    auto dev = c.prepared_maybe_get<int64_t>(
+            "UPDATE device_link_requests SET status = ? WHERE id = ? AND status = ?"
+            " RETURNING device",
+            static_cast<int>(device::LinkStatus::Ignored),
+            *row,
+            static_cast<int>(device::LinkStatus::Pending));
+    if (!dev)
+        return false;
+
+    // The device row stays Pending, deliberately: a redelivery of the same request then fails the
+    // merge guard and does not prompt again, while a genuine retry carries a higher seqno and does.
+    c.prepared_exec(
+            "UPDATE devices SET processing = NULL WHERE id = ? AND processing = ?",
+            *dev,
+            static_cast<int>(Processing::LinkRequest));
+
+    tx.commit();
+    return true;
+}
+
+void Devices::forget_link_requests(std::vector<int> reqids, result_function<size_t> cb) {
+    async([this, reqids = std::move(reqids)] { return _forget_link_requests(reqids); },
+          std::move(cb));
+}
+
+size_t Devices::forget_link_requests(std::span<const int> reqids, await_t) {
+    return jq().call_get([this, reqids] { return _forget_link_requests(reqids); });
+}
+
+size_t Devices::_forget_link_requests(std::span<const int> reqids) {
+    assert(on_loop());
+    std::vector<int64_t> rows;
+    for (auto id : reqids)
+        if (auto row = _row_for(id))
+            rows.push_back(*row);
+    if (rows.empty())
+        return 0;
+
+    std::vector<int64_t> gone;
+    auto c = conn();
+    for (auto row : c.prepared_results<int64_t>(
+                 "DELETE FROM device_link_requests WHERE id IN ({})"
+                 " AND NOT (status = {} AND expires_at > ?) RETURNING id"_format(
+                         sqlite::placeholders(rows.size()),
+                         static_cast<int>(device::LinkStatus::Pending)),
+                 sqlite::bind_each{rows},
+                 epoch_seconds(clock_now_s())))
+        gone.push_back(row);
+
+    for (auto row : gone)
+        if (auto it = _reqid_by_row.find(row); it != _reqid_by_row.end()) {
+            _row_by_reqid.erase(it->second);
+            _reqid_by_row.erase(it);
+        }
+    return gone.size();
+}
+
 void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool is_final) {
     for (const auto& msg : messages) {
         try {
@@ -1591,7 +1814,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
                                 " WHERE device = ? AND status = {} ORDER BY id DESC LIMIT 1"_format(
                                         static_cast<int>(device::LinkStatus::Pending)),
                                 item.row_id);
-                        f(static_cast<int>(lr_id), std::move(item.info), sas_from_seed(sas_seed));
+                        f(_reqid_for(lr_id), std::move(item.info), sas_from_seed(sas_seed));
                     }
                     break;
                 case Processing::Registered:
@@ -1599,17 +1822,10 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
                         if (auto& f = cb().device_self_added)
                             f();
                     } else {
-                        if (auto& f = cb().device_added) {
-                            auto reqid =
-                                    c.prepared_maybe_get<int64_t>(
-                                             "SELECT id FROM device_link_requests"
-                                             " WHERE device = ? AND status = {}"
-                                             " ORDER BY id DESC LIMIT 1"_format(
-                                                     static_cast<int>(device::LinkStatus::Pending)),
-                                             item.row_id)
-                                            .value_or(0LL);
-                            f(static_cast<int>(reqid), std::move(item.info));
-                        }
+                        // Marked before the lookup, so the request found is the one that led here
+                        // whichever way it came: accepted by another device and still pending
+                        // here, or accepted here already by accept_request().
+                        //
                         // Answered rather than removed: a request that led to a device joining is
                         // the one most worth being able to look back at.
                         c.prepared_exec(
@@ -1618,6 +1834,17 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
                                         static_cast<int>(device::LinkStatus::Accepted),
                                         static_cast<int>(device::LinkStatus::Pending)),
                                 item.row_id);
+
+                        if (auto& f = cb().device_added) {
+                            // 0 when the device joined without us ever seeing it ask.
+                            auto row = c.prepared_maybe_get<int64_t>(
+                                    "SELECT id FROM device_link_requests"
+                                    " WHERE device = ? AND status = {}"
+                                    " ORDER BY id DESC LIMIT 1"_format(
+                                            static_cast<int>(device::LinkStatus::Accepted)),
+                                    item.row_id);
+                            f(row ? _reqid_for(*row) : 0, std::move(item.info));
+                        }
                     }
                     break;
                 case Processing::Removed:
