@@ -90,6 +90,8 @@ void Devices::init() {
     if (auto own = conn().prepared_maybe_get<int>(
                 "SELECT state FROM devices WHERE unique_id = ?", self_id))
         _reported_state = static_cast<device::State>(*own);
+
+    _expiry_timer = jq().add_wakeable([this] { _flush_events(); });
 }
 
 void Devices::_mark_group_owed() {
@@ -1503,16 +1505,23 @@ std::optional<int64_t> Devices::_row_for(int reqid) {
 
 std::vector<device::LinkRequest> Devices::_link_requests(bool pending_only) {
     auto now = clock_now();
+    bool opened = false;
     std::vector<device::LinkRequest> out;
     for (auto& [row, request] : _read_link_requests(pending_only)) {
-        // One handed out already closed is seen to be closed; reporting it so would be news about
-        // something that happened before the caller ever heard of it.
-        if (!_reqid_by_row.contains(row) &&
-            (request.status != device::LinkStatus::Pending || request.expired(now)))
-            _ended.insert(row);
+        if (!_reqid_by_row.contains(row)) {
+            // One handed out already closed is seen to be closed; reporting it so would be news
+            // about something that happened before the caller ever heard of it.
+            if (request.status != device::LinkStatus::Pending || request.expired(now))
+                _ended.insert(row);
+            else
+                opened = true;
+        }
         request.id = _reqid_for(row);
         out.push_back(std::move(request));
     }
+    // Its deadline is one the expiry timer was not armed for.
+    if (opened)
+        jq().wake(_expiry_timer);
     return out;
 }
 
@@ -1747,7 +1756,11 @@ void Devices::_flush_events() {
     };
 
     auto c = conn();
-    auto now = epoch_seconds(clock_now_s());
+    auto now = clock_now_s();
+    std::optional<std::chrono::sys_seconds> next_deadline;
+    auto open_until = [&](std::chrono::sys_seconds expires) {
+        next_deadline = std::min(next_deadline.value_or(expires), expires);
+    };
 
     // Closed before opened, so a request superseded by a resend has its prompt closed before the
     // new one's is raised.
@@ -1768,8 +1781,10 @@ void Devices::_flush_events() {
             case device::LinkStatus::Superseded: why = device::LinkRequestEnd::Superseded; break;
             case device::LinkStatus::Ignored: _ended.insert(row); break;
             case device::LinkStatus::Pending:
-                if (expires <= now)
+                if (from_epoch_s(expires) <= now)
                     why = device::LinkRequestEnd::Expired;
+                else
+                    open_until(from_epoch_s(expires));
                 break;
         }
         if (why) {
@@ -1786,6 +1801,7 @@ void Devices::_flush_events() {
         for (auto& [row, request] : _read_link_requests(true))
             if (!_reqid_by_row.contains(row)) {
                 request.id = _reqid_for(row);
+                open_until(request.expires);
                 report("link_request_added",
                        [&] { events->link_request_added(std::move(request)); });
             }
@@ -1801,6 +1817,14 @@ void Devices::_flush_events() {
             report("membership_changed", [&] { events->membership_changed(state); });
         }
     }
+
+    if (next_deadline) {
+        // A non-positive interval would stop the timer instead.  Firing a moment early is harmless:
+        // the flush it runs finds nothing expired and re-arms for the remainder.
+        auto delay = std::chrono::ceil<std::chrono::microseconds>(*next_deadline - clock_now());
+        jq().repeat(_expiry_timer, std::max<std::chrono::microseconds>(delay, 1ms));
+    } else
+        jq().stop(_expiry_timer);
 }
 
 void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool is_final) {

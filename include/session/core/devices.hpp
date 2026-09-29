@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <oxen/quic/timer_id.hpp>
 #include <session/clock.hpp>
 #include <session/sodium_array.hpp>
 #include <span>
@@ -265,6 +266,11 @@ class Devices final : detail::CoreComponent {
     bool _fetched = false;
     std::optional<device::State> _reported_state;
     std::unordered_set<int64_t> _ended;
+
+    // Fires a flush at the earliest deadline among the requests handed out and still open, so a
+    // prompt closes when its request expires rather than at whichever fetch next completes -- which
+    // could be an application-chosen interval away, or never while the network is down.
+    quic::TimerID _expiry_timer;
 
     // Reports what changed through `callbacks::devices`.  Run once a fetch has been merged and at
     // the end of each call here that changes something, never partway through, so a handler never

@@ -8,6 +8,7 @@
 #include <session/core/devices.hpp>
 #include <session/core/globals.hpp>
 #include <session/xed25519.hpp>
+#include <thread>
 
 #include "test_helper.hpp"
 #include "utils.hpp"
@@ -950,6 +951,19 @@ namespace {
 auto in(std::chrono::minutes m) {
     return std::chrono::floor<std::chrono::seconds>(clock_now_s()) + m;
 }
+
+// For what happens with no call to wait on.  `done` runs on Core's loop, which is the thread that
+// writes the recorders it reads.
+template <typename F>
+bool eventually(Core& core, F done) {
+    auto give_up = std::chrono::steady_clock::now() + 5s;
+    while (!core.call_get(done)) {
+        if (std::chrono::steady_clock::now() > give_up)
+            return false;
+        std::this_thread::sleep_for(20ms);
+    }
+    return true;
+}
 }  // namespace
 
 TEST_CASE(
@@ -1070,6 +1084,33 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.core);
 
     REQUIRE(l.events.ended.size() == 1);
+    CHECK(l.events.ended[0] == std::pair{id, device::LinkRequestEnd::Expired});
+}
+
+// Deadlines are stored in whole seconds, so these land somewhere between half a second and a second
+// and a half out.
+TEST_CASE(
+        "Devices events - a deadline closes the prompt with no fetch to notice it",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto req = l.applicant->devices.build_link_request(await);
+    TestHelper::deliver_device_message(*l.core, req.message, clock_now_ms() + 1500ms, "L1");
+    auto id = l.events.added.at(0).id;
+
+    REQUIRE(eventually(*l.core, [&] { return !l.events.ended.empty(); }));
+    CHECK(l.events.ended[0] == std::pair{id, device::LinkRequestEnd::Expired});
+}
+
+TEST_CASE(
+        "Devices events - a request read rather than announced still closes at its deadline",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto req = l.applicant->devices.build_link_request(await);
+    TestHelper::deliver_device_message(
+            *l.core, req.message, clock_now_ms() + 1500ms, "L1", /*is_final=*/false);
+    auto id = l.core->devices.incoming_link_requests(await).at(0).id;
+
+    REQUIRE(eventually(*l.core, [&] { return !l.events.ended.empty(); }));
     CHECK(l.events.ended[0] == std::pair{id, device::LinkRequestEnd::Expired});
 }
 
