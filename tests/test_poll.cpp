@@ -54,6 +54,9 @@ static nlohmann::json make_response(
             nlohmann::json item;
             item["data"] = oxenc::to_base64(msg_data);
             item["hash"] = hash;
+            // A storage server always says when it will drop a message, and a link request takes
+            // that as its deadline -- without one it would arrive already expired.
+            item["expiry"] = epoch_ms(clock_now_ms() + 10min);
             body["messages"].push_back(std::move(item));
         }
         results.push_back({{"code", 200}, {"body", std::move(body)}});
@@ -62,11 +65,9 @@ static nlohmann::json make_response(
 }
 
 TEST_CASE("Core automatic polling", "[core][poll]") {
-    bool received = false;
+    DeviceEventsRecorder events;
     core::callbacks cbs;
-    cbs.device_link_request = [&](int,
-                                  const core::device::Info&,
-                                  std::span<const std::string_view>) { received = true; };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     auto* mock_net = attach_mock_network(*core);
@@ -122,7 +123,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
     // Verify last_hash was stored under this specific node's pubkey.
     CHECK(TestHelper::namespace_last_hash(*core, 21, mock_net->current_node.remote_pubkey) ==
           "hash1");
-    CHECK(received);
+    CHECK(events.added.size() == 1);
 
     // Poll again with the same node — should include last_hash in the Devices subrequest.
     mock_net->sent_requests.clear();
@@ -219,13 +220,14 @@ TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[co
     // Observe the stored cursor from inside the handler.  If it has already advanced by the time
     // the batch is being handled, then a handler that fails -- or a crash at that moment -- loses
     // the batch permanently, because the swarm filters on last_hash.
+    DeviceEventsRecorder events;
+    events.on_added = [&](const core::device::LinkRequest&) {
+        called = true;
+        hash_during_callback = TestHelper::namespace_last_hash(
+                *core_ptr, 21, mock_net->current_node.remote_pubkey);
+    };
     core::callbacks cbs;
-    cbs.device_link_request =
-            [&](int, const core::device::Info&, std::span<const std::string_view>) {
-                called = true;
-                hash_during_callback = TestHelper::namespace_last_hash(
-                        *core_ptr, 21, mock_net->current_node.remote_pubkey);
-            };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     core_ptr = &*core;
@@ -276,10 +278,9 @@ static void set_more(
 }
 
 TEST_CASE("Poll: a truncated namespace is continued before it is reported final", "[core][poll]") {
-    int calls = 0;
+    DeviceEventsRecorder events;
     core::callbacks cbs;
-    cbs.device_link_request =
-            [&](int, const core::device::Info&, std::span<const std::string_view>) { calls++; };
+    cbs.devices = &events;
 
     TempCore core{cbs};
     auto* mock_net = attach_mock_network(*core);
@@ -308,7 +309,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     TestHelper::drain(*core);
 
     // The request is stored, but the batch was not final, so nothing has been reported yet.
-    CHECK(calls == 0);
+    CHECK(events.added.empty());
 
     auto sent = polls(*mock_net);
     REQUIRE(sent.size() == 2);
@@ -322,7 +323,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
     reply2(true, false, 200, {}, make_empty_response(second).dump());
     TestHelper::drain(*core);
 
-    CHECK(calls == 1);
+    CHECK(events.added.size() == 1);
 }
 
 TEST_CASE("Poll: `more` with nothing returned does not continue", "[core][poll]") {

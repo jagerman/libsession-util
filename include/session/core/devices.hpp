@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "component.hpp"
@@ -92,6 +93,15 @@ namespace device {
         Ignored = 2,     ///< Dismissed here.  Local and silent: nothing is sent, and another device
                          ///< can still accept the same request.
         Superseded = 3,  ///< The same device asked again; the newer request is the live one.
+    };
+
+    /// Why a link request stopped being answerable, for whatever prompt was drawn for it.
+    ///
+    /// This device's own accept or ignore is not among them: the caller did that, and knows.
+    enum class LinkRequestEnd {
+        Accepted,    ///< Another device admitted it.
+        Superseded,  ///< The requesting device asked again, and the new request replaces it.
+        Expired,     ///< Its deadline passed unanswered; no device can accept it now.
     };
 
     // Value returned to indicate the push status of a device info or account keys update.
@@ -246,9 +256,29 @@ class Devices final : detail::CoreComponent {
     int _reqid_for(int64_t row);
     std::optional<int64_t> _row_for(int reqid);
 
+    // What `callbacks::devices` has been told, so that `_flush_events()` reports each change once.
+    //
+    // A request has been handed out once it has an id, whichever way the application came by it,
+    // and `_ended` holds the ones since closed: reported closed, or closed by this device itself,
+    // which the caller does not need telling about.
+    bool _devices_changed = false;
+    bool _fetched = false;
+    std::optional<device::State> _reported_state;
+    std::unordered_set<int64_t> _ended;
+
+    // Reports what changed through `callbacks::devices`.  Run once a fetch has been merged and at
+    // the end of each call here that changes something, never partway through, so a handler never
+    // sees a half-applied state.
+    void _flush_events();
+
     // Reads link requests with the device each came from.  `pending_only` restricts to those still
     // awaiting an answer and not yet past their deadline.
     std::vector<device::LinkRequest> _link_requests(bool pending_only);
+
+    // The same read without handing anything out: each request beside its row, with `id` unset.
+    // What `_flush_events()` uses to tell a request the application has not seen yet from one it
+    // has, since having an id is what having seen it means.
+    std::vector<std::pair<int64_t, device::LinkRequest>> _read_link_requests(bool pending_only);
 
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence

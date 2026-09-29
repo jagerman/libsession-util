@@ -84,6 +84,12 @@ void Devices::init() {
     // after Globals, so `self_id` does not exist yet at that point, and the flag is persisted, so
     // an account created by a run that died before reaching this still gets its group.
     establish_group();
+
+    // Where we stand at startup is the baseline, not news: `membership_changed` reports a change
+    // from it, not the fact of having a state at all.
+    if (auto own = conn().prepared_maybe_get<int>(
+                "SELECT state FROM devices WHERE unique_id = ?", self_id))
+        _reported_state = static_cast<device::State>(*own);
 }
 
 void Devices::_mark_group_owed() {
@@ -561,6 +567,9 @@ void Devices::_update_info(const device::Info& info) {
     }
 
     tx.commit();
+
+    _devices_changed = true;
+    _flush_events();
 }
 
 namespace {
@@ -805,23 +814,6 @@ namespace {
         return result;
     }
 
-    // Values for the devices.processing column, set during batch message processing and cleared
-    // after callbacks are fired at is_final.
-    enum class Processing {
-        LinkRequest = 1,  // new/updated link request received
-        Registered = 2,   // device newly transitioned to Registered
-        Removed = 3,      // device newly transitioned to Unregistered
-    };
-
-    constexpr std::string_view to_string(Processing p) {
-        switch (p) {
-            case Processing::LinkRequest: return "link-request";
-            case Processing::Registered: return "registered";
-            case Processing::Removed: return "removed";
-        }
-        return "unknown";
-    }
-
     constexpr auto PERS_DEV_NONCE = "SessionDevDNonce"_b2b_pers;
     constexpr auto PERS_KEY_NONCE = "SessionDevKNonce"_b2b_pers;
     constexpr auto PERS_KEY_KEY = "SessionDevKeyKey"_b2b_pers;
@@ -857,20 +849,6 @@ namespace {
     static_assert(bt_bytes_encoded(100) == 104);  // "100:…"
 
 }  // namespace
-
-}  // namespace session::core
-
-/// Logs a `Processing` as the word `to_string` gives for it.  Out here for the reason given at the
-/// top of this file; `session::core::Processing` names the type because the unnamed namespace it
-/// lives in is reachable from its enclosing namespace.
-template <>
-struct fmt::formatter<session::core::Processing, char> : fmt::formatter<std::string_view> {
-    auto format(session::core::Processing p, fmt::format_context& ctx) const {
-        return formatter<std::string_view>::format(to_string(p), ctx);
-    }
-};
-
-namespace session::core {
 
 std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) {
     cleared_b32 a;
@@ -1050,7 +1028,6 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     return out;
 }
 
-// Prebuilt SQL with Processing/State enum values embedded as literals rather than parameters.
 // Records a device as kicked, inserting a bare tombstone row if we hold no record of it.
 //
 // The insert half is what makes a removal durable for a device that joined after it: an update
@@ -1058,9 +1035,6 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 // into the group.  A tombstone needs no details to do its job -- rank alone settles the merge -- so
 // the columns the schema requires are filled with zeroes and the seqno left at 0, which no record
 // off the wire can be.
-//
-// `processing` is set only where the device was Registered: a removal is news to the application
-// only if we thought the device was a member, and a tombstone for one we never knew is not.
 static const std::string KICK_DEVICE_SQL =
         "INSERT INTO devices"
         " (unique_id, state, seqno, timestamp, device_type, description, version,"
@@ -1068,15 +1042,23 @@ static const std::string KICK_DEVICE_SQL =
         " VALUES (?2, {0}, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
         " ON CONFLICT(unique_id) DO UPDATE SET"
         "     state = {0}, kicked_timestamp = excluded.kicked_timestamp,"
-        "     processing = CASE WHEN state = {1} THEN {2} ELSE processing END,"
-        "     broadcast_needed = CASE WHEN state = {1} THEN 1 ELSE broadcast_needed END"_format(
+        "     broadcast_needed = CASE WHEN state = {1} THEN 1 ELSE broadcast_needed END"
+        // Every group message carries every tombstone, so most of these restate what is already
+        // held; only a real change should count as one.
+        "   WHERE state != {0} OR kicked_timestamp IS NOT excluded.kicked_timestamp"
+        " RETURNING id"_format(
                 static_cast<int>(device::State::Kicked),
-                static_cast<int>(device::State::Registered),
-                static_cast<int>(Processing::Removed));
+                static_cast<int>(device::State::Registered));
 
 static const std::string REGISTER_DEVICE_SQL =
-        "UPDATE devices SET processing = {}, broadcast_needed = 1 WHERE id = ?"_format(
-                static_cast<int>(Processing::Registered));
+        "UPDATE devices SET broadcast_needed = 1 WHERE id = ?";
+
+// A device registered by a group message was admitted somewhere, so the request that asked for it
+// has been answered, whichever device answered it.
+static const std::string ANSWER_REQUEST_SQL =
+        "UPDATE device_link_requests SET status = {} WHERE device = ? AND status = {}"_format(
+                static_cast<int>(device::LinkStatus::Accepted),
+                static_cast<int>(device::LinkStatus::Pending));
 
 // Restates a removal that an incoming message tried to undo, moving the tombstone to the front of
 // the removed list and marking it for broadcast.
@@ -1133,7 +1115,9 @@ void Devices::receive_device_group_message(
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
             // device we have never heard of gets a bare tombstone -- see KICK_DEVICE_SQL.
             assert(info.kicked);
-            c.prepared_exec(KICK_DEVICE_SQL, info.kicked->time_since_epoch().count(), id);
+            if (c.prepared_maybe_get<int64_t>(
+                        KICK_DEVICE_SQL, info.kicked->time_since_epoch().count(), id))
+                _devices_changed = true;
             continue;
         }
 
@@ -1156,6 +1140,7 @@ void Devices::receive_device_group_message(
                     "Device group message tried to restore removed device {}; restating removal",
                     oxenc::to_hex(id));
             c.prepared_exec(REASSERT_KICK_SQL, epoch_seconds(clock_now_s()), id);
+            _devices_changed = true;
             continue;
         }
 
@@ -1167,10 +1152,13 @@ void Devices::receive_device_group_message(
         auto dev_id = upsert_device_info(c, info);
         if (!dev_id)
             continue;
+        _devices_changed = true;
 
-        // Mark as newly registered only on a state transition (not for info-only updates).
-        if (!was_registered)
+        // Only on a state transition, not an update to a device already registered.
+        if (!was_registered) {
             c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
+            c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
+        }
     }
 
     // Recorded whether or not the merge changed anything: a message that told us only what we
@@ -1264,6 +1252,9 @@ Devices::LinkRequestResult Devices::_build_link_request() {
     o.append("", "L");
     o.append("L", std::span<const std::byte>{encrypted});
     assert(o.view().size() == out.size());
+
+    // Now waiting on our own request, which the caller knows: it is the one asking.
+    _reported_state = device::State::Pending;
 
     return {std::move(out), sas};
 }
@@ -1442,6 +1433,11 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
         return;
     }
 
+    // Our own request, fetched back from the swarm we sent it to.  The merge guard below would also
+    // turn it away, but only because our own row happens to carry no digest.
+    if (info.id == self_id)
+        return;
+
     auto c = conn();
 
     // Reject if already registered or unregistered; only Pending (or absent) is valid
@@ -1487,13 +1483,6 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
             epoch_seconds(expiry),
             sas_seed);
 
-    // Set processing=LinkRequest only if not already set to a higher-priority value by a
-    // concurrent device group message in the same batch
-    c.prepared_exec(
-            "UPDATE devices SET processing = ? WHERE id = ? AND processing IS NULL",
-            static_cast<int>(Processing::LinkRequest),
-            *dev_id);
-
     tx.commit();
 }
 
@@ -1513,9 +1502,25 @@ std::optional<int64_t> Devices::_row_for(int reqid) {
 }
 
 std::vector<device::LinkRequest> Devices::_link_requests(bool pending_only) {
+    auto now = clock_now();
+    std::vector<device::LinkRequest> out;
+    for (auto& [row, request] : _read_link_requests(pending_only)) {
+        // One handed out already closed is seen to be closed; reporting it so would be news about
+        // something that happened before the caller ever heard of it.
+        if (!_reqid_by_row.contains(row) &&
+            (request.status != device::LinkStatus::Pending || request.expired(now)))
+            _ended.insert(row);
+        request.id = _reqid_for(row);
+        out.push_back(std::move(request));
+    }
+    return out;
+}
+
+std::vector<std::pair<int64_t, device::LinkRequest>> Devices::_read_link_requests(
+        bool pending_only) {
     assert(on_loop());
     auto c = conn();
-    std::vector<device::LinkRequest> out;
+    std::vector<std::pair<int64_t, device::LinkRequest>> out;
 
     for (auto [row,
                received,
@@ -1565,13 +1570,15 @@ std::vector<device::LinkRequest> Devices::_link_requests(bool pending_only) {
             info.kicked.emplace(std::chrono::seconds{*kicked});
         load_device_extras(c, dev_row, info);
 
-        out.push_back(
-                {.id = _reqid_for(row),
-                 .device = std::move(info),
-                 .sas = sas_from_seed(sas_seed),
-                 .received = std::chrono::sys_seconds{std::chrono::seconds{received}},
-                 .expires = std::chrono::sys_seconds{std::chrono::seconds{expires}},
-                 .status = static_cast<device::LinkStatus>(status)});
+        out.emplace_back(
+                row,
+                device::LinkRequest{
+                        .id = 0,
+                        .device = std::move(info),
+                        .sas = sas_from_seed(sas_seed),
+                        .received = std::chrono::sys_seconds{std::chrono::seconds{received}},
+                        .expires = std::chrono::sys_seconds{std::chrono::seconds{expires}},
+                        .status = static_cast<device::LinkStatus>(status)});
     }
     return out;
 }
@@ -1629,10 +1636,9 @@ bool Devices::_accept_request(int reqid) {
     // Only from Pending: a device kicked since the request arrived is gone for good, and the rank
     // rule would refuse to lower it anyway.
     if (!c.prepared_maybe_get<int64_t>(
-                "UPDATE devices SET state = ?, broadcast_needed = 1, processing = ?"
+                "UPDATE devices SET state = ?, broadcast_needed = 1"
                 " WHERE id = ? AND state = ? RETURNING id",
                 static_cast<int>(device::State::Registered),
-                static_cast<int>(Processing::Registered),
                 *dev,
                 static_cast<int>(device::State::Pending)))
         return false;
@@ -1643,6 +1649,10 @@ bool Devices::_accept_request(int reqid) {
             *row);
 
     tx.commit();
+
+    _ended.insert(*row);
+    _devices_changed = true;
+    _flush_events();
     return true;
 }
 
@@ -1674,12 +1684,9 @@ bool Devices::_ignore_request(int reqid) {
 
     // The device row stays Pending, deliberately: a redelivery of the same request then fails the
     // merge guard and does not prompt again, while a genuine retry carries a higher seqno and does.
-    c.prepared_exec(
-            "UPDATE devices SET processing = NULL WHERE id = ? AND processing = ?",
-            *dev,
-            static_cast<int>(Processing::LinkRequest));
-
     tx.commit();
+
+    _ended.insert(*row);
     return true;
 }
 
@@ -1712,12 +1719,88 @@ size_t Devices::_forget_link_requests(std::span<const int> reqids) {
                  epoch_seconds(clock_now_s())))
         gone.push_back(row);
 
-    for (auto row : gone)
+    for (auto row : gone) {
+        _ended.erase(row);
         if (auto it = _reqid_by_row.find(row); it != _reqid_by_row.end()) {
             _row_by_reqid.erase(it->second);
             _reqid_by_row.erase(it);
         }
+    }
     return gone.size();
+}
+
+void Devices::_flush_events() {
+    assert(on_loop());
+
+    bool changed = std::exchange(_devices_changed, false);
+    auto* events = cb().devices;
+    if (!events)
+        return;
+
+    // One handler throwing must not take the others' reports down with it.
+    auto report = [](std::string_view which, auto&& call) {
+        try {
+            call();
+        } catch (const std::exception& e) {
+            log::error(cat, "DeviceEvents::{} threw: {}", which, e.what());
+        }
+    };
+
+    auto c = conn();
+    auto now = epoch_seconds(clock_now_s());
+
+    // Closed before opened, so a request superseded by a resend has its prompt closed before the
+    // new one's is raised.
+    std::vector<std::pair<int, device::LinkRequestEnd>> ended;
+    for (const auto& [row, reqid] : _reqid_by_row) {
+        if (_ended.contains(row))
+            continue;
+        auto st = c.prepared_maybe_get<int, int64_t>(
+                "SELECT status, expires_at FROM device_link_requests WHERE id = ?", row);
+        if (!st) {
+            _ended.insert(row);
+            continue;
+        }
+        auto [status, expires] = *st;
+        std::optional<device::LinkRequestEnd> why;
+        switch (static_cast<device::LinkStatus>(status)) {
+            case device::LinkStatus::Accepted: why = device::LinkRequestEnd::Accepted; break;
+            case device::LinkStatus::Superseded: why = device::LinkRequestEnd::Superseded; break;
+            case device::LinkStatus::Ignored: _ended.insert(row); break;
+            case device::LinkStatus::Pending:
+                if (expires <= now)
+                    why = device::LinkRequestEnd::Expired;
+                break;
+        }
+        if (why) {
+            _ended.insert(row);
+            ended.emplace_back(reqid, *why);
+        }
+    }
+    for (auto [reqid, why] : ended)
+        report("link_request_ended", [&] { events->link_request_ended(reqid, why); });
+
+    // Only once the swarm has been asked: a request stored before a restart may have been
+    // answered or expired while we were away, and the fetch is what says so.
+    if (_fetched)
+        for (auto& [row, request] : _read_link_requests(true))
+            if (!_reqid_by_row.contains(row)) {
+                request.id = _reqid_for(row);
+                report("link_request_added",
+                       [&] { events->link_request_added(std::move(request)); });
+            }
+
+    if (changed)
+        report("devices_replaced", [&] { events->devices_replaced(devices(true, false, true)); });
+
+    if (auto own = c.prepared_maybe_get<int>(
+                "SELECT state FROM devices WHERE unique_id = ?", self_id)) {
+        auto state = static_cast<device::State>(*own);
+        if (state != _reported_state) {
+            _reported_state = state;
+            report("membership_changed", [&] { events->membership_changed(state); });
+        }
+    }
 }
 
 void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool is_final) {
@@ -1739,135 +1822,8 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     if (!is_final)
         return;
 
-    // Fire deferred callbacks for all devices with a pending processing state.  We collect first
-    // to avoid nested statement conflicts during callback + processing-clear operations.
-    struct ProcessingItem {
-        int64_t row_id;
-        std::array<std::byte, 32> id;
-        Processing processing;
-        device::Info info;
-    };
-
-    auto c = conn();
-    std::vector<ProcessingItem> items;
-    for (auto [row_id,
-               raw_id,
-               processing_int,
-               state_int,
-               seqno,
-               timestamp,
-               dtype,
-               desc,
-               ver,
-               pk_ml,
-               pk_x,
-               kicked_ts] :
-         c.prepared_results<
-                 int64_t,
-                 sqlite::blob_guts<std::array<std::byte, 32>>,
-                 int,
-                 int,
-                 int,
-                 int64_t,
-                 std::string,
-                 std::string,
-                 int64_t,
-                 sqlite::blobn<mlkem768::PUBLICKEYBYTES>,
-                 sqlite::blobn<32>,
-                 std::optional<int64_t>>(
-                 "SELECT id, unique_id, processing, state, seqno, timestamp, device_type,"
-                 "       description, version, pubkey_mlkem768, pubkey_x25519, kicked_timestamp"
-                 " FROM devices WHERE processing IS NOT NULL ORDER BY unique_id")) {
-        auto& item = items.emplace_back();
-        item.row_id = row_id;
-        item.id = raw_id;
-        item.processing = static_cast<Processing>(processing_int);
-        item.info = fill_device_info(
-                raw_id,
-                state_int,
-                seqno,
-                timestamp,
-                std::move(dtype),
-                std::move(desc),
-                ver,
-                pk_ml,
-                pk_x);
-        if (kicked_ts)
-            item.info.kicked.emplace(std::chrono::seconds{*kicked_ts});
-        load_device_extras(c, row_id, item.info);
-    }
-
-    // Non-const so a handler can take the info: each item reaches exactly one branch below, and
-    // nothing after the switch reads `info` again.
-    for (auto& item : items) {
-        bool is_self = (item.id == self_id);
-        try {
-            switch (item.processing) {
-                case Processing::LinkRequest:
-                    if (auto& f = cb().device_link_request) {
-                        // The live one, since the table now keeps the answered and superseded ones
-                        // beside it.
-                        auto [lr_id, sas_seed] = c.prepared_get<
-                                int64_t,
-                                sqlite::blob_guts<std::array<std::byte, 16>>>(
-                                "SELECT id, sas_seed FROM device_link_requests"
-                                " WHERE device = ? AND status = {} ORDER BY id DESC LIMIT 1"_format(
-                                        static_cast<int>(device::LinkStatus::Pending)),
-                                item.row_id);
-                        f(_reqid_for(lr_id), std::move(item.info), sas_from_seed(sas_seed));
-                    }
-                    break;
-                case Processing::Registered:
-                    if (is_self) {
-                        if (auto& f = cb().device_self_added)
-                            f();
-                    } else {
-                        // Marked before the lookup, so the request found is the one that led here
-                        // whichever way it came: accepted by another device and still pending
-                        // here, or accepted here already by accept_request().
-                        //
-                        // Answered rather than removed: a request that led to a device joining is
-                        // the one most worth being able to look back at.
-                        c.prepared_exec(
-                                "UPDATE device_link_requests SET status = {}"
-                                " WHERE device = ? AND status = {}"_format(
-                                        static_cast<int>(device::LinkStatus::Accepted),
-                                        static_cast<int>(device::LinkStatus::Pending)),
-                                item.row_id);
-
-                        if (auto& f = cb().device_added) {
-                            // 0 when the device joined without us ever seeing it ask.
-                            auto row = c.prepared_maybe_get<int64_t>(
-                                    "SELECT id FROM device_link_requests"
-                                    " WHERE device = ? AND status = {}"
-                                    " ORDER BY id DESC LIMIT 1"_format(
-                                            static_cast<int>(device::LinkStatus::Accepted)),
-                                    item.row_id);
-                            f(row ? _reqid_for(*row) : 0, std::move(item.info));
-                        }
-                    }
-                    break;
-                case Processing::Removed:
-                    if (is_self) {
-                        if (auto& f = cb().device_self_removed)
-                            f();
-                    } else {
-                        if (auto& f = cb().device_removed)
-                            f(std::move(item.info));
-                    }
-                    break;
-            }
-            c.prepared_exec("UPDATE devices SET processing = NULL WHERE id = ?", item.row_id);
-        } catch (const std::exception& e) {
-            log::error(
-                    cat,
-                    "Exception in {} device callback for device {}: {}",
-                    item.processing,
-                    oxenc::to_hex(item.id),
-                    e.what());
-            // Don't clear processing so the callback will be retried
-        }
-    }
+    _fetched = true;
+    _flush_events();
 
     // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
     // on top of everything this fetch merged.  A local change made between fetches waits for the

@@ -499,53 +499,6 @@ TEST_CASE("Devices - build_account_pubkey_message", "[core][devices]") {
     }
 }
 
-TEST_CASE("Devices - a link request id is never handed out twice", "[core][devices]") {
-    std::vector<int> reqids;
-    core::callbacks cbs;
-    cbs.device_link_request =
-            [&](int reqid, device::Info&&, std::span<const std::string_view, 21>) {
-                reqids.push_back(reqid);
-            };
-    TempCore c{cbs};
-
-    cleared_b32 seed;
-    {
-        auto access = c->globals.account_seed();
-        std::ranges::copy(std::as_bytes(access.seed()), seed.begin());
-    }
-
-    auto deliver = [&](std::span<const SwarmMessage> msgs) {
-        TestHelper::on_loop(*c, [&] {
-            c->receive_messages(msgs, config::Namespace::Devices, true);
-            return 0;
-        });
-    };
-    auto request_from_new_device = [&](std::string hash) {
-        TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed}}};
-        auto msg = linker->devices.build_link_request(await).message;
-        SwarmMessage sm{msg, std::move(hash), clock_now_ms(), clock_now_ms() + 1h};
-        deliver({&sm, 1});
-    };
-
-    ScopedClockOffset clock{0s};
-    request_from_new_device("h1");
-    REQUIRE(reqids.size() == 1);
-
-    // Aged out, which takes away the row holding the highest id: the one row whose id an insert
-    // would otherwise take next.  Any batch prunes; an empty one keeps this from being the batch
-    // that brings the next request.
-    clock.advance(Devices::LINK_REQUEST_MAX_AGE + 1s);
-    deliver({});
-    REQUIRE(TestHelper::on_loop(*c, [&] {
-                return c->database().conn().prepared_get<int64_t>(
-                        "SELECT count(*) FROM device_link_requests");
-            }) == 0);
-
-    request_from_new_device("h2");
-    REQUIRE(reqids.size() == 2);
-    CHECK(reqids[1] > reqids[0]);
-}
-
 TEST_CASE("Devices - establishing the group", "[core][devices]") {
 
     SECTION("a generated account establishes a group with itself") {
@@ -805,9 +758,21 @@ namespace {
 
 /// An account's existing device, and a second one on the same account asking to join it.
 struct Linking {
-    TempCore core;  // generated, so it is in the group and can admit others
+    // What each side is told.  Declared first so they outlive the Cores that report to them.
+    DeviceEventsRecorder events;
+    DeviceEventsRecorder applicant_events;
+
+    TempCore core{reporting_to(events)};  // generated, so it is in the group and can admit others
     std::array<std::byte, 32> seed = seed_of(core);
-    TempCore applicant{core::predefined_seed{std::span<const std::byte, 32>{seed}}};
+    TempCore applicant{
+            core::predefined_seed{std::span<const std::byte, 32>{seed}},
+            reporting_to(applicant_events)};
+
+    static core::callbacks reporting_to(DeviceEventsRecorder& r) {
+        core::callbacks cb;
+        cb.devices = &r;
+        return cb;
+    }
 
     static std::array<std::byte, 32> seed_of(TempCore& c) {
         std::array<std::byte, 32> out;
@@ -957,8 +922,228 @@ TEST_CASE(
     CHECK(l.core->devices.link_requests(await).empty());
 }
 
+TEST_CASE("Devices - a link request id is never handed out twice", "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto first = l.core->devices.incoming_link_requests(await).at(0).id;
+    l.core->devices.ignore_request(first, await);
+
+    // Forgotten, which takes away the row holding the highest id: the one row whose id an insert
+    // would otherwise take next.
+    REQUIRE(l.core->devices.forget_link_requests(std::vector{first}, await) == 1);
+    REQUIRE(l.core->devices.link_requests(await).empty());
+
+    l.ask(std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min, "L2");
+    auto incoming = l.core->devices.incoming_link_requests(await);
+    REQUIRE(incoming.size() == 1);
+    CHECK(incoming[0].id != first);
+    CHECK_THROWS_AS(l.core->devices.accept_request(first, await), std::invalid_argument);
+}
+
 TEST_CASE("Devices - an id this session never handed out is an error", "[core][devices][linking]") {
     Linking l;
     CHECK_THROWS_AS(l.core->devices.accept_request(12345, await), std::invalid_argument);
     CHECK_THROWS_AS(l.core->devices.ignore_request(12345, await), std::invalid_argument);
+}
+
+namespace {
+auto in(std::chrono::minutes m) {
+    return std::chrono::floor<std::chrono::seconds>(clock_now_s()) + m;
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices events - a request is announced once, by the fetch that brought it",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto sent = l.ask();
+
+    REQUIRE(l.events.added.size() == 1);
+    CHECK(l.events.added[0].sas == sent.sas);
+
+    // Neither reading it nor fetching again announces it a second time.
+    l.core->devices.incoming_link_requests(await);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.added.size() == 1);
+
+    // Where this device stood at startup is the baseline, not news.
+    CHECK(l.events.membership.empty());
+}
+
+TEST_CASE(
+        "Devices events - nothing is announced before the first fetch",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto req = l.applicant->devices.build_link_request(await);
+
+    // Stored, as a request left over from before a restart would be, but the swarm not yet asked.
+    TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1", /*is_final=*/false);
+
+    // A local change reports what it can -- and a request is not something it can report yet.
+    device::Info info{};
+    info.description = "renamed";
+    l.core->devices.update_info(info, await);
+    CHECK(l.events.added.empty());
+
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.added.size() == 1);
+}
+
+TEST_CASE(
+        "Devices events - a request the application already read is not announced",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto req = l.applicant->devices.build_link_request(await);
+    TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1", /*is_final=*/false);
+
+    // Drawn from before the fetch: the application has it, so the fetch must not hand it over
+    // twice.
+    REQUIRE(l.core->devices.incoming_link_requests(await).size() == 1);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.added.empty());
+}
+
+TEST_CASE(
+        "Devices events - a request read after it closed is not reported closed",
+        "[core][devices][linking][events]") {
+    Linking l;
+    auto first = l.applicant->devices.build_link_request(await);
+    TestHelper::deliver_device_message(*l.core, first.message, in(10min), "L1", /*is_final=*/false);
+    auto second = l.applicant->devices.build_link_request(await);
+    TestHelper::deliver_device_message(
+            *l.core, second.message, in(10min), "L2", /*is_final=*/false);
+
+    // The superseded one is there to be read, and reads as superseded.
+    REQUIRE(l.core->devices.link_requests(await).size() == 2);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.ended.empty());
+}
+
+TEST_CASE(
+        "Devices events - a resend closes the old prompt before opening the new one",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+    auto first = l.events.added.at(0).id;
+
+    auto second = l.ask(in(10min), "L2");
+
+    REQUIRE(l.events.ended.size() == 1);
+    CHECK(l.events.ended[0] == std::pair{first, device::LinkRequestEnd::Superseded});
+    REQUIRE(l.events.added.size() == 2);
+    CHECK(l.events.added[1].id != first);
+    CHECK(l.events.added[1].sas == second.sas);
+
+    CHECK(l.events.order == std::vector<std::string>{"added", "ended", "added"});
+}
+
+TEST_CASE(
+        "Devices events - acceptance by another device closes the prompt here",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+    auto id = l.events.added.at(0).id;
+
+    // Another device admitted it, and its group message says so.
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto admitted = l.state_of_applicant();
+    admitted.state = device::State::Registered;
+    auto group = TestHelper::encrypt_device_data(
+            l.core->devices, {{self.id, self}, {admitted.id, admitted}});
+    TestHelper::deliver_device_message(*l.core, group, in(10min), "G1");
+
+    REQUIRE(l.events.ended.size() == 1);
+    CHECK(l.events.ended[0] == std::pair{id, device::LinkRequestEnd::Accepted});
+    REQUIRE(!l.events.replaced.empty());
+    CHECK(l.events.replaced.back().at(l.applicant_id()).state == device::State::Registered);
+}
+
+TEST_CASE(
+        "Devices events - an unanswered request closes when its deadline passes",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask(in(1min));
+    auto id = l.events.added.at(0).id;
+
+    ScopedClockOffset later{2min};
+    TestHelper::finish_fetch(*l.core);
+
+    REQUIRE(l.events.ended.size() == 1);
+    CHECK(l.events.ended[0] == std::pair{id, device::LinkRequestEnd::Expired});
+}
+
+TEST_CASE(
+        "Devices events - ignoring here is not reported back", "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+
+    CHECK(l.core->devices.ignore_request(l.events.added.at(0).id, await));
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.ended.empty());
+}
+
+TEST_CASE(
+        "Devices events - accepting here reports the device list, not a closed request",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+
+    // The list changed, which other views need to hear; the request closing is something only the
+    // caller was waiting on, and it knows.
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.ended.empty());
+    REQUIRE(l.events.replaced.size() == 1);
+    CHECK(l.events.replaced[0].at(l.applicant_id()).state == device::State::Registered);
+}
+
+TEST_CASE(
+        "Devices events - a link request alone does not change the device list",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+    CHECK(l.events.replaced.empty());
+}
+
+TEST_CASE(
+        "Devices events - a removal is reported once, not every time it is restated",
+        "[core][devices][events]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto gone = l.applicant->devices.device_info(await).first;
+    gone.state = device::State::Kicked;
+    gone.kicked = std::chrono::floor<std::chrono::seconds>(clock_now_s()) - 1h;
+    device::map group{{self.id, self}, {gone.id, gone}};
+
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::encrypt_device_data(l.core->devices, group), in(10min), "G1");
+    REQUIRE(l.events.replaced.size() == 1);
+    CHECK(l.events.replaced[0].at(gone.id).state == device::State::Kicked);
+
+    // Every group message carries every tombstone.
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::encrypt_device_data(l.core->devices, group), in(10min), "G2");
+    CHECK(l.events.replaced.size() == 1);
+}
+
+TEST_CASE(
+        "Devices events - a device hears it was admitted, not that it asked",
+        "[core][devices][linking][events]") {
+    Linking l;
+    l.ask();
+
+    // Its own request moved it to Pending, which it knows: it is the one asking.
+    TestHelper::finish_fetch(*l.applicant);
+    CHECK(l.applicant_events.membership.empty());
+
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    auto group = l.core->devices.build_device_group_message().message;
+    TestHelper::deliver_device_message(*l.applicant, group, in(10min), "G1");
+
+    REQUIRE(l.applicant_events.membership.size() == 1);
+    CHECK(l.applicant_events.membership[0] == device::State::Registered);
 }

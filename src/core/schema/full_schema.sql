@@ -13,7 +13,6 @@ CREATE TABLE devices (
     -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 kicked.  Ordered least to most
     -- authoritative because merging compares (state, seqno) as a row value -- see device::State.
     state INTEGER NOT NULL CHECK(state >= 0 AND state <= 3),
-    processing INTEGER,  -- non-null during batch processing: 1=new link request, 2=newly registered, 3=newly removed
     seqno INTEGER NOT NULL DEFAULT 1,
     pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
     broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting

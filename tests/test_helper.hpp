@@ -227,6 +227,38 @@ inline size_t fail_downloads(MockNetwork& net, int16_t status = 404) {
     return pending.size();
 }
 
+/// Keeps everything a Core reports through DeviceEvents, in order.  Reports arrive on Core's loop,
+/// so a test reads these after draining it.  `on_added` runs inside the report itself, for a test
+/// that needs to look at the state it is reported in.
+struct DeviceEventsRecorder : core::DeviceEvents {
+    std::function<void(const core::device::LinkRequest&)> on_added;
+
+    std::vector<core::device::LinkRequest> added;
+    std::vector<std::pair<int, core::device::LinkRequestEnd>> ended;
+    std::vector<core::device::map> replaced;
+    std::vector<core::device::State> membership;
+    std::vector<std::string> order;  // which of the four, as they arrived
+
+    void link_request_added(core::device::LinkRequest request) override {
+        if (on_added)
+            on_added(request);
+        order.push_back("added");
+        added.push_back(std::move(request));
+    }
+    void link_request_ended(int reqid, core::device::LinkRequestEnd why) override {
+        order.push_back("ended");
+        ended.emplace_back(reqid, why);
+    }
+    void devices_replaced(core::device::map devices) override {
+        order.push_back("replaced");
+        replaced.push_back(std::move(devices));
+    }
+    void membership_changed(core::device::State state) override {
+        order.push_back("membership");
+        membership.push_back(state);
+    }
+};
+
 /// The store requests a MockNetwork has captured, in the order they were sent.  Filtered rather
 /// than taken wholesale because a Core with a network attached also fetches PFS keys, so a test
 /// that asked for a send finds retrieves in the list it never asked for.
@@ -580,15 +612,21 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
             core::Core& core,
             std::span<const std::byte> data,
             sys_ms expiry,
-            std::string hash = "hash") {
+            std::string hash = "hash",
+            bool is_final = true) {
         on_loop(core, [&] {
             core::SwarmMessage m{
                     .data = data,
                     .hash = std::move(hash),
                     .timestamp = clock_now_ms(),
                     .expiry = expiry};
-            core.devices.parse_device_messages(std::span{&m, 1}, true);
+            core.devices.parse_device_messages(std::span{&m, 1}, is_final);
         });
+    }
+
+    // A namespace-21 fetch completing with nothing new, which is still a completed fetch.
+    static void finish_fetch(core::Core& core) {
+        on_loop(core, [&] { core.devices.parse_device_messages({}, true); });
     }
 
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.
