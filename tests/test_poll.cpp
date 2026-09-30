@@ -114,7 +114,7 @@ TEST_CASE("Core automatic polling", "[core][poll]") {
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker).message;
 
     sent.callback(
             true, false, 200, {}, make_response(*sent.request.body, 21, outer_msg, "hash1").dump());
@@ -240,7 +240,7 @@ TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[co
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker).message;
 
     TestHelper::poll(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);
@@ -292,7 +292,7 @@ TEST_CASE("Poll: a truncated namespace is continued before it is reported final"
         std::ranges::copy(std::as_bytes(seed_acc.seed()), seed_bytes.begin());
     }
     TempCore linker{core::predefined_seed{std::span<const std::byte, 32>{seed_bytes}}};
-    auto outer_msg = linker->devices.build_link_request(await).message;
+    auto outer_msg = TestHelper::build_link_request(*linker).message;
 
     TestHelper::poll(*core);
     REQUIRE(mock_net->sent_requests.size() == 1);

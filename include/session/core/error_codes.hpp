@@ -12,4 +12,11 @@ namespace session::core::err {
 /// There is no network attached, so nothing that needs one can be done.
 inline constexpr std::string_view network_unavailable = "network.unavailable";
 
+/// The swarm did not store what was sent: it refused it, timed out, or could not be reached.
+/// Trying again may work; the message says which.
+inline constexpr std::string_view store_failed = "swarm.store_failed";
+
+/// This device is already in the account's device group, so there is nothing to ask to join.
+inline constexpr std::string_view already_registered = "device.already_registered";
+
 }  // namespace session::core::err

@@ -105,7 +105,9 @@ class DeviceEvents {
     /// was in the group.  Not the ones asking to join, which arrive as link requests instead.
     virtual void devices_replaced(device::map devices) = 0;
 
-    /// This device's own membership changed: admitted to the group, or removed from it.
+    /// This device's own membership changed: admitted to the group, removed from it, or -- as
+    /// `Unregistered` -- its request to join lapsed unanswered.  Not for the move to `Pending` that
+    /// `Devices::request_link` makes, nor for a request it reports failed: the caller knows.
     virtual void membership_changed(device::State state) = 0;
 };
 

@@ -15,6 +15,7 @@
 #include <session/config/encrypt.hpp>
 #include <session/core.hpp>
 #include <session/core/devices.hpp>
+#include <session/core/error_codes.hpp>
 #include <session/core/link_sas.hpp>
 #include <session/crypto/ed25519.hpp>
 #include <session/crypto/mlkem768.hpp>
@@ -84,6 +85,11 @@ void Devices::init() {
     // after Globals, so `self_id` does not exist yet at that point, and the flag is persisted, so
     // an account created by a run that died before reaching this still gets its group.
     establish_group();
+
+    // A request of ours still waiting from the last run has nothing left to show it with -- its SAS
+    // and deadline went with that run -- so it is withdrawn.  Withdrawn only here: the message
+    // stays in the swarm, and an acceptance that arrives for it still admits us.
+    _withdraw_own_request();
 
     // Where we stand at startup is the baseline, not news: `membership_changed` reports a change
     // from it, not the fact of having a state at all.
@@ -1173,12 +1179,79 @@ void Devices::receive_device_group_message(
     tx.commit();
 }
 
-void Devices::build_link_request(result_function<LinkRequestResult> cb) {
-    async([this] { return _build_link_request(); }, std::move(cb));
+void Devices::request_link(result_function<LinkRequestSent> cb) {
+    enqueue([this, cb = std::move(cb)]() mutable {
+        // Everything that can throw comes before the upload takes `cb`, so this reports at most
+        // once.
+        try {
+            _request_link(cb);
+        } catch (const std::exception& e) {
+            detail::log_component_failure(e);
+            if (cb)
+                cb(unexpected{error_from(e)});
+        }
+    });
 }
 
-Devices::LinkRequestResult Devices::build_link_request(await_t) {
-    return jq().call_get([this] { return _build_link_request(); });
+void Devices::_request_link(result_function<LinkRequestSent>& cb) {
+    assert(on_loop());
+
+    // Also what stops a device with no account getting as far as building a request, since a
+    // network cannot be attached without one.
+    if (!core.network())
+        throw session::error{err::network_unavailable, "Cannot request a link: no network"};
+    if (_device_info().second)
+        throw session::error{
+                err::already_registered, "This device is already in the account's device group"};
+
+    auto req = _build_link_request();
+    LinkRequestSent sent{.sas = req.sas, .expires = clock_now_s() + LINK_REQUEST_TTL};
+    auto which = ++_own_request;
+    _own_deadline = sent.expires;
+
+    std::vector<SwarmStore> stores;
+    stores.push_back(
+            {.ns = config::Namespace::Devices,
+             .data = std::move(req.message),
+             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(LINK_REQUEST_TTL)});
+
+    core._swarm_push(
+            std::move(stores),
+            {},
+            [this, alive = std::weak_ptr<int>{_alive}, which, sent, cb = std::move(cb)](
+                    std::optional<std::vector<SwarmStoreResult>> results) {
+                if (alive.expired())
+                    return;
+
+                if (results && !results->empty() && results->front().stored) {
+                    if (cb)
+                        cb(sent);
+                    return;
+                }
+
+                // Nothing was sent that another device could accept, so nothing is outstanding --
+                // unless a later request has replaced this one, which is still in flight.  The
+                // caller hears it failed, so hearing that we left Pending as well would be news
+                // twice.
+                if (which == _own_request && _withdraw_own_request())
+                    _reported_state = device::State::Unregistered;
+                if (cb)
+                    cb(unexpected{Error{err::store_failed, "The swarm did not store the request"}});
+            });
+
+    _flush_events();
+}
+
+bool Devices::_withdraw_own_request() {
+    assert(on_loop());
+    _own_deadline.reset();
+    return conn()
+            .prepared_maybe_get<int64_t>(
+                    "UPDATE devices SET state = ? WHERE unique_id = ? AND state = ? RETURNING id",
+                    static_cast<int>(device::State::Unregistered),
+                    self_id,
+                    static_cast<int>(device::State::Pending))
+            .has_value();
 }
 
 Devices::LinkRequestResult Devices::_build_link_request() {
@@ -1187,7 +1260,7 @@ Devices::LinkRequestResult Devices::_build_link_request() {
 
     if (is_registered)
         throw std::logic_error{
-                "build_link_request() called on a device that is already registered in the device "
+                "Cannot build a link request: this device is already registered in the device "
                 "group"};
 
     info.id = self_id;
@@ -1740,12 +1813,30 @@ size_t Devices::_forget_link_requests(std::span<const int> reqids) {
 
 void Devices::_flush_events() {
     assert(on_loop());
+    auto now = clock_now_s();
+
+    // Not cleared when we are admitted: the withdrawal finds nothing Pending and does nothing,
+    // which is simpler than clearing the deadline on every path that can admit us.
+    if (_own_deadline && *_own_deadline <= now)
+        _withdraw_own_request();
+    auto next_deadline = _own_deadline;
 
     bool changed = std::exchange(_devices_changed, false);
-    auto* events = cb().devices;
-    if (!events)
-        return;
+    if (auto* events = cb().devices)
+        if (auto theirs = _report_events(*events, changed, now))
+            next_deadline = std::min(next_deadline.value_or(*theirs), *theirs);
 
+    if (next_deadline) {
+        // A non-positive interval would stop the timer instead.  Firing a moment early is harmless:
+        // the flush it runs finds nothing expired and re-arms for the remainder.
+        auto delay = std::chrono::ceil<std::chrono::microseconds>(*next_deadline - clock_now());
+        jq().repeat(_expiry_timer, std::max<std::chrono::microseconds>(delay, 1ms));
+    } else
+        jq().stop(_expiry_timer);
+}
+
+std::optional<std::chrono::sys_seconds> Devices::_report_events(
+        DeviceEvents& events, bool devices_changed, std::chrono::sys_seconds now) {
     // One handler throwing must not take the others' reports down with it.
     auto report = [](std::string_view which, auto&& call) {
         try {
@@ -1756,7 +1847,6 @@ void Devices::_flush_events() {
     };
 
     auto c = conn();
-    auto now = clock_now_s();
     std::optional<std::chrono::sys_seconds> next_deadline;
     auto open_until = [&](std::chrono::sys_seconds expires) {
         next_deadline = std::min(next_deadline.value_or(expires), expires);
@@ -1793,7 +1883,7 @@ void Devices::_flush_events() {
         }
     }
     for (auto [reqid, why] : ended)
-        report("link_request_ended", [&] { events->link_request_ended(reqid, why); });
+        report("link_request_ended", [&] { events.link_request_ended(reqid, why); });
 
     // Only once the swarm has been asked: a request stored before a restart may have been
     // answered or expired while we were away, and the fetch is what says so.
@@ -1803,28 +1893,22 @@ void Devices::_flush_events() {
                 request.id = _reqid_for(row);
                 open_until(request.expires);
                 report("link_request_added",
-                       [&] { events->link_request_added(std::move(request)); });
+                       [&] { events.link_request_added(std::move(request)); });
             }
 
-    if (changed)
-        report("devices_replaced", [&] { events->devices_replaced(devices(true, false, true)); });
+    if (devices_changed)
+        report("devices_replaced", [&] { events.devices_replaced(devices(true, false, true)); });
 
     if (auto own = c.prepared_maybe_get<int>(
                 "SELECT state FROM devices WHERE unique_id = ?", self_id)) {
         auto state = static_cast<device::State>(*own);
         if (state != _reported_state) {
             _reported_state = state;
-            report("membership_changed", [&] { events->membership_changed(state); });
+            report("membership_changed", [&] { events.membership_changed(state); });
         }
     }
 
-    if (next_deadline) {
-        // A non-positive interval would stop the timer instead.  Firing a moment early is harmless:
-        // the flush it runs finds nothing expired and re-arms for the remainder.
-        auto delay = std::chrono::ceil<std::chrono::microseconds>(*next_deadline - clock_now());
-        jq().repeat(_expiry_timer, std::max<std::chrono::microseconds>(delay, 1ms));
-    } else
-        jq().stop(_expiry_timer);
+    return next_deadline;
 }
 
 void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool is_final) {

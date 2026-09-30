@@ -605,6 +605,12 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         d.receive_device_group_message(data, hash);
     }
 
+    // A link request as `request_link` builds it, without the upload, for a test that hands it to
+    // another device itself.  Leaves no deadline behind, so the request never lapses on its own.
+    static auto build_link_request(core::Core& core) {
+        return on_loop(core, [&] { return core.devices._build_link_request(); });
+    }
+
     // Delivers one namespace-21 message as a completed fetch would: through the same dispatch, with
     // `is_final` set so the deferred work -- the prompts, and the ids they carry -- happens too,
     // and with the expiry the swarm assigned it, which a link request takes as its deadline.

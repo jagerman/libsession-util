@@ -30,6 +30,7 @@ namespace session::core {
 using namespace std::literals;
 
 class Core;
+class DeviceEvents;
 
 namespace device {
 
@@ -267,15 +268,21 @@ class Devices final : detail::CoreComponent {
     std::optional<device::State> _reported_state;
     std::unordered_set<int64_t> _ended;
 
-    // Fires a flush at the earliest deadline among the requests handed out and still open, so a
-    // prompt closes when its request expires rather than at whichever fetch next completes -- which
+    // Fires a flush at the earliest deadline among our own request and those handed out and still
+    // open, so each lapses when it expires rather than at whichever fetch next completes -- which
     // could be an application-chosen interval away, or never while the network is down.
     quic::TimerID _expiry_timer;
 
-    // Reports what changed through `callbacks::devices`.  Run once a fetch has been merged and at
+    // Lapses our own request if its deadline has passed, reports what changed through
+    // `callbacks::devices`, and re-arms the expiry timer.  Run once a fetch has been merged and at
     // the end of each call here that changes something, never partway through, so a handler never
     // sees a half-applied state.
     void _flush_events();
+
+    // The reporting half, for when there is someone to report to.  Answers the earliest deadline
+    // among the requests it has handed out and are still open.
+    std::optional<std::chrono::sys_seconds> _report_events(
+            DeviceEvents& events, bool devices_changed, std::chrono::sys_seconds now);
 
     // Reads link requests with the device each came from.  `pending_only` restricts to those still
     // awaiting an answer and not yet past their deadline.
@@ -344,21 +351,31 @@ class Devices final : detail::CoreComponent {
     void device_info(result_function<std::pair<device::Info, bool>> cb);
     std::pair<device::Info, bool> device_info(await_t);
 
-    struct LinkRequestResult {
-        std::vector<std::byte> message;        // encrypted bytes to push to Namespace::Devices
-        std::array<std::string_view, 21> sas;  // emoji SAS sequence for user display
+    struct LinkRequestSent {
+        /// The 21 emoji the user compares against what the accepting device shows; the first 7 are
+        /// the standard display.
+        std::array<std::string_view, 21> sas;
+
+        /// When the request lapses unanswered.  After it no device can accept it, and asking again
+        /// is the only way in.
+        std::chrono::sys_seconds expires;
     };
 
-    // Builds an outgoing link request message to upload to Namespace::Devices.  This should
-    // only be called when this device is not currently registered in the device group; throws
-    // std::logic_error if it is already registered.  The returned message is to be pushed to
-    // Namespace::Devices with a 10-minute TTL.  The sas field contains the short authentication
-    // string that should be displayed to the user for verification against the accepting device.
+    // Asks the account's other devices to admit this one: uploads a link request for them to
+    // accept, and answers once the swarm has stored it.  The account must already be restored here
+    // -- the request is encrypted to its root key -- and this device not yet in its group.
     //
-    // Reads the device config and writes the pending request, so it happens on the loop either
-    // way; an application driving a linking screen is on its own thread and wants one of these.
-    void build_link_request(result_function<LinkRequestResult> cb);
-    LinkRequestResult build_link_request(await_t);
+    // What happens next is reported through `callbacks::devices`: `membership_changed(Registered)`
+    // once a device accepts, or `membership_changed(Unregistered)` if `expires` passes first.
+    // Asking again replaces the request, and its SAS, with a new one.
+    //
+    // A request lasts only as long as this Core: nothing needed to show it again is kept, so one
+    // left waiting at shutdown is dropped at the next start.  An acceptance still admits us if it
+    // arrives afterwards.
+    //
+    // Fails with `err::already_registered`, `err::network_unavailable`, or `err::store_failed` --
+    // the last worth retrying.  None of them leaves a request outstanding.
+    void request_link(result_function<LinkRequestSent> cb);
 
     // Every link request this device has seen, newest first: pending, answered, superseded and
     // expired alike.  For a history view.
@@ -405,7 +422,28 @@ class Devices final : detail::CoreComponent {
     size_t forget_link_requests(std::span<const int> reqids, await_t);
 
   private:
+    struct LinkRequestResult {
+        std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
+        std::array<std::string_view, 21> sas;
+    };
+
+    // Builds our link request and moves our own row to Pending.  Throws std::logic_error if this
+    // device is already registered.
     LinkRequestResult _build_link_request();
+
+    // Takes the handler by reference and moves from it only once nothing more can throw, so that
+    // `request_link` can still report a failure through it.
+    void _request_link(result_function<LinkRequestSent>& cb);
+
+    // Our own request's deadline, while one is outstanding, and which request that is: a failed
+    // upload must withdraw only the request it was carrying, not one asked for after it.
+    std::optional<std::chrono::sys_seconds> _own_deadline;
+    int _own_request = 0;
+
+    // Returns our own row from Pending to Unregistered, answering whether it was Pending.  Local
+    // only: a request already in the swarm can still be accepted, and admits us if it is.
+    bool _withdraw_own_request();
+
     bool _accept_request(int reqid);
     bool _ignore_request(int reqid);
     size_t _forget_link_requests(std::span<const int> reqids);
@@ -487,8 +525,9 @@ class Devices final : detail::CoreComponent {
     // offline for longer than this loses the only record of what its group is.
     static constexpr auto DEVICE_GROUP_TTL = 30 * 24h;
 
-    // How long to keep a pending link request before pruning it as stale.
-    static constexpr auto LINK_REQUEST_MAX_AGE = 10min;
+    // How long the swarm holds a link request, which is how long it can be answered.  Linking
+    // needs the user at both devices at once, so a longer wait buys nothing.
+    static constexpr auto LINK_REQUEST_TTL = 10min;
 
     // Rotates the shared account keys used for PFS+PQ message encryption.  Generates a new random
     // seed, stores it in the database, marks the previous active key as rotated, and prunes keys

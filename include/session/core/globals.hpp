@@ -118,7 +118,7 @@ class Globals final : detail::CoreComponent {
     ///
     /// This is also the first half of linking a new device to an existing account: a link request
     /// is encrypted to the account root key, so the seed must be adopted before
-    /// devices.build_link_request() can be called.
+    /// devices.request_link() can be called.
     ///
     /// The handler form takes the seed by value because it outlives the call: it is carried to the
     /// loop and zeroed with the job, rather than borrowed from a caller that has already returned.
