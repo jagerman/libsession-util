@@ -1192,13 +1192,18 @@ TEST_CASE(
 
 namespace {
 
-using Asked = std::optional<Expected<Devices::LinkRequestSent>>;
+using Asked = std::optional<Expected<Devices::OutgoingLinkRequest>>;
 
 // Asks for a link from `c` and runs the job, so that the upload has been sent by the time this
 // returns.  What it answers lands in `into`, once the upload is answered.
 void request_link(TempCore& c, Asked& into) {
-    c->devices.request_link([&into](Expected<Devices::LinkRequestSent> r) { into = std::move(r); });
+    c->devices.request_link(
+            [&into](Expected<Devices::OutgoingLinkRequest> r) { into = std::move(r); });
     TestHelper::drain(*c);
+}
+
+bool same(const Devices::OutgoingLinkRequest& a, const Devices::OutgoingLinkRequest& b) {
+    return a.sas == b.sas && a.expires == b.expires;
 }
 
 // The link request carried by the oldest upload not yet answered.  Read before answering it, since
@@ -1247,14 +1252,21 @@ TEST_CASE(
     CHECK(store["ttl"] == std::chrono::milliseconds{Devices::LINK_REQUEST_TTL}.count());
     auto message = uploaded(*net);
 
-    // Not answered until the swarm has it: until then there is nothing another device could accept.
+    // Not answered, nor there to be read, until the swarm has it: until then there is nothing
+    // another device could accept.
     CHECK_FALSE(got);
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
     answer_upload(l.applicant, *net, true);
     REQUIRE(got);
     REQUIRE(got->has_value());
     auto asked = **got;
     CHECK(asked.expires > clock_now_s() + 9min);
     CHECK(own_state(l.applicant) == device::State::Pending);
+
+    // What the waiting screen is redrawn from is what it was first drawn from.
+    auto waiting = l.applicant->devices.outgoing_link_request(await);
+    REQUIRE(waiting);
+    CHECK(same(*waiting, asked));
 
     // The other device prompts with what this one shows.
     TestHelper::deliver_device_message(*l.core, message, asked.expires, "L1");
@@ -1266,6 +1278,7 @@ TEST_CASE(
     TestHelper::deliver_device_message(*l.applicant, group, in(10min), "G1");
 
     CHECK(l.applicant_events.membership == std::vector{device::State::Registered});
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
 }
 
 TEST_CASE(
@@ -1281,6 +1294,7 @@ TEST_CASE(
     REQUIRE_FALSE(got->has_value());
     CHECK(got->error().code == err::store_failed);
     CHECK(own_state(l.applicant) == device::State::Unregistered);
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
 
     // The caller has been told; the membership it never left is not news.
     TestHelper::finish_fetch(*l.applicant);
@@ -1303,8 +1317,34 @@ TEST_CASE(
 
     answer_upload(l.applicant, *net, true);
     REQUIRE(second);
-    CHECK(second->has_value());
+    REQUIRE(second->has_value());
     CHECK(own_state(l.applicant) == device::State::Pending);
+    auto waiting = l.applicant->devices.outgoing_link_request(await);
+    REQUIRE(waiting);
+    CHECK(same(*waiting, **second));
+}
+
+TEST_CASE(
+        "Devices - a request being replaced is not shown while its replacement uploads",
+        "[core][devices][linking][request]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.applicant);
+    Asked first, second;
+    request_link(l.applicant, first);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(l.applicant->devices.outgoing_link_request(await));
+
+    // Its SAS is about to be superseded, so it must not be what a redraw shows in the meantime.
+    request_link(l.applicant, second);
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
+
+    answer_upload(l.applicant, *net, true);
+    auto waiting = l.applicant->devices.outgoing_link_request(await);
+    REQUIRE(waiting);
+    REQUIRE(second);
+    REQUIRE(second->has_value());
+    CHECK(same(*waiting, **second));
+    CHECK(waiting->sas != (*first)->sas);
 }
 
 TEST_CASE(
@@ -1327,23 +1367,55 @@ TEST_CASE(
     REQUIRE(eventually(*l.applicant, [&] { return !l.applicant_events.membership.empty(); }));
     CHECK(l.applicant_events.membership == std::vector{device::State::Unregistered});
     CHECK(own_state(l.applicant) == device::State::Unregistered);
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
 }
 
+namespace {
+void restart_applicant(Linking& l) {
+    l.applicant.core.reset();
+    l.applicant.core = std::make_unique<core::Core>(
+            l.applicant.path, Linking::reporting_to(l.applicant_events));
+}
+}  // namespace
+
 TEST_CASE(
-        "Devices - a link request left waiting at shutdown is withdrawn at the next start",
+        "Devices - a link request left waiting at shutdown is still waiting after a restart",
         "[core][devices][linking][request]") {
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked got;
     request_link(l.applicant, got);
     answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+
+    restart_applicant(l);
+
+    CHECK(own_state(l.applicant) == device::State::Pending);
+    auto waiting = l.applicant->devices.outgoing_link_request(await);
+    REQUIRE(waiting);
+    CHECK(same(*waiting, **got));
+
+    // And it still lapses, with no fetch to notice: the restart re-arms its deadline.
+    ScopedClockOffset later{Devices::LINK_REQUEST_TTL - 1s};
+    restart_applicant(l);
+    REQUIRE(eventually(*l.applicant, [&] { return !l.applicant_events.membership.empty(); }));
+    CHECK(l.applicant_events.membership == std::vector{device::State::Unregistered});
+}
+
+TEST_CASE(
+        "Devices - a link request never confirmed stored is withdrawn at the next start",
+        "[core][devices][linking][request]") {
+    Linking l;
+    attach_mock_network(*l.applicant);
+    Asked got;
+    request_link(l.applicant, got);
     REQUIRE(own_state(l.applicant) == device::State::Pending);
 
-    l.applicant.core.reset();
-    l.applicant.core = std::make_unique<core::Core>(
-            l.applicant.path, Linking::reporting_to(l.applicant_events));
+    restart_applicant(l);
 
     CHECK(own_state(l.applicant) == device::State::Unregistered);
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
     TestHelper::finish_fetch(*l.applicant);
     CHECK(l.applicant_events.membership.empty());
 }

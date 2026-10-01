@@ -351,7 +351,8 @@ class Devices final : detail::CoreComponent {
     void device_info(result_function<std::pair<device::Info, bool>> cb);
     std::pair<device::Info, bool> device_info(await_t);
 
-    struct LinkRequestSent {
+    /// This device's own link request, as the waiting screen shows it.
+    struct OutgoingLinkRequest {
         /// The 21 emoji the user compares against what the accepting device shows; the first 7 are
         /// the standard display.
         std::array<std::string_view, 21> sas;
@@ -369,13 +370,19 @@ class Devices final : detail::CoreComponent {
     // once a device accepts, or `membership_changed(Unregistered)` if `expires` passes first.
     // Asking again replaces the request, and its SAS, with a new one.
     //
-    // A request lasts only as long as this Core: nothing needed to show it again is kept, so one
-    // left waiting at shutdown is dropped at the next start.  An acceptance still admits us if it
-    // arrives afterwards.
-    //
     // Fails with `err::already_registered`, `err::network_unavailable`, or `err::store_failed` --
     // the last worth retrying.  None of them leaves a request outstanding.
-    void request_link(result_function<LinkRequestSent> cb);
+    void request_link(result_function<OutgoingLinkRequest> cb);
+
+    // The request `request_link` made, while it is still waiting for an answer: stored by the
+    // swarm, not yet accepted, and not past its deadline.  Nothing otherwise -- including while the
+    // upload is still in flight, when there is nothing another device could accept yet.
+    //
+    // What a waiting screen is drawn from, each time it is drawn or reopened, and what to read
+    // again on `membership_changed`.  Survives a restart for as long as the request itself does,
+    // since the swarm's copy stays acceptable until its deadline either way.
+    void outgoing_link_request(result_function<std::optional<OutgoingLinkRequest>> cb);
+    std::optional<OutgoingLinkRequest> outgoing_link_request(await_t);
 
     // Every link request this device has seen, newest first: pending, answered, superseded and
     // expired alike.  For a history view.
@@ -424,6 +431,7 @@ class Devices final : detail::CoreComponent {
   private:
     struct LinkRequestResult {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
+        std::array<std::byte, 16> sas_seed;
         std::array<std::string_view, 21> sas;
     };
 
@@ -433,16 +441,25 @@ class Devices final : detail::CoreComponent {
 
     // Takes the handler by reference and moves from it only once nothing more can throw, so that
     // `request_link` can still report a failure through it.
-    void _request_link(result_function<LinkRequestSent>& cb);
+    void _request_link(result_function<OutgoingLinkRequest>& cb);
 
-    // Our own request's deadline, while one is outstanding, and which request that is: a failed
-    // upload must withdraw only the request it was carrying, not one asked for after it.
-    std::optional<std::chrono::sys_seconds> _own_deadline;
+    // Which of our requests is the latest: an upload answering must record, or withdraw, only the
+    // request it carried, not one asked for after it.
     int _own_request = 0;
 
-    // Returns our own row from Pending to Unregistered, answering whether it was Pending.  Local
-    // only: a request already in the swarm can still be accepted, and admits us if it is.
+    // Our request's deadline and SAS seed, kept in Globals from the swarm storing it until it is
+    // withdrawn.  Kept rather than held in memory so that the waiting screen can be drawn again
+    // after a restart, for a request the swarm still holds.
+    std::optional<std::chrono::sys_seconds> _own_deadline();
+    std::optional<OutgoingLinkRequest> _outgoing_link_request();
+
+    // Returns our own row from Pending to Unregistered and forgets the request, answering whether
+    // it was Pending.  Local only: a request already in the swarm can still be accepted, and admits
+    // us if it is.
     bool _withdraw_own_request();
+
+    // Points the expiry timer at `deadline`, or stops it.
+    void _arm_expiry(std::optional<std::chrono::sys_seconds> deadline);
 
     bool _accept_request(int reqid);
     bool _ignore_request(int reqid);
