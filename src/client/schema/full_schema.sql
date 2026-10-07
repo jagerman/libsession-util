@@ -128,7 +128,11 @@ CREATE TABLE conversations (
 CREATE INDEX conversations_order ON conversations(priority DESC, last_activity DESC);
 
 CREATE TABLE messages (
-    id INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT so that no id is ever handed out twice.  Without it, deleting the newest row
+    -- frees its id for the next insert, and the id is held well beyond any one transaction: by the
+    -- application, which acts on messages by id, and by our own sends, uploads and transfers, which
+    -- report back against it.  Anything still holding the old id would then act on the new message.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     -- The sender's Content.msgId: 8 random bytes separating this message from another they sent in
     -- the same millisecond.  Every copy of a message carries the same value -- it is set before the
@@ -291,7 +295,11 @@ CREATE TABLE attachment_cache (
     -- Surrogate, so that an attachment row referencing this stores an integer rather than a second
     -- copy of the name -- and so that the name is free to change shape later without the references
     -- to it meaning anything different.
-    id INTEGER PRIMARY KEY,
+    --
+    -- AUTOINCREMENT because a cache hit holds this across a disk read, to mark the entry used once
+    -- the read is done.  Were an eviction and a new entry to free and retake the id meanwhile, that
+    -- mark would land on the wrong file.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     -- Keyed (`cache::name_for`) so that someone reading the cache directory cannot tell which
     -- files this account has fetched.
     name TEXT NOT NULL UNIQUE,
