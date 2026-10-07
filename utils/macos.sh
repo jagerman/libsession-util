@@ -12,18 +12,12 @@ if ! command -v xcodebuild; then
     exit 1
 fi
 
+. "$(dirname "$0")/archive-name.sh"
+
 archive="${1:-libsession-util-macos-TAG.tar.xz}"
 
 if [[ "$archive" =~ TAG ]]; then
-    if [ -n "$DRONE_TAG" ]; then
-        tag="$DRONE_TAG"
-    elif [ -n "$DRONE_COMMIT" ]; then
-        tag="$(date --date=@$DRONE_BUILD_CREATED +%Y%m%dT%H%M%SZ)-${DRONE_COMMIT:0:9}"
-    else
-        tag="$(date +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=9 HEAD)"
-    fi
-
-    archive="${archive/TAG/$tag}"
+    archive="$(archive_name "$archive")"
 fi
 
 
