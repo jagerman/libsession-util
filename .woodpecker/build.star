@@ -94,14 +94,34 @@ def test_commands(runner = ""):
         for t in ["testLogging", "testAll"]
     ]
 
-def workflow(name, platform, steps, when = None):
-    return {
+def tests(runner = ""):
+    return {"name": "tests", "commands": test_commands(runner)}
+
+# Checks that a database made by every earlier schema in the history upgrades to the current one.
+# Those schemas exist only in git, so this needs the whole history and the tags, which the default
+# shallow clone has neither of.
+schema_history = {
+    "name": "schema history",
+    "pkgs": test_deps + ["git"],
+    "commands": ["tests/schema_history_check.sh build/tests/schema-upgrade-check"],
+}
+full_clone = [{
+    "name": "clone",
+    "image": "woodpeckerci/plugin-git:2",
+    "settings": {"depth": 0, "partial": False, "tags": True},
+}]
+
+def workflow(name, platform, steps, when = None, clone = None):
+    wf = {
         "name": name,
         "labels": {"platform": platform, "backend": "local" if platform.startswith("darwin/") else "docker"},
         # The debian/* and ubuntu/* branches build packages, with CI configs of their own.
         "when": when or [{"event": events, "branch": {"exclude": ["debian/*", "ubuntu/*"]}}],
         "steps": steps,
     }
+    if clone:
+        wf["clone"] = clone
+    return wf
 
 # Installs `pkgs` in a fresh container of `image`, from deb.session.foundation as well if wanted.
 def apt_install(image, pkgs, session_repo = True, foreign_arch = None):
@@ -156,11 +176,12 @@ def linux(
         cmake = {},
         jobs = 6,
         test_runner = "",
-        checks = None):
+        checks = None,
+        clone = None):
     if cmake.get("BUILD_STATIC_DEPS"):
         system = []
     if checks == None:
-        checks = [{"name": "tests", "commands": test_commands(test_runner)}]
+        checks = [tests(test_runner)]
     image = registry + image
     steps = [build_step(
         image,
@@ -174,7 +195,7 @@ def linux(
             "pull": True,
             "commands": apt_install(image, check.get("pkgs", test_deps), session_repo, foreign_arch) + check["commands"],
         })
-    return workflow(name, "linux/" + arch, steps)
+    return workflow(name, "linux/" + arch, steps, clone = clone)
 
 def clang(version):
     return linux(
@@ -345,8 +366,7 @@ def main(ctx):
             "Debian sid (live tests)",
             "debian-sid",
             cmake = {"ENABLE_NETWORKING": True, "ENABLE_NETWORKING_SROUTER": True, "BUILD_LIVE_TESTS": True},
-            checks = [{"name": "tests", "commands": test_commands()}] +
-                     [live_test(m) for m in ["onionreq", "srouter", "direct"]],
+            checks = [tests()] + [live_test(m) for m in ["onionreq", "srouter", "direct"]],
         ),
 
         # Live Pro-backend integration tests, which stand in for the ordinary test run.
@@ -374,6 +394,7 @@ def main(ctx):
         clang(19),
         full_llvm(19),
         linux("Debian stable (i386)", "debian-stable/i386"),
+        linux("Debian 13", "debian-trixie", checks = [tests(), schema_history], clone = full_clone),
         linux("Debian 12", "debian-bookworm"),
         linux("Ubuntu latest", "ubuntu-rolling"),
         linux("Ubuntu LTS", "ubuntu-lts"),
