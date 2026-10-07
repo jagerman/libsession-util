@@ -140,7 +140,7 @@ if [ "${SHOULD_BUILD_STATIC_LIBS}" == "SHOULD_BUILD_STATIC_LIBS" ]; then
             -DSROUTER_DAEMON=OFF \
             -DSUBMODULE_CHECK=$submodule_check \
             -DCMAKE_BUILD_TYPE=$build_type \
-            -DLOCAL_MIRROR=https://oxen.rocks/deps
+            -DLOCAL_MIRROR=https://builds.session.codes/deps
     done
 fi
 

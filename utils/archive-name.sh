@@ -5,10 +5,10 @@
 # build agrees, and the current ones otherwise.
 archive_name() {
     local tag
-    if [ -n "$DRONE_TAG" ]; then
-        tag="$DRONE_TAG"
-    elif [ -n "$DRONE_COMMIT" ]; then
-        tag="$(date --date=@$DRONE_BUILD_CREATED +%Y%m%dT%H%M%SZ)-${DRONE_COMMIT:0:9}"
+    if [ -n "$CI_COMMIT_TAG" ]; then
+        tag="$CI_COMMIT_TAG"
+    elif [ -n "$CI_COMMIT_SHA" ]; then
+        tag="$(date --date=@$CI_PIPELINE_CREATED +%Y%m%dT%H%M%SZ)-${CI_COMMIT_SHA:0:9}"
     else
         tag="$(date +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=9 HEAD)"
     fi

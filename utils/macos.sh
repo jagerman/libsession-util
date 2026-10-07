@@ -29,7 +29,7 @@ for i in arm64 x86_64; do
     if [ "$(uname -m)" == "$i" ]; then
         echo "Building for macos ($i) in $build"
         ./utils/static-bundle.sh "$build" "" \
-            -DLOCAL_MIRROR=https://oxen.rocks/deps
+            -DLOCAL_MIRROR=https://builds.session.codes/deps
     else
         echo "Cross-compiling for macos ($i) in $build"
         # The args here are a bit weird:
@@ -44,7 +44,7 @@ for i in arm64 x86_64; do
             -DCMAKE_SYSTEM_NAME=Darwin \
             -DARCH_TRIPLET="$i-apple-darwin16" \
             -DCMAKE_OSX_ARCHITECTURES=$i \
-            -DLOCAL_MIRROR=https://oxen.rocks/deps
+            -DLOCAL_MIRROR=https://builds.session.codes/deps
     fi
 done
 

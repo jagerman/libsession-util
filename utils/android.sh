@@ -34,7 +34,7 @@ for abi in "${abis[@]}"; do
         -DANDROID_ARM_MODE=arm \
         -DANDROID_PLATFORM=android-23 \
         -DANDROID_STL=c++_static \
-        -DLOCAL_MIRROR=https://oxen.rocks/deps
+        -DLOCAL_MIRROR=https://builds.session.codes/deps
 done
 
 cd build-android
