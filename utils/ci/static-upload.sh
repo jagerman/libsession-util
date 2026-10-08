@@ -16,7 +16,8 @@ set -o xtrace  # Don't start tracing until *after* we write the ssh key
 
 chmod 600 ssh_key
 
-branch_or_tag=${CI_COMMIT_BRANCH:-${CI_COMMIT_TAG:-unknown}}
+# Tag first: a tag build has a branch too, which Woodpecker sets to the tag's ref (refs/tags/v1.2.3).
+branch_or_tag=${CI_COMMIT_TAG:-${CI_COMMIT_BRANCH:-unknown}}
 
 upload_to="builds.session.codes/${CI_REPO// /_}/${branch_or_tag// /_}"
 
