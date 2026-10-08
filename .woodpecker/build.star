@@ -292,11 +292,10 @@ pro_backend_git = "https://github.com/session-foundation/session-pro-backend.git
 # Track upstream mainline (session-foundation dev): the [pro_live] drift check is meant to follow it.
 pro_backend_ref = "dev"
 
-# What the live Pro-backend check needs beyond the test deps: postgres, the session-router key tool,
-# the backend's python3-* runtime, and clone/venv tooling.
+# What the live Pro-backend check needs beyond the test deps: postgres, the backend's python3-*
+# runtime, and clone/venv tooling.
 pro_backend_pkgs = [
     "postgresql",
-    "session-router-bin",
     "python3-session-util",
     "python3-nacl",
     "python3-psycopg",
