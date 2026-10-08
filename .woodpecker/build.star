@@ -426,7 +426,7 @@ def main(ctx):
         macos("macOS Arm64 (Debug)", "arm64", cmake = {"CMAKE_BUILD_TYPE": "Debug"}),
 
         static_linux("Static Linux: amd64", "debian-stable", "libsession-util-linux-amd64-TAG.tar.xz"),
-        static_linux("Static Linux: i386", "debian-stable", "libsession-util-linux-i386-TAG.tar.xz"),
+        static_linux("Static Linux: i386", "debian-stable/i386", "libsession-util-linux-i386-TAG.tar.xz"),
         static_linux("Static Linux: arm64", "debian-stable", "libsession-util-linux-arm64-TAG.tar.xz", arch = "arm64"),
         static_linux(
             "Static Linux: armhf",
