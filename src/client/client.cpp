@@ -14,6 +14,8 @@
 #include <session/config/contacts.hpp>
 #include <session/config/convo_info_volatile.hpp>
 #include <session/config/expiring.hpp>
+#include <session/config/local.hpp>
+#include <session/config/user_groups.hpp>
 #include <session/config/user_profile.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
@@ -991,6 +993,29 @@ void Client::attachment_cache_size(result_function<int64_t> cb) {
 }
 int64_t Client::attachment_cache_size(await_t) {
     return call_get([this] { return _attachment_cache_size(); });
+}
+
+std::vector<ConfigSize> Client::_config_sizes() {
+    if (!core.globals.have_account())
+        return {};
+    auto& configs = core.configs;
+    auto size = [](config::ConfigBase& conf) {
+        return static_cast<int64_t>(conf.make_dump().size());
+    };
+    return {
+            {"user_profile", size(configs.user_profile())},
+            {"contacts", size(configs.contacts())},
+            {"convo_info_volatile", size(configs.convo_info_volatile())},
+            {"user_groups", size(configs.user_groups())},
+            {"local", size(configs.local())},
+    };
+}
+
+void Client::config_sizes(result_function<std::vector<ConfigSize>> cb) {
+    _async([this] { return _config_sizes(); }, std::move(cb));
+}
+std::vector<ConfigSize> Client::config_sizes(await_t) {
+    return call_get([this] { return _config_sizes(); });
 }
 
 void Client::set_auto_download_max_size(std::optional<int64_t> bytes, result_function<> cb) {
