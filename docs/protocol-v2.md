@@ -223,6 +223,7 @@ as:
         "group": "...encrypted 8-byte group identifier...",
         "keys": "[abc123...][def456...][789aaa...][888bbb...]],
         "kicked": "[k123...][k456...][k789...][kabc...]",
+        "link_x25519": "...the group's current account X25519 pubkey...",
         "payload": "...encrypted payload...",
         "signature": "...above data signed with long-term account key...",
     }
@@ -236,6 +237,12 @@ where:
   identifier" below.
 - `kicked` announces removals to devices that can no longer read the payload; see "Announcing
   removals" below.
+- `link_x25519` is the X25519 half of the group's current account key (see "Account keys"), to which
+  a device asking to join the group encrypts its link request (see "Initiating a device link").  Only
+  members hold the matching secret, so only they can read requests.  The ML-KEM half is not
+  published here: it would add over a kilobyte to every group message, to protect a short-lived
+  request whose contents -- a device's public keys and description -- are of little use to anyone
+  recording it for a future quantum attack.
 - `ciphertexts` is a packed binary value of N×4×1088 bytes where each 1088 byte segment contains an
   ML-KEM768 ciphertext for one of the accounts devices.  When the number of devices is not a
   multiple of 4, the unused slots are filled with random data.
@@ -380,7 +387,7 @@ It is shown as a SAS by the same mechanism as a link request's (see "Handshake s
 string"), from a 16-byte seed hashed from the identifier rather than from the identifier itself, so
 that groups created close together do not look alike:
 
-    seed = BLAKE2b_16(identifier, pers="SessionDevGroupI")
+    seed = BLAKE2b_16(identifier, pers="SessionDvGrp_SAS")
 
 from which the 21 emoji are taken exactly as for a link request.  The suggested basic display is the
 first 4 of them together with the creation time; the full 21 are there for an extended view.  Two
@@ -398,8 +405,8 @@ It is carried in the outer structure, encrypted so that any device holding the a
 read it -- including one not yet in any group -- while to anyone else it differs from message to
 message:
 
-    k     = BLAKE2b_32(seed, pers="SessionDevGroupK")
-    nonce = BLAKE2b_24(A, pers="SessionDevGroupN")
+    k     = BLAKE2b_32(seed, pers="SessionDvGrpID_K")
+    nonce = BLAKE2b_24(A, pers="SessionDvGrpID_N")
     group = XChaCha20(identifier, key=k, nonce=nonce)
 
 where `seed` is the account root seed and `A` is the message's ephemeral X25519 pubkey.  There is no
@@ -434,7 +441,6 @@ message namespace 21.  This message is constructed as follows:
 
     {
         "id": "unique-client-identifier1",
-        "group": "...8-byte identifier of the group asked to join...",
         "info": {
             "type": "i",
             "timestamp": 1777777777,
@@ -447,16 +453,59 @@ message namespace 21.  This message is constructed as follows:
         }
     }
 
-That is, it is simply the information to add to the linked device list plus some metadata, and the
-identifier of the group asked to join, read from that group's messages.  Only that group's devices
-prompt for it: the request is readable by every device on the account, and without the identifier
-the devices of every group the account has would prompt for the same request, with the same SAS.
+That is, it is simply the information to add to the linked device list plus some metadata.  It is
+uploaded to namespace 21 with a TTL of 10 minutes.  (Since device linking requires a user to have
+access to both devices at the same time, a longer TTL accomplishes nothing.)
 
-This request is encrypted using the session account root key, and uploaded to namespace 21 with a TTL of
-10 minutes.  (Since device linking requires a user to have access to both devices at the same time,
-a longer TTL accomplishes nothing).  Note that the above is not signed explicitly: the recipient
-already needs the account long-term root key to decrypt the content, and so an additional signature
-by that same key would add nothing.
+The request is encrypted to the group asked to join, using the `link_x25519` pubkey from that
+group's messages, so that only the group's members can read it.  It must not be readable by every
+holder of the root seed: a removed device still holds the seed, and a request it could read would
+give it the requesting device's keys and SAS, enough to admit that device into a group of its own.
+Encrypting to the group also means only that group's devices prompt for it, where an account has
+more than one.
+
+The encryption is that of one-to-one messages (see "One-to-one Message Encryption") without the
+ML-KEM steps, there being no ML-KEM key to encapsulate to, and so not X-Wing.  With `X` the group's
+`link_x25519` and `S` the account's long-term pubkey:
+
+1. Generate an ephemeral X25519 keypair, e/E.
+
+2. Compute the encrypted key indicator, which tells the group's devices which of their current and
+   recent account keys the request was encrypted to:
+
+       kiss = BLAKE2b_2(E || S, key=eS, pers="SessionDvGrpKISS")
+       ki   = X[0:2] ⊕ kiss
+
+   Without `kiss` the indicator would tell anyone who can see the group's messages, where `X`
+   appears in the clear, which group and key a request was meant for.
+
+3. Derive the key and nonce:
+
+       kn = BLAKE2b_56(eX || E || X, pers="SessionDvGrpLink")
+       k  = kn[0:32]
+       n  = kn[32:56]
+
+   BLAKE2b rather than the SHA3-256 and SHAKE256 of one-to-one messages: those follow from X-Wing,
+   which this is not, and every other derivation in device groups is BLAKE2b.
+
+4. The request dict above is signed with the account's Ed25519 key, under a `"~"` key appended to
+   it in the same way as a one-to-one message's inner signature.  A request is not otherwise
+   authenticated: without the signature, anyone able to see the group's `link_x25519` -- including
+   a storage server -- could encrypt a request of their own to it, and have the group's devices
+   prompt for a device that does not exist.
+
+5. The signed request is encrypted with XChaCha20-Poly1305 using `k` and `n`, and the message is
+   the bt-encoded dict:
+
+       {
+           "": "L",
+           "E": "...ephemeral X25519 pubkey...",
+           "L": "...encrypted request...",
+           "i": "...ki, the 2-byte encrypted key indicator..."
+       }
+
+A member decrypts with `xE` for the account key whose X25519 pubkey begins with `ki ⊕ kiss`,
+`kiss` being computed as `BLAKE2b_2(E || S, key=sE, ...)` from the account's long-term secret `s`.
 
 #### Handshake short authentication string
 
@@ -473,7 +522,7 @@ The exact sequence is calculated from a list of 6-bit (0-63) integer values that
 of the emoji value, generated as follows:
 
 - seed = Argon2id(M, salt=blake2b(M, size=16, pers="SessionLinkEmoji"), size=16, cost=16MiB, ops=2)
-  where M is the decrypted device link message data.
+  where M is the signed request dict, as decrypted from `L`.
 - emoji indices are then selected by interpreting the resulting 16 bytes as a 128-bit, little-endian
   encoded integer where index 0 is the value of the least significant 6 bits, index 1 is bits 6-11,
   and so on.
@@ -495,9 +544,8 @@ the short window before the user accepts the request; a memory-hard hash makes t
 
 ### Device link request handling
 
-Upon receiving a (valid) device link request in namespace 21 naming its own group, an existing
-(linked) device must
-display to the user a screen with the new device details, asking for confirmation of the new linked
+Upon receiving a device link request in namespace 21 that it can decrypt and whose signature is
+valid, an existing (linked) device must display to the user a screen with the new device details, asking for confirmation of the new linked
 device.  This information should generally consist of the device type, description, and version,
 time the request was made, and the short authentication string.
 
@@ -536,6 +584,21 @@ Upon accepting a device linking request, the existing linked device accepting th
 The device that requested linking, meanwhile, continues to monitor namespace 21 for an updated
 device message that it is successfully able to decrypt.
 
+#### Confirmation on the requesting device
+
+Decrypting a group message is not by itself enough for the requesting device to consider itself
+linked: its user must also confirm on it that its SAS matches the one the accepting device showed,
+and it joins only once both have happened.
+
+Encrypting the request to the group stops a removed device, or any other seed holder outside the
+group, from reading it.  It does not stop one from publishing a group message of its own, carrying
+its own `link_x25519` and even the real group's identifier.  A device that encrypts its request to
+such a key has its request read by that impostor, which can then admit it to a group of its own --
+and from the requesting device, that is indistinguishable from being accepted.  The real group
+cannot read such a request at all, and so never prompts for it.  Asking the user to confirm on the
+requesting device closes this: the user confirms only having seen the same SAS on one of their own
+devices, which happens only if the request reached the real group.
+
 ## Multiple groups
 
 An account can come to have more than one device group, when a device starts a new group while
@@ -570,6 +633,15 @@ Once accepted into the new group, it leaves the old one:
   that the remaining members stop encrypting to it.  Being a departure rather than a removal, it
   does not appear in the `kicked` list.  It also remembers the old group's identifier as dismissed,
   so as not to alert about the group it has just left.
+
+The departed device still holds every account key the old group had, and the group must move to one
+it does not.  A removal does this in the same step: the removing device generates a new account key
+and pushes it in the message that carries the tombstone, which the removed device is not given a key
+to.  A departing device cannot do the same for itself, since it would know any key it generated,
+and so the rotation is a second step: a remaining member that merges a departure tombstone it did
+not already hold generates a new account key and pushes it.  Several members may do so at once; as
+with any rotations that cross, the merge keeps the most recently created key as current, the lowest
+seed breaking a tie, so every device settles on the same one.
 
 # Account keys
 
