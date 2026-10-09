@@ -80,6 +80,7 @@ has dismissed it here.
 | `Waiting` | This device's link request is outstanding. | The waiting screen (see "Joining"). |
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Offer a way back: `renew_device_identity`, then join again. |
 | `CutOff` | This device's group has disappeared from the swarm while another group is there. | A critical alert; this may be an attack. Never dismissable. Offer to join one of `others`. |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer `renew_device_identity`, then join again. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
 while all of the account's devices were offline for 30 days, and starting a group in that case
@@ -104,7 +105,7 @@ unchanged, and the next start (or the device screen) offers the choice again.
 2. **Ask.** `request_link(group, cb)`. It uploads the request and answers once the swarm has stored
    it, with the SAS and the deadline (10 minutes). Errors: `err::unknown_group` (no longer in the
    swarm), `err::network_unavailable`, `err::store_failed` (worth retrying), `err::already_registered`
-   (already in that group).
+   (already in that group), `err::removed` (displaced: renew the identity first).
 3. **Show the waiting screen**, drawn from `outgoing_link_request()` every time it is opened: the 7
    emoji (21 extended), a countdown to `expires`, and a **"These match"** action. Tell the user to
    open Session on one of their existing devices, where a matching prompt will appear.
@@ -195,6 +196,14 @@ isn't), which is not an error. This device cannot remove itself.
 - **Cut off** (`membership_changed(CutOff)`). Treat this as critical: the device's group is gone
   from the swarm and another is there, which may mean someone with the recovery phrase replaced it.
   It is never dismissable. Offer to join one of `others`.
+- **Displaced** (`membership_changed(Displaced)`). Critical, and never dismissable. The group has
+  moved on to keys this device doesn't hold, under this device's own identity. Either the user
+  restored this device elsewhere and approved the copy as a replacement, or someone with a copy of
+  this device's data has taken its place. Say both: "Another device has taken this device's place
+  in your device group. If you didn't restore it on another device, someone may have a copy of
+  this device's data." The device stops acting for the group by itself. The way back is
+  `renew_device_identity()`, then joining as a new device; the user should also remove the old
+  identity from one of their other devices if they don't recognise what now holds it.
 - **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back,
   `renew_device_identity()` gives it a new identity; it then joins like any new device. Messages
   and the account's configs are kept.
@@ -205,8 +214,8 @@ isn't), which is not an error. This device cannot remove itself.
 from `GroupsVisible`, where it creates a group *alongside* the existing ones. That deletes nothing:
 the other devices get `group_appeared`, so a mistake can be undone. A device that was `Waiting`
 drops its request. It fails with `err::membership_unknown` before the first fetch,
-`err::already_registered` from a group, and `err::removed` for a removed device (which must
-`renew_device_identity` first).
+`err::already_registered` from a group, and `err::removed` for a removed or displaced device (which
+must `renew_device_identity` first).
 
 ## Switching groups
 

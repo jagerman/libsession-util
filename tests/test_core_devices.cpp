@@ -911,12 +911,14 @@ struct Linking {
         return out;
     }
 
-    std::array<std::byte, 32> applicant_id() {
-        auto hex = applicant->devices.device_id();
+    static std::array<std::byte, 32> id_of(TempCore& c) {
+        auto hex = c->devices.device_id();
         std::array<std::byte, 32> id;
         oxenc::from_hex(hex.begin(), hex.end(), reinterpret_cast<unsigned char*>(id.data()));
         return id;
     }
+
+    std::array<std::byte, 32> applicant_id() { return id_of(applicant); }
 
     // The applicant's request, as the existing device receives it.  Whole seconds, because that is
     // what the deadline is stored in, so a test can compare it exactly.
@@ -2484,6 +2486,67 @@ TEST_CASE(
     CHECK(third_events.ended ==
           std::vector{std::pair{third_events.added[0].id, device::LinkRequestEnd::Accepted}});
     CHECK(third->devices.incoming_link_requests(await).empty());
+}
+
+TEST_CASE(
+        "Devices - a device whose place another has taken is told so",
+        "[core][devices][membership]") {
+    Linking l;
+    l.admit();
+
+    // A copy of the applicant, under its id but with keys of its own, admitted in its place.
+    TempCore copy{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::set_device_id(*copy, l.applicant_id());
+    ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*copy, *l.core).message, in(10min), "L2");
+    REQUIRE(l.events.added.back().replaces);
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
+    CHECK(l.applicant_events.membership.back() == device::Membership::Displaced);
+
+    // It speaks for the group no longer: nothing pushed, nobody admitted or removed.
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+    CHECK_FALSE(l.applicant->devices.remove_device(Linking::id_of(l.core), await));
+    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) == err::removed);
+
+    // The way back is the removed device's: a new identity.
+    REQUIRE(l.applicant->devices.renew_device_identity(await));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+}
+
+TEST_CASE(
+        "Devices - a snapshot that has yet to hear of this device does not displace it",
+        "[core][devices][membership]") {
+    Linking l;
+    // The group as it was before the applicant joined, which a member could still push for a moment
+    // after: built before it fetched the admission.
+    auto before = l.core->devices.build_device_group_message().message;
+
+    // Admitted by a message held until the user confirms, which is when it is read -- but as of
+    // when the swarm stored it.
+    l.ask();
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+
+    TestHelper::deliver_device_message(*l.applicant, before, in(10min), "G-stale");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+
+    // Beyond the grace, though, a message leaving it out is one the group sent without it.
+    ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+    TestHelper::deliver_device_message(*l.applicant, before, in(10min), "G-late");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
+
+    // And reading the group again, at or past what displaced it, puts it back.
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 }
 
 TEST_CASE("Devices - a removed device cannot start a group", "[core][devices][membership]") {

@@ -92,6 +92,12 @@ static constexpr auto own_request_group_key = "devices_link_request_group"sv;
 static constexpr auto confirmed_key = "devices_link_confirmed"sv;
 static constexpr auto held_admission_key = "devices_link_held_admission"sv;
 static constexpr auto held_admission_hash_key = "devices_link_held_admission_hash"sv;
+static constexpr auto held_admission_ts_key = "devices_link_held_admission_ts"sv;
+
+// The swarm timestamp of the newest message from our group that we could read, and of the one we
+// could not that displaced us from it, in unix milliseconds.
+static constexpr auto read_at_key = "devices_group_read_at"sv;
+static constexpr auto displaced_key = "devices_group_displaced_at"sv;
 
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
@@ -166,6 +172,7 @@ void Devices::establish_group() {
     // the swarm: until then another group alongside it would read as our having been cut off.
     auto group = new_group_id();
     _set_group_id(group);
+    _note_read(clock_now_ms());
     auto now = clock_now_s();
     c.prepared_exec(
             "INSERT INTO device_groups (group_id, link_x25519, seen_at, expires_at)"
@@ -1324,7 +1331,7 @@ static const std::string REASSERT_TOMBSTONE_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
 void Devices::receive_device_group_message(
-        std::span<const std::byte> data, const std::string& hash) {
+        std::span<const std::byte> data, const std::string& hash, sys_ms timestamp) {
     GroupPayload payload;
     try {
         auto raw = decrypt_device_data(std::as_bytes(data));
@@ -1344,6 +1351,20 @@ void Devices::receive_device_group_message(
                 log::warning(cat, "This device has been removed from its device group");
                 _devices_changed = true;
             }
+            return;
+        }
+
+        // Every message from our group is encrypted to us while we are in it, so a newer one we
+        // cannot read means another device holds our place.  Older ones say nothing: they are from
+        // before we joined, or snapshots overtaken since -- see DISPLACEMENT_GRACE.
+        auto group = _group_of(data);
+        auto read_at = core.globals.get_integer(read_at_key);
+        if (group && group == _group_id() && read_at &&
+            timestamp.time_since_epoch() >
+                    std::chrono::milliseconds{*read_at} + DISPLACEMENT_GRACE &&
+            _member()) {
+            core.globals.set(displaced_key, int64_t{timestamp.time_since_epoch().count()});
+            log::warning(cat, "Another device has taken this device's place in its device group");
             return;
         }
         log::warning(cat, "Ignoring incoming device group message: {}", e.what());
@@ -1377,6 +1398,7 @@ void Devices::receive_device_group_message(
     if (admitting && !core.globals.get_integer(confirmed_key).value_or(0)) {
         core.globals.set(held_admission_key, data);
         core.globals.set(held_admission_hash_key, std::string_view{hash});
+        core.globals.set(held_admission_ts_key, int64_t{timestamp.time_since_epoch().count()});
         log::info(cat, "Admitted to a device group; holding it until the user confirms the SAS");
         return;
     }
@@ -1487,13 +1509,13 @@ void Devices::receive_device_group_message(
     // lacks on our behalf: the rotation falls to whichever remaining member learns of it first --
     // or to several, whose rotations then settle on one key as any crossing rotations do.  Not for
     // a removal, which the removing device rotated for in the same step.
-    if (departed && c.prepared_maybe_get<int>(
-                            "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                            self_id,
-                            static_cast<int>(device::State::Registered))) {
+    if (departed && _member()) {
         log::info(cat, "A device left the group; rotating the account key");
         rotate_account_keys();
     }
+
+    if (theirs && theirs == _group_id())
+        _note_read(timestamp);
 
     // Recorded whether or not the merge changed anything: a message that told us only what we
     // already knew is just as redundant as one that told us something new, and our next push
@@ -1631,6 +1653,12 @@ void Devices::_request_link(
     // network cannot be attached without one.
     if (!core.network())
         throw session::error{err::network_unavailable, "Cannot request a link: no network"};
+    // Not even to switch groups: leaving its old one would announce a departure under an id that is
+    // now another device's.
+    if (_displaced())
+        throw session::error{
+                err::removed,
+                "Another device holds this device's place; it must ask under a new device id"};
     if (_group_id() == group && _device_info().second)
         throw session::error{err::already_registered, "This device is already in that group"};
 
@@ -1749,7 +1777,9 @@ bool Devices::_confirm_link() {
     core.globals.set(confirmed_key, int64_t{1});
     if (auto held = core.globals.get_blob(held_admission_key)) {
         auto hash = core.globals.get_text(held_admission_hash_key).value_or("");
-        receive_device_group_message(*held, hash);
+        sys_ms stored{std::chrono::milliseconds{
+                core.globals.get_integer(held_admission_ts_key).value_or(0)}};
+        receive_device_group_message(*held, hash, stored);
         _flush_events();
     }
     return true;
@@ -1759,6 +1789,7 @@ void Devices::_forget_confirmation() {
     core.globals.erase(confirmed_key);
     core.globals.erase(held_admission_key);
     core.globals.erase(held_admission_hash_key);
+    core.globals.erase(held_admission_ts_key);
 }
 
 void Devices::_forget_own_request() {
@@ -2281,10 +2312,7 @@ bool Devices::_accept_request(int reqid) {
 
     // A device outside the group has nobody to admit anyone to.  Checked here rather than left to
     // the push, which would simply never happen and leave the request looking accepted.
-    if (!c.prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Registered)))
+    if (!_member())
         return false;
 
     auto request = c.prepared_maybe_get<int64_t, int>(
@@ -2450,7 +2478,8 @@ device::MembershipState Devices::_membership() {
             // None of ours left is only alarming beside another's: alone, it is a group whose
             // messages have yet to reach the swarm, or expired while every device was away, and
             // our next push restores them.
-            out.membership = !ours_present && !out.others.empty() ? device::Membership::CutOff
+            out.membership = _displaced()                         ? device::Membership::Displaced
+                           : !ours_present && !out.others.empty() ? device::Membership::CutOff
                                                                   : device::Membership::InGroup;
             break;
         case device::State::Pending: out.membership = device::Membership::Waiting; break;
@@ -2484,14 +2513,40 @@ void Devices::_forget_group() {
     c.prepared_exec("DELETE FROM device_group_merged");
     c.prepared_exec("DELETE FROM device_account_keys");
     core.globals.erase(group_id_key);
+    core.globals.erase(read_at_key);
+    core.globals.erase(displaced_key);
+}
+
+bool Devices::_displaced() {
+    return core.globals.get_integer(displaced_key).has_value();
+}
+
+bool Devices::_member() {
+    return !_displaced() && conn().prepared_maybe_get<int>(
+                                    "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                    self_id,
+                                    static_cast<int>(device::State::Registered));
+}
+
+void Devices::_note_read(sys_ms timestamp) {
+    int64_t ms = timestamp.time_since_epoch().count();
+    if (auto read_at = core.globals.get_integer(read_at_key); !read_at || ms > *read_at)
+        core.globals.set(read_at_key, ms);
+
+    // Read again at or past what displaced us, which only a member could: the group took us back,
+    // or what looked like displacement was a snapshot that had yet to hear of us after all.
+    if (auto displaced = core.globals.get_integer(displaced_key); displaced && ms >= *displaced) {
+        core.globals.erase(displaced_key);
+        log::info(cat, "This device can read its device group again");
+    }
 }
 
 bool Devices::_renew_device_identity() {
     assert(on_loop());
-    if (!conn().prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Kicked)))
+    if (!_displaced() && !conn().prepared_maybe_get<int>(
+                                 "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                 self_id,
+                                 static_cast<int>(device::State::Kicked)))
         return false;
 
     // Before the transaction, which it would otherwise nest inside.
@@ -2538,11 +2593,12 @@ device::GroupId Devices::_start_group() {
         case device::Membership::CutOff:
             throw session::error{err::already_registered, "This device is already in a group"};
         case device::Membership::Removed:
-            // Its tables still hold the group it was removed from, which a group started from them
+        case device::Membership::Displaced:
+            // Its tables still hold the group it is no longer in, which a group started from them
             // would carry on as its own members.
             throw session::error{
                     err::removed,
-                    "This device was removed from its group; it must rejoin under a new device id "
+                    "This device is no longer in its group; it must rejoin under a new device id "
                     "before starting one"};
         case device::Membership::Waiting: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
@@ -2597,10 +2653,7 @@ bool Devices::_remove_device(std::span<const std::byte, 32> id) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    if (!c.prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Registered)))
+    if (!_member())
         return false;
 
     if (!c.prepared_maybe_get<int64_t>(
@@ -2791,7 +2844,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             auto type = in.require<std::string_view>("");
             if (type == "G") {
                 _record_group(msg);
-                receive_device_group_message(msg.data, msg.hash);
+                receive_device_group_message(msg.data, msg.hash, msg.timestamp);
             } else if (type == "L")
                 receive_link_request(msg.data, msg.hash, msg.expiry);
             else
@@ -2868,7 +2921,9 @@ static const std::string NEEDS_PUSH_SQL =
 Devices::NeedsPush Devices::needs_push() {
     auto c = conn();
     auto [dg, ap] = c.prepared_get<int, int>(NEEDS_PUSH_SQL, self_id, self_id);
-    return {.device_group = bool(dg), .account_pubkey = bool(ap)};
+    // Not for a group that has moved on without us: we cannot read what it holds now, and would
+    // push a snapshot of what it held before.
+    return {.device_group = bool(dg) && !_displaced(), .account_pubkey = bool(ap)};
 }
 
 void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
@@ -2966,10 +3021,7 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotat
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    if (!c.prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Registered)))
+    if (!_member())
         return std::nullopt;
 
     int64_t t_created = 0;

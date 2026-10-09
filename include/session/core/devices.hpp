@@ -273,6 +273,11 @@ namespace device {
         CutOff,   ///< Was in a group, none of whose messages are left in the swarm, while another
                   ///< group's are.  It can no longer receive anything encrypted to its group, which
                   ///< may be an attack, and is never dismissable.
+        Displaced,  ///< Its group has moved on without it: a newer message from the group is one
+                    ///< it cannot read, though nothing removed it.  Another device holds its place
+                    ///< under its id -- a restored copy of it, admitted as a replacement, or
+                    ///< someone holding a copy of its data who has rotated it out, which is an
+                    ///< attack.  Never dismissable.  It can come back only under a new device id.
     };
 
     /// A device group in the swarm other than this device's own.
@@ -390,7 +395,15 @@ class Devices final : detail::CoreComponent {
     // The group message takes the swarm hash as well, because merging one is what makes it
     // redundant: our next push carries its contents forward, and that is when it can be deleted.
     // Recorded only on a message we could decrypt -- see `device_group_merged`.
-    void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
+    void receive_device_group_message(
+            std::span<const std::byte> data, const std::string& hash, sys_ms timestamp);
+
+    // In the group and able to act for it: registered, and not displaced from it.
+    bool _member();
+    bool _displaced();
+
+    // A message from our own group, stored at `timestamp`, was one we could read.
+    void _note_read(sys_ms timestamp);
     //
     // The link request takes the swarm's expiry, which is what bounds the request: it is when the
     // message stops being fetchable, so after it no device can accept the request at all.  And its
@@ -464,9 +477,9 @@ class Devices final : detail::CoreComponent {
     // or, from outside a group, `membership_changed` with what it sees if `expires` passes first.
     // Asking again replaces the request, and its SAS, with a new one.
     //
-    // Fails with `err::already_registered` for the group it is already in,
-    // `err::network_unavailable`, `err::unknown_group`, or `err::store_failed` -- the last worth
-    // retrying.  None of them leaves a request outstanding.
+    // Fails with `err::already_registered` for the group it is already in, `err::removed` for a
+    // device displaced from its group, `err::network_unavailable`, `err::unknown_group`, or
+    // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting for an answer: stored by the
@@ -568,14 +581,15 @@ class Devices final : detail::CoreComponent {
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
-    // Gives a removed device a new identity, so that it can ask to join again: a removed id is
-    // spent, and can never rejoin the group that removed it.  A new device id and new device keys
+    // Gives a removed or displaced device a new identity, so that it can ask to join again: a
+    // removed id is spent, and can never rejoin the group that removed it, and a displaced one is
+    // another device's now.  A new device id and new device keys
     // replace the old, and what it held of its old group -- its devices and its account keys
     // included -- is forgotten, leaving it `GroupsVisible` or `NoGroup` like any device outside a
     // group.  Its messages, the account's configs, and the groups it has seen in the swarm are
     // kept.
     //
-    // Answers false for a device that has not been removed.
+    // Answers false for a device that has been neither removed nor displaced.
     void renew_device_identity(result_function<bool> cb);
     bool renew_device_identity(await_t);
 
@@ -587,8 +601,8 @@ class Devices final : detail::CoreComponent {
     // key, whatever the device held before.
     //
     // Fails with `err::already_registered` for a device already in a group, `err::removed` for one
-    // removed from its group, and `err::membership_unknown` before the first fetch of this run:
-    // starting a group is the user's decision, made from what the swarm holds.
+    // removed or displaced from its group, and `err::membership_unknown` before the first fetch of
+    // this run: starting a group is the user's decision, made from what the swarm holds.
     void start_group(result_function<device::GroupId> cb);
     device::GroupId start_group(await_t);
 
@@ -768,6 +782,14 @@ class Devices final : detail::CoreComponent {
     // How long the swarm holds a link request, which is how long it can be answered.  Linking
     // needs the user at both devices at once, so a longer wait buys nothing.
     static constexpr auto LINK_REQUEST_TTL = 10min;
+
+    // How much newer than the newest message from our group we could read one we cannot read must
+    // be before it says we were displaced.  Just after we join, a member can push a snapshot it
+    // built before fetching our admission, which leaves us out for no reason but timing; this
+    // covers that, and the difference between the clocks of the two devices whose timestamps are
+    // compared.  A real displacement is not missed for it: every later message is unreadable too,
+    // and the account key's rotation guarantees one.
+    static constexpr auto DISPLACEMENT_GRACE = 5min;
 
     // Rotates the shared account keys used for PFS+PQ message encryption.  Generates a new random
     // seed, stores it in the database, marks the previous active key as rotated, and prunes keys

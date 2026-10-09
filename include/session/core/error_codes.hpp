@@ -27,8 +27,8 @@ inline constexpr std::string_view unknown_group = "device.unknown_group";
 /// depends on it.  See `Devices::membership`.
 inline constexpr std::string_view membership_unknown = "device.membership_unknown";
 
-/// This device was removed from its group, and must come back under a new device identity before
-/// it can do this.
+/// This device was removed from its group, or displaced from it (see `device::Membership`), and
+/// must come back under a new device identity before it can do this.
 inline constexpr std::string_view removed = "device.removed";
 
 }  // namespace session::core::err

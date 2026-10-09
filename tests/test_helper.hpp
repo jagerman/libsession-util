@@ -612,7 +612,16 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     // something a push supersedes.
     static void receive_device_group_message(
             core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
-        d.receive_device_group_message(data, hash);
+        d.receive_device_group_message(data, hash, clock_now_ms());
+    }
+
+    // Gives `core` another device's id, as a copy of that device's data would have it -- though
+    // not its keys, which is what a copy that has since rotated them looks like.
+    static void set_device_id(core::Core& core, std::span<const std::byte, 32> id) {
+        on_loop(core, [&] {
+            std::ranges::copy(id, core.devices.self_id.begin());
+            return 0;
+        });
     }
 
     // A link request as `request_link` builds it, asking to join `member`'s group, without the

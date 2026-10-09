@@ -372,6 +372,35 @@ The list is padded to a multiple of 4 entries with random values and shuffled, a
 An adversary who obtains the root seed can compute these values, and so recover an account's removal
 history from stored messages.
 
+### Displaced devices
+
+A device can also lose its place without being removed: another device comes to hold its record,
+under its device ID, with keys it does not have.  That happens when a restored copy of it is
+admitted as a replacement (see "Device link request handling"), and when someone holding a copy of
+its data -- device keys and all -- rotates those keys and pushes the record.  The second is an
+attack, and the design deliberately settles it in favour of whichever copy rotates first: the other
+can read nothing after that.  If the real device rotates first, the copy is shut out, which is the
+point; if the copy does, the real device must notice and say so.
+
+It can: while it is in the group, every message from the group is encrypted to it, so one carrying
+its group's identifier that it cannot decrypt, and that does not name it in `kicked`, means the
+group has moved on without it.  Such a message counts only if its swarm timestamp is more than 5
+minutes past the newest message from the group the device *could* read.  Just after a device joins,
+a member may push a snapshot it built before fetching the admission, which leaves the new device
+out for no reason but timing, and the margin also absorbs the difference between the two devices'
+clocks.  It costs nothing in detection: every later message is unreadable too, and account key
+rotation guarantees one.
+
+A displaced device alerts its user, as a possible attack, and stops acting for the group: it pushes
+nothing, admits and removes nobody, and does not leave the group to join another, since a departure
+under its ID would now apply to the device holding it.  It can come back only under a new device
+ID, as a removed device does.  Reading a message from the group again, as new as the one that
+displaced it, undoes this.
+
+A holder of the account seed can forge a message carrying the group's identifier, and so cause this
+alert, as it can forge a `kicked` entry to cause a removal alert.  Neither gives it anything: the
+device stops acting for its group, rather than starting to trust anything new.
+
 ### Group identifier
 
 Each device group has an identifier, generated when the group is created and never changed
