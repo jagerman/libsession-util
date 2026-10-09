@@ -433,7 +433,27 @@ class Devices final : detail::CoreComponent {
     void forget_link_requests(std::vector<int> reqids, result_function<size_t> cb);
     size_t forget_link_requests(std::span<const int> reqids, await_t);
 
+    // Removes a device from the group, permanently: its id can never rejoin.  The account key
+    // rotates in the same step, so that the device does not hold the current one, and it is given
+    // no key to anything the group pushes from here on.  The removal reaches the other devices --
+    // and, through the `kicked` list, the removed device itself -- with the next group push, which
+    // happens once the next fetch completes.
+    //
+    // Answers false if the device is not in the group -- unknown, still only asking to join (which
+    // is `ignore_request`), or already gone -- or this device is no longer in it either.  None of
+    // those is an error: each can happen between a device list being drawn and the user acting on
+    // it.  Passing this device's own id is an error (std::invalid_argument): a device leaves a
+    // group by joining another.
+    void remove_device(std::array<std::byte, 32> id, result_function<bool> cb);
+    bool remove_device(std::span<const std::byte, 32> id, await_t);
+
   private:
+    bool _remove_device(std::span<const std::byte, 32> id);
+
+    // Whether an unreadable group message names this device in its `kicked` list, which is the only
+    // way a removed device learns of it: it is no longer given a key to the payload.
+    bool _names_us_kicked(std::span<const std::byte> data);
+
     struct LinkRequestResult {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
         std::array<std::byte, 16> sas_seed;

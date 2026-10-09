@@ -314,10 +314,15 @@ TEST_CASE("Devices - device group payload padding", "[core][devices]") {
     }
 
     SECTION("a kicked device is named in the payload but is not a recipient") {
+        auto ciphertexts_size = [](std::span<const std::byte> msg) {
+            oxenc::bt_dict_consumer outer{msg};
+            return outer.require_span<std::byte>("C").size();
+        };
+
         device::map m;
         for (size_t i = 0; i < 4; i++)
             m.emplace(infos[i].id, infos[i]);
-        auto four_registered = TestHelper::encrypt_device_data(c->devices, m).size();
+        auto four_registered = ciphertexts_size(TestHelper::encrypt_device_data(c->devices, m));
 
         // A fifth entry, kicked rather than registered.
         auto kicked = infos[4];
@@ -327,11 +332,10 @@ TEST_CASE("Devices - device group payload padding", "[core][devices]") {
 
         auto with_kicked = TestHelper::encrypt_device_data(c->devices, m);
 
-        // Unchanged size: five entries, but still only four recipients, so the key and ciphertext
-        // lists stay in the 4 bucket.  Were the kicked device handed a key they would cross into
-        // the 8 bucket and this would grow -- which is what makes this an assertion about the
-        // recipient set rather than about padding.
-        CHECK(with_kicked.size() == four_registered);
+        // Five entries, but still only four recipients, so the ciphertext list stays in the 4
+        // bucket.  Were the kicked device handed a key it would cross into the 8 bucket and grow --
+        // which is what makes this an assertion about the recipient set rather than about padding.
+        CHECK(ciphertexts_size(with_kicked) == four_registered);
 
         // And it is still named in the payload: that is how every other device learns it is gone.
         auto plaintext = TestHelper::decrypt_device_data(c->devices, with_kicked);
@@ -912,6 +916,19 @@ struct Linking {
         auto found = devs.find(applicant_id());
         REQUIRE(found != devs.end());
         return found->second;
+    }
+
+    // The applicant asks, is accepted here, and reads the group message admitting it, leaving a
+    // group of two.
+    void admit() {
+        ask();
+        REQUIRE(core->devices.accept_request(events.added.at(0).id, await));
+        TestHelper::deliver_device_message(
+                *applicant,
+                core->devices.build_device_group_message().message,
+                std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min,
+                "G1");
+        REQUIRE(applicant->devices.device_info(await).second);
     }
 };
 
@@ -1548,4 +1565,67 @@ TEST_CASE(
         CHECK(got->error().code == err::already_registered);
         CHECK(own_state(l.core) == device::State::Registered);
     }
+}
+
+TEST_CASE(
+        "Devices - a removed device is told so, though it can read nothing else",
+        "[core][devices][removal]") {
+    Linking l;
+    l.admit();
+    auto key_before = l.core->devices.active_account_keys().front().x25519_pub;
+
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    CHECK(l.state_of_applicant().state == device::State::Kicked);
+
+    // The key it held is no longer the current one.
+    CHECK(l.core->devices.active_account_keys().front().x25519_pub != key_before);
+
+    // It is given no key to the message that removes it...
+    auto group = l.core->devices.build_device_group_message().message;
+    CHECK_THROWS_AS(
+            TestHelper::decrypt_device_data(l.applicant->devices, group),
+            device::decryption_failed);
+
+    // ...but learns of the removal from the kicked list all the same.
+    TestHelper::deliver_device_message(*l.applicant, group, in(10min), "G2");
+    CHECK(own_state(l.applicant) == device::State::Kicked);
+    REQUIRE(!l.applicant_events.membership.empty());
+    CHECK(l.applicant_events.membership.back() == device::State::Kicked);
+}
+
+TEST_CASE("Devices - a device that left is not told it was removed", "[core][devices][removal]") {
+    Linking l;
+    l.admit();
+
+    // A group message carrying a departure for it, as the group it left would push.
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto left = l.state_of_applicant();
+    left.state = device::State::Left;
+    left.kicked = clock_now_s();
+    auto group =
+            TestHelper::encrypt_device_data(l.core->devices, {{self.id, self}, {left.id, left}});
+
+    TestHelper::deliver_device_message(*l.applicant, group, in(10min), "G2");
+    CHECK(own_state(l.applicant) == device::State::Registered);
+}
+
+TEST_CASE(
+        "Devices - only a device in the group can be removed, and only by another",
+        "[core][devices][removal]") {
+    Linking l;
+    std::array<std::byte, 32> unknown;
+    random::fill(unknown);
+    CHECK_FALSE(l.core->devices.remove_device(unknown, await));
+
+    // Still only asking: that is ignore_request's to answer.
+    l.ask();
+    CHECK_FALSE(l.core->devices.remove_device(l.applicant_id(), await));
+    CHECK(l.state_of_applicant().state == device::State::Pending);
+
+    // A device outside the group has nobody to remove.
+    auto [self, registered] = l.core->devices.device_info(await);
+    CHECK_FALSE(l.applicant->devices.remove_device(self.id, await));
+
+    CHECK_THROWS_AS(l.core->devices.remove_device(self.id, await), std::invalid_argument);
 }

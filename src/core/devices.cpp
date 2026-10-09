@@ -843,6 +843,18 @@ namespace {
     constexpr auto PERS_KEY_KEY = "SessionDevKeyKey"_b2b_pers;
     constexpr auto PERS_KEY_KEY_IDX = "SessionDevKeyIdx"_b2b_pers;
     constexpr auto PERS_ACC_KEY_ROT = "SessionAccKeyRot"_b2b_pers;
+    constexpr auto PERS_KICKED = "SessionDevKicked"_b2b_pers;
+
+    // A removed device's entry in a message's `kicked` list: computable only with the account seed,
+    // and different in every message, being keyed by that message's ephemeral A.
+    std::array<std::byte, 16> kicked_entry(
+            std::span<const std::byte, 32> A,
+            std::span<const std::byte, 32> seed,
+            std::span<const std::byte, 32> device_id) {
+        std::array<std::byte, 16> out;
+        hash::blake2b_key_pers(out, A, PERS_KICKED, seed, device_id);
+        return out;
+    }
 
     // Device group payloads are null-padded to a multiple of this before encryption so that the
     // encrypted size reveals only which bucket the payload falls in, not what it contains.  A
@@ -888,6 +900,29 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     for (const auto& [id, info] : devices)
         if (info.state == device::State::Registered)
             recipients.push_back(&info);
+
+    // Removals among the tombstones, announced to the devices removed, which have no key to read
+    // them from the payload.  Departures are left out: the device that left knows, and would read
+    // its own entry as a removal.  Padded to a multiple of 4 and shuffled, like the recipient
+    // lists, so that the length says only which bucket the removal count is in.
+    std::vector<std::byte> kicked_raw;
+    {
+        auto seed = core.globals.account_seed();
+        std::vector<const std::array<std::byte, 32>*> removed;
+        for (const auto& [id, info] : devices)
+            if (info.state == device::State::Kicked)
+                removed.push_back(&id);
+
+        std::vector<size_t> slots((removed.size() + 3) / 4 * 4);
+        std::iota(slots.begin(), slots.end(), 0);
+        std::ranges::shuffle(slots, csrng);
+
+        kicked_raw.resize(16 * slots.size());
+        random::fill(kicked_raw);
+        for (size_t i = 0; i < removed.size(); i++)
+            std::ranges::copy(
+                    kicked_entry(A, seed.seed(), *removed[i]), kicked_raw.begin() + 16 * slots[i]);
+    }
 
     int padded_count = recipients.size();
     padded_count = (padded_count + 3) / 4 * 4;
@@ -1033,7 +1068,9 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
             + 3 + bt_bytes_encoded(ciphertext_raw.size())  // "1:C" + "NNNN:...(mlkem cts)..."
             + 3 + bt_bytes_encoded(enc_key_raw.size())     // "1:K" + "NNN:...(encrypted keys)..."
             + 3 + bt_bytes_encoded(enc_devices.size())     // "1:d" + "MMMM:...(enc device info)..."
-            + 3 + bt_bytes_encoded(64)                     // "1:~" + "64:...(Ed25519 signature)..."
+            +
+            (kicked_raw.empty() ? 0 : 3 + bt_bytes_encoded(kicked_raw.size()))  // "1:k" + "NN:..."
+            + 3 + bt_bytes_encoded(64)  // "1:~" + "64:...(Ed25519 signature)..."
     );
 
     oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
@@ -1043,6 +1080,8 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     o.append("C", ciphertext_raw);
     o.append("K", enc_key_raw);
     o.append("d", enc_devices);
+    if (!kicked_raw.empty())
+        o.append("k", kicked_raw);
     o.append_signature("~", [seed = core.globals.account_seed()](std::span<const std::byte> body) {
         return ed25519::sign(seed.ed25519_secret(), body);
     });
@@ -1110,6 +1149,22 @@ void Devices::receive_device_group_message(
         auto raw = decrypt_device_data(std::as_bytes(data));
         payload = decode_group_payload(raw);
     } catch (const device::decryption_failed& e) {
+        if (_names_us_kicked(data)) {
+            // When we learned of it, which is the nearest we can say: the removal time is in the
+            // payload we can no longer read.  Only from a live state, so that every later message
+            // still naming us leaves it where it is.
+            if (conn().prepared_maybe_get<int64_t>(
+                        "UPDATE devices SET state = ?, kicked_timestamp = ?"
+                        " WHERE unique_id = ? AND state < ? RETURNING id",
+                        static_cast<int>(device::State::Kicked),
+                        epoch_seconds(clock_now_s()),
+                        self_id,
+                        static_cast<int>(device::State::Kicked))) {
+                log::warning(cat, "This device has been removed from its device group");
+                _devices_changed = true;
+            }
+            return;
+        }
         log::warning(cat, "Ignoring incoming device group message: {}", e.what());
         return;
     }
@@ -1199,6 +1254,24 @@ void Devices::receive_device_group_message(
                 "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
     tx.commit();
+}
+
+bool Devices::_names_us_kicked(std::span<const std::byte> data) {
+    oxenc::bt_dict_consumer in{data};
+    in.require<std::string_view>("");
+    auto A = in.require_span<std::byte, 32>("A");
+    if (!in.skip_until("k"))
+        return false;
+    auto kicked = in.consume_span<std::byte>();
+    if (kicked.size() % 16 != 0)
+        return false;
+
+    auto seed = core.globals.account_seed();
+    auto ours = kicked_entry(A, seed.seed(), self_id);
+    for (size_t i = 0; i < kicked.size(); i += 16)
+        if (std::ranges::equal(kicked.subspan(i, 16), ours))
+            return true;
+    return false;
 }
 
 void Devices::request_link(result_function<OutgoingLinkRequest> cb) {
@@ -1837,6 +1910,48 @@ bool Devices::_ignore_request(int reqid) {
     tx.commit();
 
     _ended.insert(*row);
+    return true;
+}
+
+void Devices::remove_device(std::array<std::byte, 32> id, result_function<bool> cb) {
+    async([this, id] { return _remove_device(id); }, std::move(cb));
+}
+
+bool Devices::remove_device(std::span<const std::byte, 32> id, await_t) {
+    return jq().call_get([this, id] { return _remove_device(id); });
+}
+
+bool Devices::_remove_device(std::span<const std::byte, 32> id) {
+    assert(on_loop());
+    if (std::ranges::equal(id, self_id))
+        throw std::invalid_argument{"remove_device: cannot remove this device itself"};
+
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+
+    if (!c.prepared_maybe_get<int>(
+                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                self_id,
+                static_cast<int>(device::State::Registered)))
+        return false;
+
+    if (!c.prepared_maybe_get<int64_t>(
+                "UPDATE devices SET state = ?, kicked_timestamp = ?, broadcast_needed = 1"
+                " WHERE unique_id = ? AND state = ? RETURNING id",
+                static_cast<int>(device::State::Kicked),
+                epoch_seconds(clock_now_s()),
+                id,
+                static_cast<int>(device::State::Registered)))
+        return false;
+
+    // In the same transaction, so there is no moment at which the removal is recorded and the key
+    // the removed device holds is still the one a push would treat as current.
+    rotate_account_keys();
+    tx.commit();
+
+    log::info(cat, "Removed device {} from the group", oxenc::to_hex(id));
+    _devices_changed = true;
+    _flush_events();
     return true;
 }
 
