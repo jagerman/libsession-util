@@ -1357,17 +1357,25 @@ void Devices::receive_device_group_message(
                 keys.x25519_pub);
     }
 
+    bool departed = false;
     for (const auto& [id, info] : payload.devices) {
         if (info.state == device::State::Kicked || info.state == device::State::Left) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
             // device we have never heard of gets a bare tombstone -- see TOMBSTONE_SQL.
             assert(info.kicked);
+            auto was =
+                    c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
+                            .value_or(static_cast<int>(device::State::Unregistered));
             if (c.prepared_maybe_get<int64_t>(
                         TOMBSTONE_SQL,
                         info.kicked->time_since_epoch().count(),
                         id,
-                        static_cast<int>(info.state)))
+                        static_cast<int>(info.state))) {
                 _devices_changed = true;
+                if (info.state == device::State::Left &&
+                    was < static_cast<int>(device::State::Left))
+                    departed = true;
+            }
             continue;
         }
 
@@ -1409,6 +1417,18 @@ void Devices::receive_device_group_message(
             c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
             c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
         }
+    }
+
+    // A device that left still holds every account key we have, and could not rotate to one it
+    // lacks on our behalf: the rotation falls to whichever remaining member learns of it first --
+    // or to several, whose rotations then settle on one key as any crossing rotations do.  Not for
+    // a removal, which the removing device rotated for in the same step.
+    if (departed && c.prepared_maybe_get<int>(
+                            "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                            self_id,
+                            static_cast<int>(device::State::Registered))) {
+        log::info(cat, "A device left the group; rotating the account key");
+        rotate_account_keys();
     }
 
     // Recorded whether or not the merge changed anything: a message that told us only what we

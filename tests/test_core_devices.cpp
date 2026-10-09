@@ -2203,6 +2203,64 @@ TEST_CASE(
     CHECK(l.applicant_events.membership.back() == device::Membership::Removed);
 }
 
+TEST_CASE(
+        "Devices - a member learning of a departure rotates the account key",
+        "[core][devices][removal]") {
+    Linking l;
+    l.admit();
+    auto current = [&] { return l.core->devices.active_account_keys().front().x25519_pub; };
+    auto before = current();
+
+    // The farewell the applicant pushes on leaving: its own view of the group, itself departed.
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto leaver = l.state_of_applicant();
+    leaver.state = device::State::Left;
+    leaver.kicked = clock_now_s();
+    auto farewell = TestHelper::encrypt_device_data(
+            l.applicant->devices, {{self.id, self}, {leaver.id, leaver}});
+    TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G2");
+
+    // A key the departed device does not hold.
+    auto after = current();
+    CHECK(after != before);
+    for (const auto& k : l.applicant->devices.active_account_keys())
+        CHECK(k.x25519_pub != after);
+
+    // Hearing of the same departure again -- restated later, as a device trying to return gets --
+    // is not a second one.
+    leaver.kicked = clock_now_s() + 1h;
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(
+                    l.applicant->devices, {{self.id, self}, {leaver.id, leaver}}),
+            in(10min),
+            "G3");
+    CHECK(current() == after);
+}
+
+TEST_CASE(
+        "Devices - a member learning of a removal elsewhere does not rotate",
+        "[core][devices][removal]") {
+    Linking l;
+    l.admit();
+    auto before = l.core->devices.active_account_keys().front().x25519_pub;
+
+    // The device that removed it rotated in the same step; a second rotation here buys nothing.
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto removed = l.state_of_applicant();
+    removed.state = device::State::Kicked;
+    removed.kicked = clock_now_s();
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(
+                    l.applicant->devices, {{self.id, self}, {removed.id, removed}}),
+            in(10min),
+            "G2");
+    CHECK(l.core->devices.active_account_keys().front().x25519_pub == before);
+}
+
 TEST_CASE("Devices - a device that left is not told it was removed", "[core][devices][removal]") {
     Linking l;
     l.admit();
