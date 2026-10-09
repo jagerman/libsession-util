@@ -418,3 +418,43 @@ TEST_CASE("Client: a thumbnail found missing is made again", "[client][thumbnail
     CHECK(f.attachment(id).has_thumbnail);
     CHECK(jpeg_size(f.c->attachment_thumbnail(id, 0, await)) == std::pair{240, 240});
 }
+
+TEST_CASE("Client: the waiting cache reads answer on Core's loop", "[client][thumbnail]") {
+    // Leaked if a read never answers: Core's loop is then blocked for good, and tearing the Client
+    // down would wait on it, so the test would hang rather than fail.
+    auto f = std::make_unique<Fixture>();
+    auto data = picture(400, 300);
+    auto [id, url] = f->arrive(data);
+    auto thumb = f->c->attachment_thumbnail(id, 0, await);
+
+    // Both reads, and then the thumbnail's again with its file gone, which answers by writing.
+    using answers = std::
+            tuple<std::vector<std::byte>, std::vector<std::byte>, std::optional<std::string_view>>;
+    auto answered = std::make_shared<std::promise<answers>>();
+    std::thread{[c = &*f->c, id, thumb_file = f->thumb_file(url), answered] {
+        try {
+            answered->set_value(TestHelper::on_loop(c->core, [&] {
+                auto t = c->attachment_thumbnail(id, 0, await);
+                auto d = c->attachment_data_cached(id, 0, await);
+                std::filesystem::remove(thumb_file);
+                return answers{std::move(t), std::move(d), error_code([&] {
+                                   c->attachment_thumbnail(id, 0, await);
+                               })};
+            }));
+        } catch (...) {
+            answered->set_exception(std::current_exception());
+        }
+    }}.detach();
+
+    auto got = answered->get_future();
+    if (got.wait_for(10s) != std::future_status::ready) {
+        (void)f.release();
+        FAIL("a waiting read on Core's loop never answered");
+    }
+    auto [t, d, missing] = got.get();
+    CHECK(t == thumb);
+    CHECK(d == data);
+    CHECK(missing == err::no_thumbnail);
+    settle(*f->c);
+    CHECK(f->attachment(id).has_thumbnail);
+}

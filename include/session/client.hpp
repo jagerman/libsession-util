@@ -1308,16 +1308,26 @@ class Client {
     // Where a read that finishes on another loop hands its answer, on Core's loop.
     using bytes_answer = std::function<void(Expected<std::vector<std::byte>>)>;
 
+    // Starts such a read on Core's loop, `wait` meaning as for `_read_cache_file`.
+    using bytes_read = std::function<void(bytes_answer, bool wait)>;
+
     // The public handler and waiting forms of such a read: run `start` on Core's loop with
     // somewhere to answer, and report what it answers or throws.
-    void _answer_bytes(
-            std::function<void(bytes_answer)> start, result_function<std::vector<std::byte>> cb);
-    std::vector<std::byte> _await_bytes(std::function<void(bytes_answer)> start);
+    void _answer_bytes(bytes_read start, result_function<std::vector<std::byte>> cb);
+    std::vector<std::byte> _await_bytes(bytes_read start);
+
+    // Reads `file` on the disk loop, behind whatever is queued there, and hands it to `then` on
+    // Core's loop.  `wait` blocks Core's loop for it instead, for a caller on that loop that must
+    // answer before returning; safe, as nothing on the disk loop ever waits for Core's.
+    void _read_cache_file(
+            std::filesystem::path file,
+            bool wait,
+            std::function<void(std::optional<std::vector<std::byte>>)> then);
 
     // These read on the disk loop and hand the answer to `done` on Core's loop.  They throw
     // `session::error` rather than calling `done` when there is plainly nothing to read.
-    void _attachment_thumbnail(int64_t message_id, size_t index, bytes_answer done);
-    void _attachment_data_cached(int64_t message_id, size_t index, bytes_answer done);
+    void _attachment_thumbnail(int64_t message_id, size_t index, bytes_answer done, bool wait);
+    void _attachment_data_cached(int64_t message_id, size_t index, bytes_answer done, bool wait);
 
     // The edge new thumbnails are made at: the stored setting, or failing that the constructor's.
     uint32_t _thumbnail_edge();
