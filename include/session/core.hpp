@@ -667,6 +667,9 @@ class Core {
     /// its jobs outlive itself puts them on a `quic::JobQueue` of its own over this loop, stops
     /// that queue as it is torn down, and holds the loop at least as long as the queue: a queue has
     /// to go before its loop does.
+    ///
+    /// Nothing run on it may wait for this Core's loop: Client's waiting cache reads block Core's
+    /// loop on this one.
     const std::shared_ptr<quic::Loop>& disk_loop() { return _disk_loop; }
 
     /// How long a cached PFS key is considered fresh (no re-fetch needed).
