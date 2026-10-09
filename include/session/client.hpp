@@ -16,6 +16,7 @@
 #include <session/util.hpp>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -70,6 +71,29 @@ namespace session::client {
 
 using namespace std::literals;
 
+/// The thumbnail edge used when neither the application nor a stored setting gives one: 240 points
+/// at the 2x density most phones have.
+inline constexpr uint32_t DEFAULT_THUMBNAIL_EDGE = 480;
+
+/// A Client constructor option: the edge, in pixels, of the attachment thumbnails this Client
+/// makes for as long as none has been stored with `Client::set_thumbnail_edge`.  A stored value
+/// wins whatever this says, so an application can pass the edge its display wants on every launch
+/// without discarding one the user chose.  Clamped as that setter's argument is.
+///
+///     session::client::Client client{path, cbs, session::client::default_thumbnail_edge{720}};
+///
+/// A default rather than a setting because what suits a display -- 240 points at its density, say
+/// -- is the application's to know every run, while a stored value has to survive the next run.
+struct default_thumbnail_edge {
+    uint32_t px;
+};
+
+/// Anything a Client constructor accepts after the database path: everything `core::Core` takes,
+/// which is forwarded to it, and Client's own options.
+template <typename T>
+concept ClientOption =
+        core::CoreOption<T> || std::same_as<std::remove_cvref_t<T>, default_thumbnail_edge>;
+
 class Client {
     friend class session::TestHelper;  // for unit tests
 
@@ -83,20 +107,21 @@ class Client {
     /// takes (database encryption, predefined_seed, …) and forwards them — with the one exception
     /// of `core::callbacks`, which a Client's application cannot supply: those are Client's own
     /// wiring, and the static_assert below rejects an attempt to pass a set rather than letting it
-    /// be silently overwritten.
+    /// be silently overwritten.  Client's own options (`default_thumbnail_edge`) are taken from the
+    /// same list and not forwarded.
     ///
     /// What an application is told is `client::callbacks`, given as the `cbs` argument of the
     /// overloads below and reported through the dispatcher.  Anything an application needs that
     /// only Core knows is Client's job to handle and re-report there; if something Core reports has
     /// no `client::callbacks` equivalent, that is a gap to fill here rather than a reason to reach
     /// past Client for it.
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     explicit Client(std::filesystem::path db_path, Opts&&... opts) :
             Client{std::move(db_path), callbacks{}, std::forward<Opts>(opts)...} {}
 
     /// As below, additionally taking the dispatcher every handler is delivered through.  See
     /// `dispatcher`; without one, handlers run on Core's event loop.
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     explicit Client(
             std::filesystem::path db_path, callbacks cbs, dispatcher dispatch, Opts&&... opts) :
             Client{std::move(db_path), std::move(cbs), std::forward<Opts>(opts)...} {
@@ -106,13 +131,14 @@ class Client {
     /// As above, additionally taking the change notifications to deliver.  They are fixed for the
     /// life of the Client, exactly as core::callbacks are, and are the only way an application is
     /// told anything -- see `callbacks`, and read the startup ordering note there before using it.
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     explicit Client(std::filesystem::path db_path, callbacks cbs, Opts&&... opts) :
             _cbs{std::make_shared<callbacks>(std::move(cbs))},
-            core{std::move(db_path),
-                 _core_callbacks(),
-                 core::schema_extension{"client", schema::MIGRATIONS, schema::FULL_SCHEMA},
-                 std::forward<Opts>(opts)...} {
+            _default_thumbnail_edge{
+                    core::detail::maybe_instance<default_thumbnail_edge>(opts...)
+                            .value_or(default_thumbnail_edge{DEFAULT_THUMBNAIL_EDGE})
+                            .px},
+            core{_make_core(std::move(db_path), _core_callbacks(), std::forward<Opts>(opts)...)} {
         static_assert(
                 (!std::same_as<std::remove_cvref_t<Opts>, core::callbacks> && ...),
                 "A Client's Core callbacks are its own wiring and cannot be supplied: what an "
@@ -387,6 +413,32 @@ class Client {
             size_t index,
             std::function<void(const AttachmentProgress&)> on_progress,
             result_function<std::vector<std::byte>> cb);
+
+    /// An attachment's thumbnail: a square JPEG of the picture, `thumbnail_edge` pixels a side (or
+    /// the picture's shorter side, if that is smaller), for a grid or a list to draw without
+    /// decoding the whole file.  See `image::thumbnail` for exactly what it is.
+    ///
+    /// **From the cache only, never the network.**  A thumbnail is made from the cached copy of the
+    /// file, once it is here, so there is never one to fetch: `Attachment::has_thumbnail` says
+    /// whether there is one now, and changes to it are reported through `messages_updated`.  A
+    /// display that wants one sooner asks for the file itself with `attachment_data`, which caches
+    /// it and so leads to its thumbnail.
+    ///
+    /// Made for every cached picture Session displays: as a download is kept, as a file we send is
+    /// kept, and once for the files already cached by a version that made none.  Each is made at
+    /// the `thumbnail_edge` in force at the time and kept with the file, so it goes when the file
+    /// is evicted or deleted and counts towards `attachment_cache_limit` with it.
+    ///
+    /// Reading one marks the cached file as used, as reading the file itself does: a picture being
+    /// shown as its thumbnail is a picture in use, and should not be first to go.
+    ///
+    /// Fails with:
+    ///
+    /// - `err::message_not_found`, `err::attachment_not_found` — there is no such attachment.
+    /// - `err::no_thumbnail` — there is no thumbnail for it, for any of the reasons above.
+    void attachment_thumbnail(
+            int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb);
+    std::vector<std::byte> attachment_thumbnail(int64_t message_id, size_t index, await_t);
 
     /// Withdraws one request made by `attachment_data` or `save_attachment`, by the token it
     /// returned or that its progress reports carry: its callback, and the last progress report it
@@ -683,6 +735,25 @@ class Client {
     void auto_download_concurrency(result_function<std::optional<int>> cb);
     std::optional<int> auto_download_concurrency(await_t);
 
+    /// The edge, in pixels, of the attachment thumbnails made from now on (see
+    /// `attachment_thumbnail`): the stored value if one has been set, and otherwise the
+    /// `default_thumbnail_edge` this Client was constructed with, or `DEFAULT_THUMBNAIL_EDGE`.
+    ///
+    /// Clamped to [`image::min_thumbnail_edge`, `image::max_thumbnail_edge`], 64 to 1024: the top
+    /// keeps a decoded thumbnail to 4 MiB.  nullopt removes the stored value, going back to the
+    /// constructor's.
+    ///
+    /// Thumbnails already made are kept at the size they were made at, rather than all made again:
+    /// a change is a preference about new ones, and remaking a whole cache's worth is a cost
+    /// nobody asked for.
+    ///
+    /// Persisted and device-local, for the same reasons as the cache limit, and because it follows
+    /// this device's display.
+    void set_thumbnail_edge(std::optional<uint32_t> px, result_function<> cb);
+    void set_thumbnail_edge(std::optional<uint32_t> px, await_t);
+    void thumbnail_edge(result_function<uint32_t> cb);
+    uint32_t thumbnail_edge(await_t);
+
     // -- Our own account ----------------------------------------------------------------------
     //
     // These read and write the UserProfile config, which follows the account between devices.  They
@@ -752,6 +823,30 @@ class Client {
 
     // As above, and for the same reason.
     std::chrono::milliseconds _high_freq_dispatch_interval{100};
+
+    // Above `core`, which the constructor initialises after it from the same options.
+    uint32_t _default_thumbnail_edge;
+
+    // Core, built from the options that are Core's: everything but Client's own.
+    template <ClientOption... Opts>
+    static core::Core _make_core(
+            std::filesystem::path db_path, core::callbacks cbs, Opts&&... opts) {
+        return std::apply(
+                [&]<typename... CoreOpts>(CoreOpts&&... core_opts) {
+                    return core::Core{
+                            std::move(db_path),
+                            std::move(cbs),
+                            core::schema_extension{
+                                    "client", schema::MIGRATIONS, schema::FULL_SCHEMA},
+                            std::forward<CoreOpts>(core_opts)...};
+                },
+                std::tuple_cat([]<typename T>(T&& o) {
+                    if constexpr (core::CoreOption<T>)
+                        return std::tuple<std::remove_cvref_t<T>>{std::forward<T>(o)};
+                    else
+                        return std::tuple<>{};
+                }(std::forward<Opts>(opts))...));
+    }
 
     // Core's send ids are per-process (its counter restarts at 1 on every run), so this mapping
     // must not be persisted or a stale row would capture a later run's status updates.
@@ -1138,6 +1233,11 @@ class Client {
     // Whether a file somebody asked for, of the size its sender declared, is kept once fetched: it
     // needs somewhere to go, and to fit `requested_cache_max_size`.
     bool _caches_requested(std::optional<int64_t> size);
+
+    std::vector<std::byte> _attachment_thumbnail(int64_t message_id, size_t index);
+
+    // The edge new thumbnails are made at: the stored setting, or failing that the constructor's.
+    uint32_t _thumbnail_edge();
 
     // Decides what an arriving message's attachments are worth fetching unasked, sets whether it is
     // shown as a gallery, and starts whatever it decided on.  Does nothing without a cache

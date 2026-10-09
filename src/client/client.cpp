@@ -20,6 +20,7 @@
 #include <session/format.hpp>
 #include <session/hash.hpp>
 #include <session/image/content_types.hpp>
+#include <session/image/thumbnail.hpp>
 #include <session/network/backends/session_file_server.hpp>
 #include <session/network/session_network.hpp>
 #include <session/placeholders.hpp>
@@ -940,6 +941,7 @@ namespace {
     constexpr auto AUTO_DL_MAX_KEY = "client:auto_download_max_size";
     constexpr auto REQUESTED_MAX_KEY = "client:requested_cache_max_size";
     constexpr auto AUTO_DL_CONCURRENCY_KEY = "client:auto_download_concurrency";
+    constexpr auto THUMBNAIL_EDGE_KEY = "client:thumbnail_edge";
     constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
 
@@ -1090,6 +1092,33 @@ std::optional<int> Client::auto_download_concurrency(await_t) {
     return call_get([this] { return get_concurrency(core.globals); });
 }
 
+static uint32_t clamped_edge(int64_t px) {
+    return static_cast<uint32_t>(
+            std::clamp<int64_t>(px, image::min_thumbnail_edge, image::max_thumbnail_edge));
+}
+
+uint32_t Client::_thumbnail_edge() {
+    return clamped_edge(
+            core.globals.get_integer(THUMBNAIL_EDGE_KEY).value_or(_default_thumbnail_edge));
+}
+
+static void set_thumbnail_edge_in(core::Globals& g, std::optional<uint32_t> px) {
+    set_limit(g, THUMBNAIL_EDGE_KEY, px ? std::optional{int64_t{clamped_edge(*px)}} : std::nullopt);
+}
+
+void Client::set_thumbnail_edge(std::optional<uint32_t> px, result_function<> cb) {
+    _async([this, px] { set_thumbnail_edge_in(core.globals, px); }, std::move(cb));
+}
+void Client::set_thumbnail_edge(std::optional<uint32_t> px, await_t) {
+    call_get([this, px] { set_thumbnail_edge_in(core.globals, px); });
+}
+void Client::thumbnail_edge(result_function<uint32_t> cb) {
+    _async([this] { return _thumbnail_edge(); }, std::move(cb));
+}
+uint32_t Client::thumbnail_edge(await_t) {
+    return call_get([this] { return _thumbnail_edge(); });
+}
+
 bool Client::_caches_requested(std::optional<int64_t> size) {
     if (_cache_dir.empty())
         return false;
@@ -1182,6 +1211,21 @@ void Client::_attachment_data(
              _attachment_progress(message_id, index, token, std::move(on_progress)),
              std::move(cb),
              std::move(ended)});
+}
+
+void Client::attachment_thumbnail(
+        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
+    _async([this, message_id, index] { return _attachment_thumbnail(message_id, index); },
+           std::move(cb));
+}
+std::vector<std::byte> Client::attachment_thumbnail(int64_t message_id, size_t index, await_t) {
+    return call_get([this, message_id, index] { return _attachment_thumbnail(message_id, index); });
+}
+
+std::vector<std::byte> Client::_attachment_thumbnail(int64_t message_id, size_t index) {
+    throw session::error{
+            err::no_thumbnail,
+            "Attachment {} of message {} has no thumbnail"_format(index, message_id)};
 }
 
 void Client::cancel_attachment_transfer(uint64_t token) {
