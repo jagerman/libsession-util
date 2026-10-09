@@ -234,10 +234,15 @@ void Devices::rotate_account_keys() {
     random::fill(seed);
     auto keys = keys_from_seed<AccountKeys>(seed);
 
+    // Created after every key we hold, even within the same second: the newest key wins, with ties
+    // going to the lowest seed, so a rotation stamped with the same second as the key it replaces
+    // could lose to it -- and after a removal, that would leave current the key the removed device
+    // holds.
     auto c = conn();
     c.prepared_exec(
             "INSERT INTO device_account_keys (created, seed, pubkey_mlkem768, pubkey_x25519)"
-            " VALUES (?, ?, ?, ?)",
+            " VALUES (MAX(?1, IFNULL((SELECT MAX(created) + 1 FROM device_account_keys), ?1)),"
+            "  ?2, ?3, ?4)",
             epoch_seconds(clock_now_s()),
             seed,
             keys.mlkem768_pub,

@@ -373,24 +373,45 @@ TEST_CASE("Devices - account keys", "[core][devices]") {
         CHECK(after.front().x25519_pub != before.front().x25519_pub);
     }
 
-    SECTION("rotate_account_keys produces a distinct key: same timestamp, seed tiebreak") {
-        // Snap the adjusted clock to the start of the next second so both key-creation calls
-        // land in the same second with no risk of spanning a second boundary.
+    SECTION("a rotation within the same second as the key it replaces still supersedes it") {
+        // Pinned to the start of a second so that both keys are created within it.
         ScopedClockOffset pin_to_next_second{
                 (clock_now_s() + 1s) - std::chrono::system_clock::now()};
 
-        c->devices.active_account_keys();  // ensure initial key exists at pinned second
-        c->devices.rotate_account_keys();  // new key created at same second
-        auto keys = c->devices.active_account_keys();
-        REQUIRE(keys.size() == 2);
-        CHECK_FALSE(keys.front().rotated.has_value());
-        CHECK(keys.back().rotated.has_value());
+        // Whichever seed is lower: a rotation that a tie could undo would, after a removal, leave
+        // current the key the removed device holds.  Eight in a row, since any one of them wins a
+        // seed tie half the time by luck alone.
+        auto before = c->devices.active_account_keys();
+        REQUIRE(before.size() == 1);
+        for (size_t n = 2; n <= 9; n++) {
+            c->devices.rotate_account_keys();
+            auto keys = c->devices.active_account_keys();
+            REQUIRE(keys.size() == n);
+            CHECK(keys.front().x25519_pub != before.front().x25519_pub);
+            CHECK_FALSE(keys.front().rotated.has_value());
+            before = keys;
+        }
+    }
 
-        // Look up each key's seed via its x25519 pubkey and verify the tie-breaking rule:
-        // the active key must have the lexicographically smaller seed.
-        auto active_seed = TestHelper::account_key_seed(c->devices, keys.front().x25519_pub);
-        auto rotated_seed = TestHelper::account_key_seed(c->devices, keys.back().x25519_pub);
-        CHECK(active_seed < rotated_seed);
+    SECTION("keys created in the same second settle on the lower seed, in either order") {
+        // What two devices' rotations crossing looks like once both have merged: the same created
+        // time from different seeds.  Every device must settle on the same one.
+        for (bool reversed : {false, true}) {
+            auto conn = c->database().conn();
+            conn.prepared_exec("DELETE FROM device_account_keys");
+            std::array<std::byte, 32> low, high;
+            low.fill(std::byte{0x01});
+            high.fill(std::byte{0xff});
+            for (auto* seed : reversed ? std::array{&low, &high} : std::array{&high, &low})
+                conn.prepared_exec(
+                        "INSERT INTO device_account_keys"
+                        " (created, seed, pubkey_mlkem768, pubkey_x25519)"
+                        " VALUES (1700000000, ?, zeroblob(1184), zeroblob(32))",
+                        *seed);
+            auto active = conn.prepared_get<sqlite::blob_guts<std::array<std::byte, 32>>>(
+                    "SELECT seed FROM device_account_keys WHERE rotated IS NULL");
+            CHECK(active == low);
+        }
     }
 
     SECTION("after one rotation active_account_keys has two entries") {
@@ -410,8 +431,10 @@ TEST_CASE("Devices - account keys", "[core][devices]") {
             CHECK(keys.size() == 2);
         }
 
-        // Advance clock past retention window: old rotated key should be pruned
-        ScopedClockOffset advance_past_retention{Devices::ACCOUNT_KEY_RETENTION + 1s};
+        // Advance clock past retention window: old rotated key should be pruned.  Two seconds,
+        // because a rotation made within the second its predecessor was created is stamped a
+        // second ahead, and the old key's rotation time with it.
+        ScopedClockOffset advance_past_retention{Devices::ACCOUNT_KEY_RETENTION + 2s};
         auto keys = c->devices.active_account_keys();
         CHECK(keys.size() == 1);
         CHECK_FALSE(keys.front().rotated.has_value());
