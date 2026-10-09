@@ -86,6 +86,12 @@ static device::GroupId new_group_id() {
 static constexpr auto own_request_expires_key = "devices_link_request_expires"sv;
 static constexpr auto own_request_sas_key = "devices_link_request_sas"sv;
 
+// The user's confirmation that our request's SAS matched, and a group message admitting us that
+// arrived before it, held until it does: a fetch delivers a message only once.
+static constexpr auto confirmed_key = "devices_link_confirmed"sv;
+static constexpr auto held_admission_key = "devices_link_held_admission"sv;
+static constexpr auto held_admission_hash_key = "devices_link_held_admission_hash"sv;
+
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
         log::info(cat, "Loaded existing unique device id: {}", self_id);
@@ -1307,6 +1313,23 @@ void Devices::receive_device_group_message(
         return;
     }
 
+    // A message admitting us while we wait on our own request.  Being able to read it shows only
+    // that some holder of the seed encrypted it to us, so it waits for the user to confirm the SAS;
+    // see confirm_link.
+    auto self = payload.devices.find(self_id);
+    bool admitting = self != payload.devices.end() &&
+                     self->second.state == device::State::Registered &&
+                     conn().prepared_maybe_get<int>(
+                             "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                             self_id,
+                             static_cast<int>(device::State::Pending));
+    if (admitting && !core.globals.get_integer(confirmed_key).value_or(0)) {
+        core.globals.set(held_admission_key, data);
+        core.globals.set(held_admission_hash_key, std::string_view{hash});
+        log::info(cat, "Admitted to a device group; holding it until the user confirms the SAS");
+        return;
+    }
+
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
@@ -1396,6 +1419,9 @@ void Devices::receive_device_group_message(
                 "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
     tx.commit();
+
+    if (admitting)
+        _forget_confirmation();
 }
 
 void Devices::_record_group(const SwarmMessage& msg) {
@@ -1565,13 +1591,48 @@ std::optional<Devices::OutgoingLinkRequest> Devices::_outgoing_link_request() {
                 static_cast<int>(device::State::Pending)))
         return std::nullopt;
 
-    return OutgoingLinkRequest{.sas = sas_from_seed(seed), .expires = *expires};
+    return OutgoingLinkRequest{
+            .sas = sas_from_seed(seed),
+            .expires = *expires,
+            .confirmed = core.globals.get_integer(confirmed_key).value_or(0) != 0};
+}
+
+void Devices::confirm_link(result_function<bool> cb) {
+    async([this] { return _confirm_link(); }, std::move(cb));
+}
+
+bool Devices::confirm_link(await_t) {
+    return jq().call_get([this] { return _confirm_link(); });
+}
+
+bool Devices::_confirm_link() {
+    assert(on_loop());
+    if (!conn().prepared_maybe_get<int>(
+                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                self_id,
+                static_cast<int>(device::State::Pending)))
+        return false;
+
+    core.globals.set(confirmed_key, int64_t{1});
+    if (auto held = core.globals.get_blob(held_admission_key)) {
+        auto hash = core.globals.get_text(held_admission_hash_key).value_or("");
+        receive_device_group_message(*held, hash);
+        _flush_events();
+    }
+    return true;
+}
+
+void Devices::_forget_confirmation() {
+    core.globals.erase(confirmed_key);
+    core.globals.erase(held_admission_key);
+    core.globals.erase(held_admission_hash_key);
 }
 
 bool Devices::_withdraw_own_request() {
     assert(on_loop());
     core.globals.erase(own_request_expires_key);
     core.globals.erase(own_request_sas_key);
+    _forget_confirmation();
     return conn()
             .prepared_maybe_get<int64_t>(
                     "UPDATE devices SET state = ? WHERE unique_id = ? AND state = ? RETURNING id",
@@ -1640,6 +1701,9 @@ Devices::LinkRequestResult Devices::_build_link_request(
     auto plaintext = encode_link_request_plaintext(self_id, info, seed.ed25519_secret());
     auto sas_seed = derive_sas_seed(to_span<std::byte>(plaintext));
     auto out = _encrypt_link_request(to_span(plaintext), link_x25519);
+
+    // A new request has a new SAS, which the user has not compared yet.
+    _forget_confirmation();
 
     // Now waiting on our own request, which the caller knows: it is the one asking.
     _rebaseline_membership();

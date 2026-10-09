@@ -934,11 +934,12 @@ struct Linking {
         return found->second;
     }
 
-    // The applicant asks, is accepted here, and reads the group message admitting it, leaving a
-    // group of two.
+    // The applicant asks, is accepted here, has its user confirm the SAS, and reads the group
+    // message admitting it, leaving a group of two.
     void admit() {
         ask();
         REQUIRE(core->devices.accept_request(events.added.at(0).id, await));
+        REQUIRE(applicant->devices.confirm_link(await));
         TestHelper::deliver_device_message(
                 *applicant,
                 core->devices.build_device_group_message().message,
@@ -1333,6 +1334,9 @@ TEST_CASE(
     auto group = l.core->devices.build_device_group_message().message;
     TestHelper::deliver_device_message(*l.applicant, group, in(10min), "G1");
 
+    // Admitted, but not in until its user confirms the SAS.
+    CHECK(l.applicant_events.membership.empty());
+    REQUIRE(l.applicant->devices.confirm_link(await));
     CHECK(l.applicant_events.membership == std::vector{device::Membership::InGroup});
 }
 
@@ -1420,10 +1424,13 @@ TEST_CASE(
     REQUIRE(waiting);
     CHECK(same(*waiting, asked));
 
-    // The other device prompts with what this one shows.
+    // The other device prompts with what this one shows, and the user, seeing them match, says so
+    // on both.
     TestHelper::deliver_device_message(*l.core, message, asked.expires, "L1");
     REQUIRE(l.events.added.size() == 1);
     CHECK(l.events.added[0].sas == asked.sas);
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    CHECK(l.applicant->devices.outgoing_link_request(await)->confirmed);
 
     REQUIRE(l.core->devices.accept_request(l.events.added[0].id, await));
     auto group = l.core->devices.build_device_group_message().message;
@@ -1931,6 +1938,85 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.core);
     CHECK(l.core->devices.membership(await).membership == device::Membership::CutOff);
     CHECK(l.events.membership.back() == device::Membership::CutOff);
+}
+
+TEST_CASE(
+        "Devices - a device admitted only by an impostor's group does not join",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+
+    // A seed holder outside the real group -- a removed device, say -- publishes a group of its
+    // own, and the applicant asks to join that one instead.
+    DeviceEventsRecorder impostor_events;
+    TempCore impostor{
+            core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
+            Linking::reporting_to(impostor_events)};
+    TestHelper::start_group(*impostor);
+    auto req = TestHelper::build_link_request(*l.applicant, *impostor);
+
+    // The real group cannot read the request, so it never prompts, and the user never sees a SAS
+    // to compare.
+    TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1");
+    CHECK(l.events.added.empty());
+
+    // The impostor can, and admits it.
+    TestHelper::deliver_device_message(*impostor, req.message, in(10min), "L1");
+    REQUIRE(impostor_events.added.size() == 1);
+    REQUIRE(impostor->devices.accept_request(impostor_events.added[0].id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, impostor->devices.build_device_group_message().message, in(10min), "G1");
+
+    // Readable, but not enough: with no confirmation from its user, it does not join.
+    CHECK(own_state(l.applicant) == device::State::Pending);
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::Waiting});
+}
+
+TEST_CASE(
+        "Devices - an admission held for confirmation survives a restart",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.applicant);
+    Asked got;
+    request_link(l, got);
+    auto message = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+
+    TestHelper::deliver_device_message(*l.core, message, (*got)->expires, "L1");
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    REQUIRE(own_state(l.applicant) == device::State::Pending);
+
+    l.applicant.core.reset();
+    l.applicant.core = std::make_unique<core::Core>(
+            l.applicant.path, Linking::reporting_to(l.applicant_events));
+
+    // The fetch that brought the admission will not bring it again; it was kept.
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    CHECK(own_state(l.applicant) == device::State::Registered);
+    CHECK(TestHelper::group_id(*l.applicant) == TestHelper::group_id(*l.core));
+}
+
+TEST_CASE("Devices - a new request needs confirming again", "[core][devices][linking][confirm]") {
+    Linking l;
+    CHECK_FALSE(l.applicant->devices.confirm_link(await));
+
+    l.ask();
+    REQUIRE(l.applicant->devices.confirm_link(await));
+
+    // Asked again: a new SAS, which the user has not compared.
+    auto second = l.ask(in(10min), "L2");
+    REQUIRE(l.events.added.size() == 2);
+    REQUIRE(l.core->devices.accept_request(l.events.added[1].id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    CHECK(own_state(l.applicant) == device::State::Pending);
+
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    CHECK(own_state(l.applicant) == device::State::Registered);
 }
 
 namespace {

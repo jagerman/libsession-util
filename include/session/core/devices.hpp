@@ -428,6 +428,10 @@ class Devices final : detail::CoreComponent {
         /// When the request lapses unanswered.  After it no device can accept it, and asking again
         /// is the only way in.
         std::chrono::sys_seconds expires;
+
+        /// The user has confirmed, through `confirm_link`, that the emoji match the accepting
+        /// device's; what is left is for that device to accept.
+        bool confirmed = false;
     };
 
     // Asks the devices of the group `group` to admit this one: uploads a link request for them to
@@ -452,6 +456,19 @@ class Devices final : detail::CoreComponent {
     // since the swarm's copy stays acceptable until its deadline either way.
     void outgoing_link_request(result_function<std::optional<OutgoingLinkRequest>> cb);
     std::optional<OutgoingLinkRequest> outgoing_link_request(await_t);
+
+    // The user's confirmation, on this device, that its SAS matches the one the accepting device
+    // showed.  A device joins only once it has this *and* a group message admitting it, in either
+    // order: being able to read such a message is not enough on its own, since anyone holding the
+    // account seed can publish a group of its own with a link key of its own, and admit into it a
+    // device that encrypted its request there.  The real group can read no such request, and so
+    // never prompts for it, which is what makes the user's confirmation mean something.  See
+    // "Confirmation on the requesting device".
+    //
+    // Answers false if this device is not waiting on a request.  Asking again needs confirming
+    // again: a new request has a new SAS.
+    void confirm_link(result_function<bool> cb);
+    bool confirm_link(await_t);
 
     // Every link request this device has seen, newest first: pending, answered, superseded and
     // expired alike.  For a history view.
@@ -586,9 +603,15 @@ class Devices final : detail::CoreComponent {
     std::optional<OutgoingLinkRequest> _outgoing_link_request();
 
     // Returns our own row from Pending to Unregistered and forgets the request, answering whether
-    // it was Pending.  Local only: a request already in the swarm can still be accepted, and admits
-    // us if it is.
+    // it was Pending.  Local only: a request already in the swarm can still be accepted, though it
+    // admits us only if the user confirms it.
     bool _withdraw_own_request();
+
+    // Forgets the user's confirmation and any admission held back for one: both belong to a request
+    // that has been replaced, withdrawn, or answered.
+    void _forget_confirmation();
+
+    bool _confirm_link();
 
     // Points the expiry timer at `deadline`, or stops it.
     void _arm_expiry(std::optional<std::chrono::sys_seconds> deadline);
