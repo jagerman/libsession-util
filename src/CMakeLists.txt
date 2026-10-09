@@ -151,6 +151,7 @@ target_link_libraries(
     PUBLIC
     core
     PRIVATE
+    image
     libsession::protos
 )
 

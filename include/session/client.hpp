@@ -1098,7 +1098,15 @@ class Client {
     //
     // Returns whether it got that far, which is what says the messages have been told: a caller
     // that gets false has left them where they were and owes them the news itself.
-    bool _record_cached(const std::string& url, const std::filesystem::path& file, int64_t on_disk);
+    //
+    // Queues a thumbnail for it when any of those messages shows it as a picture.  `plain`, for a
+    // file of our own, is the local file the copy was made from, which the thumbnail is then made
+    // from instead of decrypting the copy back.
+    bool _record_cached(
+            const std::string& url,
+            const std::filesystem::path& file,
+            int64_t on_disk,
+            std::optional<std::filesystem::path> plain = std::nullopt);
 
     /// Keeps a copy of a file we just uploaded, so that a message we sent can be drawn without
     /// fetching back a file that came off this disk in the first place.
@@ -1205,6 +1213,47 @@ class Client {
     // of what is left.
     void _post_disk(std::function<void()> job);
 
+    // Where thumbnails are made: a thread of their own, used one thumbnail at a time, since making
+    // one decodes a whole picture and neither Core's loop nor the disk loop can wait for that.
+    // libvips spreads each one over its own worker threads, so one at a time still uses the cores.
+    // Placed, emplaced and stopped as the disk loop is, for the same reasons.
+    std::shared_ptr<oxen::quic::Loop> _thumb_loop;
+    std::optional<oxen::quic::JobQueue> _thumb_jq;
+    void _post_thumbnail(std::function<void()> job);
+
+    // Cache entries waiting for a thumbnail, oldest first, and whether one is being made.  Core's
+    // loop's.  One at a time end to end -- made, written on the disk loop, recorded -- which is
+    // what keeps a thumbnail written for an entry evicted meanwhile from racing the eviction.
+    struct PendingThumbnail {
+        int64_t entry;
+        std::optional<std::filesystem::path> plain;  // as `_record_cached`'s
+    };
+    std::deque<PendingThumbnail> _thumb_pending;
+    bool _thumb_running = false;
+
+    // Whether the startup pass has queued entries that are not all done yet: the pass is recorded
+    // as done only once they are, so one cut short by the process ending runs again next time.
+    bool _thumb_pass_running = false;
+
+    void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);
+
+    // Starts the next queued thumbnail unless one is being made, skipping entries that have gone
+    // or been given one since they were queued.
+    void _pump_thumbnails();
+
+    // Back from the thumbnail thread with what it made, or nullopt if the file is not a picture it
+    // could make one of: writes it beside the entry if the entry still wants it.
+    void _thumbnail_made(
+            int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg);
+
+    // Records a thumbnail written beside entry `entry`, and tells the messages showing it; or, if
+    // the entry has gone meanwhile, removes the thumbnail again.
+    void _record_thumbnail(int64_t entry, const std::string& name, int64_t on_disk);
+
+    // Queues a thumbnail for every cached picture without one, unless this version's pass has
+    // already run: what a cache filled before thumbnails existed needs, once.
+    void _thumbnail_pass();
+
     // `automatic` for an auto-download, which is always kept; anything else is kept only if
     // `_caches_requested` says so.  `ended` is the waiter's.
     void _attachment_data(
@@ -1238,7 +1287,12 @@ class Client {
     // needs somewhere to go, and to fit `requested_cache_max_size`.
     bool _caches_requested(std::optional<int64_t> size);
 
-    std::vector<std::byte> _attachment_thumbnail(int64_t message_id, size_t index);
+    // Reads an attachment's thumbnail on the disk loop and hands it to `done` on Core's loop.
+    // Throws `session::error` rather than calling `done` when there is plainly none to read.
+    void _attachment_thumbnail(
+            int64_t message_id,
+            size_t index,
+            std::function<void(Expected<std::vector<std::byte>>)> done);
 
     // The edge new thumbnails are made at: the stored setting, or failing that the constructor's.
     uint32_t _thumbnail_edge();
