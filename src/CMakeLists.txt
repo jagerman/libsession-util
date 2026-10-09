@@ -256,6 +256,7 @@ add_libsession_util_library(image
     image/probe.cpp
     image/source.cpp
     image/thumbhash.cpp
+    image/thumbnail.cpp
     image/vips.cpp
 )
 # libvips' vips/semaphore.h shadows the <semaphore.h> libstdc++'s <semaphore> includes when static-deps/include/vips is on the path.
