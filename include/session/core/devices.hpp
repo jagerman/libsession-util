@@ -10,6 +10,7 @@
 #include <oxen/quic/timer_id.hpp>
 #include <session/clock.hpp>
 #include <session/sodium_array.hpp>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -248,6 +249,38 @@ namespace device {
         bool operator==(const GroupId&) const = default;
     };
 
+    /// Where this device stands with respect to the account's device groups.  An ongoing state
+    /// rather than a step in setup: it is re-evaluated on every fetch, and any of these can recur.
+    enum class Membership {
+        Unknown,  ///< Not yet known: no fetch from the swarm has completed since this Core started,
+                  ///< and what the swarm holds decides every other value.
+        InGroup,  ///< In a group.  Others may be visible alongside it: see MembershipState::others.
+        NoGroup,  ///< Not in a group, and no group is in the swarm.  Either the account never had
+                  ///< one, or every device was offline long enough for it to expire, and the two
+                  ///< cannot be told apart -- so starting one is the user's decision.
+        GroupsVisible,  ///< Not in a group, and one or more groups it cannot read are in the swarm:
+                        ///< it may ask to join one, or start its own alongside them.
+        Waiting,        ///< Waiting on this device's own link request; see `outgoing_link_request`.
+        Removed,  ///< Removed from its group by another device.  It can come back only under a new
+                  ///< device id.
+        CutOff,   ///< Was in a group, none of whose messages are left in the swarm, while another
+                  ///< group's are.  It can no longer receive anything encrypted to its group, which
+                  ///< may be an attack, and is never dismissable.
+    };
+
+    /// A device group in the swarm other than this device's own.
+    struct VisibleGroup {
+        GroupId id;
+        std::chrono::sys_seconds last_seen;  ///< When its newest message was stored.
+        bool dismissed;  ///< The user has dismissed it here: see `Devices::dismiss_group`.
+    };
+
+    struct MembershipState {
+        Membership membership;
+        std::optional<GroupId> group;      ///< This device's group, while it is in one.
+        std::vector<VisibleGroup> others;  ///< Every other group in the swarm, newest first.
+    };
+
     struct decryption_failed : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
@@ -286,7 +319,8 @@ class Devices final : detail::CoreComponent {
     // which the caller does not need telling about.
     bool _devices_changed = false;
     bool _fetched = false;
-    std::optional<device::State> _reported_state;
+    device::Membership _reported_membership = device::Membership::Unknown;
+    std::set<std::array<std::byte, 8>> _announced_groups;
     std::unordered_set<int64_t> _ended;
 
     // Fires a flush at the earliest deadline among our own request and those handed out and still
@@ -477,8 +511,26 @@ class Devices final : detail::CoreComponent {
     void remove_device(std::array<std::byte, 32> id, result_function<bool> cb);
     bool remove_device(std::span<const std::byte, 32> id, await_t);
 
+    // Where this device stands, and which other groups are in the swarm.  What an application
+    // prompts from at startup and draws its device screen from; read again on `membership_changed`
+    // and `group_appeared`.  `Unknown` until the first fetch of this run completes, since the swarm
+    // may have changed while it was down.
+    void membership(result_function<device::MembershipState> cb);
+    device::MembershipState membership(await_t);
+
+    // Dismisses the alert for another group, so that `group_appeared` does not fire for it again --
+    // here only: each device dismisses for itself.  Remembered across restarts.  It does not quiet
+    // `CutOff`, which is never dismissable.  Answers false for a group not seen in the swarm.
+    void dismiss_group(device::GroupId group, result_function<bool> cb);
+    bool dismiss_group(const device::GroupId& group, await_t);
+
   private:
     bool _remove_device(std::span<const std::byte, 32> id);
+    device::MembershipState _membership();
+    bool _dismiss_group(const device::GroupId& group);
+
+    // Takes where we now stand as already reported, after a change the caller made and so knows of.
+    void _rebaseline_membership();
 
     // Whether an unreadable group message names this device in its `kicked` list, which is the only
     // way a removed device learns of it: it is no longer given a key to the payload.

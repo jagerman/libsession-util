@@ -78,7 +78,8 @@ enum class MessageSendStatus {
 ///
 /// Everything here is reported once the fetch that caused it has been merged in full, so a handler
 /// never sees a half-applied state.  State to draw from initially is read the ordinary way, through
-/// `Devices::devices()` and `Devices::incoming_link_requests()`; these report what changes after.
+/// `Devices::membership()`, `Devices::devices()` and `Devices::incoming_link_requests()`; these
+/// report what changes after.
 ///
 /// Called on Core's event loop, so a method must not block.  One that throws is logged, and the
 /// others are still called; what it was told is not told again.
@@ -105,10 +106,17 @@ class DeviceEvents {
     /// was in the group.  Not the ones asking to join, which arrive as link requests instead.
     virtual void devices_replaced(device::map devices) = 0;
 
-    /// This device's own membership changed: admitted to the group, removed from it, or -- as
-    /// `Unregistered` -- its request to join lapsed unanswered.  Not for the move to `Pending` that
-    /// `Devices::request_link` makes, nor for a request it reports failed: the caller knows.
-    virtual void membership_changed(device::State state) = 0;
+    /// This device's membership changed, or became known with the first fetch of this run; see
+    /// device::Membership for what each value means.  `Removed` and `CutOff` are the two to alert
+    /// on, and arrive as soon as the fetch that reveals them is merged.  Not for the move to
+    /// `Waiting` that `Devices::request_link` makes, nor back from it when that call reports
+    /// failure: the caller knows.  Never `Unknown`.
+    virtual void membership_changed(device::Membership membership) = 0;
+
+    /// While this device is in a group, another group has appeared in the swarm alongside it: the
+    /// account has forked, which the user should be told of.  Once per group per run, and not for a
+    /// group dismissed through `Devices::dismiss_group`.
+    virtual void group_appeared(device::GroupId group) = 0;
 };
 
 /// Struct holding application callbacks to fire when libsession Core events happen to allow the

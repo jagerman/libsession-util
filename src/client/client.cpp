@@ -423,8 +423,12 @@ void Client::devices_replaced(core::device::map devices) {
     });
 }
 
-void Client::membership_changed(core::device::State state) {
-    _emit([state](const callbacks& cbs) { cbs.devices->membership_changed(state); });
+void Client::membership_changed(core::device::Membership membership) {
+    _emit([membership](const callbacks& cbs) { cbs.devices->membership_changed(membership); });
+}
+
+void Client::group_appeared(core::device::GroupId group) {
+    _emit([group](const callbacks& cbs) { cbs.devices->group_appeared(group); });
 }
 
 void Client::_init() {

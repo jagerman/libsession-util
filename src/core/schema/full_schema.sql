@@ -107,7 +107,9 @@ CREATE TABLE device_groups (
     seen_at INTEGER NOT NULL,     -- swarm timestamp of the newest message seen, unix seconds
     -- The latest expiry among the messages seen, unix seconds.  The group is in the swarm until
     -- then, as far as fetching can tell: a deletion is not something a fetch reports.
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    -- The user dismissed the alert for this group here.  This device's decision alone.
+    dismissed INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 -- This table holds current and recent device private keys for *this* device, including the

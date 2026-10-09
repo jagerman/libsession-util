@@ -236,8 +236,9 @@ struct DeviceEventsRecorder : core::DeviceEvents {
     std::vector<core::device::LinkRequest> added;
     std::vector<std::pair<int, core::device::LinkRequestEnd>> ended;
     std::vector<core::device::map> replaced;
-    std::vector<core::device::State> membership;
-    std::vector<std::string> order;  // which of the four, as they arrived
+    std::vector<core::device::Membership> membership;
+    std::vector<core::device::GroupId> appeared;
+    std::vector<std::string> order;  // which of them, as they arrived
 
     void link_request_added(core::device::LinkRequest request) override {
         if (on_added)
@@ -253,9 +254,13 @@ struct DeviceEventsRecorder : core::DeviceEvents {
         order.push_back("replaced");
         replaced.push_back(std::move(devices));
     }
-    void membership_changed(core::device::State state) override {
+    void membership_changed(core::device::Membership m) override {
         order.push_back("membership");
-        membership.push_back(state);
+        membership.push_back(m);
+    }
+    void group_appeared(core::device::GroupId group) override {
+        order.push_back("appeared");
+        appeared.push_back(group);
     }
 };
 
@@ -619,6 +624,15 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
         return on_loop(
                 core, [&] { return core.devices._encrypt_link_request(plaintext, link_x25519); });
+    }
+
+    // Gives `core` a group of its own, as a new account gets one -- a second group, on an account
+    // that already has a first.
+    static void start_group(core::Core& core) {
+        on_loop(core, [&] {
+            core.devices._mark_group_owed();
+            core.devices.establish_group();
+        });
     }
 
     static std::optional<core::device::GroupId> group_id(core::Core& core) {
