@@ -70,14 +70,6 @@ namespace session::client {
 
 using namespace std::literals;
 
-/// One of the account's configs and how large it is: see `Client::config_sizes()`.
-struct ConfigSize {
-    /// `user_profile`, `contacts`, `convo_info_volatile`, `user_groups` or `local`.
-    std::string name;
-    /// The size of the dump the config would write now, in bytes.
-    int64_t bytes;
-};
-
 class Client {
     friend class session::TestHelper;  // for unit tests
 
@@ -627,10 +619,11 @@ class Client {
     /// Measured by dumping each config, so it costs one serialisation of each; cheap for a header,
     /// not something to poll.
     ///
-    /// Empty when there is no account yet: the configs are built from it on first use, and there is
-    /// nothing to measure before then.
-    void config_sizes(result_function<std::vector<ConfigSize>> cb);
-    std::vector<ConfigSize> config_sizes(await_t);
+    /// Keyed by config: `user_profile`, `contacts`, `convo_info_volatile`, `user_groups` and
+    /// `local`.  Empty when there is no account yet: the configs are built from it on first use,
+    /// and there is nothing to measure before then.
+    void config_sizes(result_function<std::unordered_map<std::string, int>> cb);
+    std::unordered_map<std::string, int> config_sizes(await_t);
 
     /// The largest attachment that will be fetched *unasked*, or nullopt for no limit.
     ///
@@ -1056,7 +1049,7 @@ class Client {
     // connection is for callers that already hold one and are about to write through it -- eviction
     // reads this to decide whether it has work to do.
     int64_t _attachment_cache_size();
-    std::vector<ConfigSize> _config_sizes();
+    std::unordered_map<std::string, int> _config_sizes();
     int64_t _attachment_cache_size(sqlite::Connection& c);
 
     // Where a profile reached us from, which is what a field it does not carry means.

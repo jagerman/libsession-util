@@ -995,13 +995,11 @@ int64_t Client::attachment_cache_size(await_t) {
     return call_get([this] { return _attachment_cache_size(); });
 }
 
-std::vector<ConfigSize> Client::_config_sizes() {
+std::unordered_map<std::string, int> Client::_config_sizes() {
     if (!core.globals.have_account())
         return {};
     auto& configs = core.configs;
-    auto size = [](config::ConfigBase& conf) {
-        return static_cast<int64_t>(conf.make_dump().size());
-    };
+    auto size = [](config::ConfigBase& conf) { return static_cast<int>(conf.make_dump().size()); };
     return {
             {"user_profile", size(configs.user_profile())},
             {"contacts", size(configs.contacts())},
@@ -1011,10 +1009,10 @@ std::vector<ConfigSize> Client::_config_sizes() {
     };
 }
 
-void Client::config_sizes(result_function<std::vector<ConfigSize>> cb) {
+void Client::config_sizes(result_function<std::unordered_map<std::string, int>> cb) {
     _async([this] { return _config_sizes(); }, std::move(cb));
 }
-std::vector<ConfigSize> Client::config_sizes(await_t) {
+std::unordered_map<std::string, int> Client::config_sizes(await_t) {
     return call_get([this] { return _config_sizes(); });
 }
 

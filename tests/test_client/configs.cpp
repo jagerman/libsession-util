@@ -592,20 +592,16 @@ TEST_CASE("Client: config sizes are the size of each config's dump", "[client][c
     SECTION("one entry per config, growing with what is put in it") {
         TempClient c;
         auto before = c->config_sizes(await);
-        std::vector<std::string> names;
-        for (const auto& size : before)
-            names.push_back(size.name);
-        CHECK(names ==
-              std::vector<std::string>{
-                      "user_profile", "contacts", "convo_info_volatile", "user_groups", "local"});
+        CHECK(before.size() == 5);
+        for (auto name :
+             {"user_profile", "contacts", "convo_info_volatile", "user_groups", "local"})
+            CHECK(before.contains(name));
 
-        auto profile = [](const std::vector<ConfigSize>& sizes) {
-            return std::ranges::find(sizes, "user_profile", &ConfigSize::name)->bytes;
-        };
         c->set_display_name("A name long enough to make the dump measurably larger", await);
-        CHECK(profile(c->config_sizes(await)) > profile(before));
-        CHECK(profile(c->config_sizes(await)) == in_configs(*c, [](auto& cfg) {
-                  return static_cast<int64_t>(cfg.user_profile().make_dump().size());
+        auto after = c->config_sizes(await);
+        CHECK(after.at("user_profile") > before.at("user_profile"));
+        CHECK(after.at("user_profile") == in_configs(*c, [](auto& cfg) {
+                  return static_cast<int>(cfg.user_profile().make_dump().size());
               }));
     }
 }
