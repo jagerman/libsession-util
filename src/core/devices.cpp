@@ -72,6 +72,17 @@ static constexpr auto dev_key = "device_unique_id"sv;
 // restored account never sets it: its group, if it has one, belongs to devices we have not met yet.
 static constexpr auto establish_key = "devices_establish_group"sv;
 
+static constexpr auto group_id_key = "devices_group_id"sv;
+
+// The creation minute, then 4 random bytes to tell apart groups created in the same one.
+static device::GroupId new_group_id() {
+    device::GroupId id;
+    auto minutes = std::chrono::floor<std::chrono::minutes>(clock_now()).time_since_epoch();
+    oxenc::write_host_as_little(static_cast<uint32_t>(minutes.count()), id.value.data());
+    random::fill(std::span{id.value}.last<4>());
+    return id;
+}
+
 // Our own link request, from the swarm storing it until it is withdrawn.
 static constexpr auto own_request_expires_key = "devices_link_request_expires"sv;
 static constexpr auto own_request_sas_key = "devices_link_request_sas"sv;
@@ -150,6 +161,7 @@ void Devices::establish_group() {
             std::as_bytes(std::span{key.mlkem768_pub}),
             std::as_bytes(std::span{key.x25519_pub}));
 
+    _set_group_id(new_group_id());
     core.globals.set(establish_key, int64_t{0});
 
     tx.commit();
@@ -844,6 +856,25 @@ namespace {
     constexpr auto PERS_KEY_KEY_IDX = "SessionDevKeyIdx"_b2b_pers;
     constexpr auto PERS_ACC_KEY_ROT = "SessionAccKeyRot"_b2b_pers;
     constexpr auto PERS_KICKED = "SessionDevKicked"_b2b_pers;
+    constexpr auto PERS_GROUP_ID_KEY = "SessionDvGrpID_K"_b2b_pers;
+    constexpr auto PERS_GROUP_ID_NONCE = "SessionDvGrpID_N"_b2b_pers;
+    constexpr auto PERS_GROUP_SAS = "SessionDvGrp_SAS"_b2b_pers;
+
+    // Encrypts or decrypts a group identifier for a message's outer `@` (XChaCha20 being its own
+    // inverse): readable by any holder of the account seed, and different in every message to
+    // anyone else, the nonce coming from that message's A.
+    std::array<std::byte, 8> crypt_group_id(
+            std::span<const std::byte, 8> in,
+            std::span<const std::byte, 32> A,
+            std::span<const std::byte, 32> seed) {
+        cleared_b32 key;
+        hash::blake2b_pers(key, PERS_GROUP_ID_KEY, seed);
+        std::array<std::byte, encryption::XCHACHA20_NONCEBYTES> nonce;
+        hash::blake2b_pers(nonce, PERS_GROUP_ID_NONCE, A);
+        std::array<std::byte, 8> out;
+        encryption::xchacha20_xor(out, in, nonce, key);
+        return out;
+    }
 
     // A removed device's entry in a message's `kicked` list: computable only with the account seed,
     // and different in every message, being keyed by that message's ephemeral A.
@@ -886,6 +917,39 @@ namespace {
 
 }  // namespace
 
+std::chrono::sys_time<std::chrono::minutes> device::GroupId::created() const {
+    return std::chrono::sys_time<std::chrono::minutes>{
+            std::chrono::minutes{oxenc::load_little_to_host<uint32_t>(value.data())}};
+}
+
+std::array<std::string_view, 21> device::GroupId::sas() const {
+    std::array<std::byte, 16> seed;
+    hash::blake2b_pers(seed, PERS_GROUP_SAS, value);
+    return sas_from_seed(seed);
+}
+
+std::optional<device::GroupId> Devices::_group_id() {
+    device::GroupId id;
+    if (core.globals.get_blob_to(group_id_key, id.value))
+        return id;
+    return std::nullopt;
+}
+
+void Devices::_set_group_id(const device::GroupId& id) {
+    core.globals.set(group_id_key, std::span<const std::byte>{id.value});
+}
+
+std::optional<device::GroupId> Devices::_group_of(std::span<const std::byte> message) {
+    oxenc::bt_dict_consumer in{message};
+    in.require<std::string_view>("");
+    if (!in.skip_until("@"))
+        return std::nullopt;
+    auto encrypted = in.consume_span<std::byte, 8>();
+    auto A = in.require_span<std::byte, 32>("A");
+    auto seed = core.globals.account_seed();
+    return device::GroupId{crypt_group_id(encrypted, A, seed.seed())};
+}
+
 std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) {
     cleared_b32 a;
     random::fill(a);
@@ -905,9 +969,21 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     // them from the payload.  Departures are left out: the device that left knows, and would read
     // its own entry as a removal.  Padded to a multiple of 4 and shuffled, like the recipient
     // lists, so that the length says only which bucket the removal count is in.
+    // A group established before groups had identifiers gets one from whichever of its devices
+    // pushes first, and the rest adopt it from that message.
+    auto group_id = _group_id();
+    if (!group_id) {
+        group_id = new_group_id();
+        _set_group_id(*group_id);
+        log::info(cat, "Gave this device group an identifier");
+    }
+    std::array<std::byte, 8> group_id_enc;
+
     std::vector<std::byte> kicked_raw;
     {
         auto seed = core.globals.account_seed();
+        group_id_enc = crypt_group_id(group_id->value, A, seed.seed());
+
         std::vector<const std::array<std::byte, 32>*> removed;
         for (const auto& [id, info] : devices)
             if (info.state == device::State::Kicked)
@@ -1064,6 +1140,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     out.resize(
             2                                              // Outer "d" ... "e" delimiters
             + 5                                            // "0:" + "1:G" (message type indicator)
+            + 3 + bt_bytes_encoded(group_id_enc.size())    // "1:@" + "8:...(enc group id)..."
             + 3 + bt_bytes_encoded(A.size())               // "1:A" + "32:...(A eph pk)..."
             + 3 + bt_bytes_encoded(ciphertext_raw.size())  // "1:C" + "NNNN:...(mlkem cts)..."
             + 3 + bt_bytes_encoded(enc_key_raw.size())     // "1:K" + "NNN:...(encrypted keys)..."
@@ -1076,6 +1153,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
 
     o.append("", "G");
+    o.append("@", group_id_enc);
     o.append("A", A);
     o.append("C", ciphertext_raw);
     o.append("K", enc_key_raw);
@@ -1169,8 +1247,21 @@ void Devices::receive_device_group_message(
         return;
     }
 
+    // A group we can read but are not in is one we are switching to, and its contents are not ours
+    // to merge into the group we are in.
+    auto theirs = _group_of(data);
+    auto ours = _group_id();
+    if (theirs && ours && *theirs != *ours) {
+        log::warning(cat, "Not merging a readable device group message from another group");
+        return;
+    }
+
     auto c = conn();
     SQLite::Transaction tx{c.sql};
+
+    // Admitted, or in a group that predates identifiers: either way this is the group's.
+    if (theirs && !ours)
+        _set_group_id(*theirs);
 
     // Merge incoming account keys.  New seeds are inserted and the rotation trigger applies
     // tie-breaking: latest created wins (smallest seed as tiebreaker), so concurrent rotations

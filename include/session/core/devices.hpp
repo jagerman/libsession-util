@@ -232,6 +232,22 @@ namespace device {
         }
     };
 
+    /// A device group's identifier (see "Group identifier" in docs/protocol-v2.md).  Fixed when the
+    /// group is created, and what devices compare to tell one of an account's groups from another.
+    struct GroupId {
+        std::array<std::byte, 8> value;
+
+        /// When the group was created, by the creating device's clock.
+        std::chrono::sys_time<std::chrono::minutes> created() const;
+
+        /// The emoji a user compares to check that two devices are in the same group.  The
+        /// suggested basic display is the first 4 beside `created()`; all 21 are for an extended
+        /// view.  Not a security check: anyone holding the account seed can copy an identifier.
+        std::array<std::string_view, 21> sas() const;
+
+        bool operator==(const GroupId&) const = default;
+    };
+
     struct decryption_failed : std::runtime_error {
         using std::runtime_error::runtime_error;
     };
@@ -297,6 +313,15 @@ class Devices final : detail::CoreComponent {
     // What `_flush_events()` uses to tell a request the application has not seen yet from one it
     // has, since having an id is what having seen it means.
     std::vector<std::pair<int64_t, device::LinkRequest>> _read_link_requests(bool pending_only);
+
+    // This device's group's identifier: nullopt outside a group, and also inside one established
+    // before groups had identifiers, until a group message gives it one.
+    std::optional<device::GroupId> _group_id();
+    void _set_group_id(const device::GroupId& id);
+
+    // The identifier a group message carries, which needs only the account seed to read; nullopt
+    // for a message from before identifiers.
+    std::optional<device::GroupId> _group_of(std::span<const std::byte> message);
 
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence

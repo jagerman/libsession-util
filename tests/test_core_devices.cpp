@@ -1568,6 +1568,95 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a group's identifier is carried readably only for seed holders",
+        "[core][devices][group-id]") {
+    TempCore c;
+    auto id = TestHelper::group_id(*c);
+    REQUIRE(id);
+    CHECK(std::chrono::abs(id->created() - clock_now()) <= 1min);
+
+    auto m1 = c->devices.build_device_group_message().message;
+    auto m2 = c->devices.build_device_group_message().message;
+    CHECK(TestHelper::group_of(*c, m1) == id);
+    CHECK(TestHelper::group_of(*c, m2) == id);
+
+    // To anyone without the seed it is different in every message, so nothing links them.
+    auto at = [](std::span<const std::byte> msg) {
+        oxenc::bt_dict_consumer outer{msg};
+        auto v = outer.require_span<std::byte>("@");
+        return std::vector<std::byte>{v.begin(), v.end()};
+    };
+    CHECK(at(m1) != at(m2));
+    CHECK(std::ranges::search(m1, id->value).empty());
+}
+
+TEST_CASE(
+        "Devices - a group identifier says when its group was created",
+        "[core][devices][group-id]") {
+    device::GroupId id{};
+    oxenc::write_host_as_little(uint32_t{29'600'000}, id.value.data());
+    CHECK(id.created().time_since_epoch() == 29'600'000min);
+
+    // The emoji come from a hash rather than the bytes, so groups created in the same minute -- the
+    // same leading half -- still look different.
+    auto other = id;
+    other.value[7] = std::byte{1};
+    CHECK(id.sas() != other.sas());
+    CHECK(id.sas() == device::GroupId{id.value}.sas());
+}
+
+TEST_CASE(
+        "Devices - an admitted device takes on its group's identifier",
+        "[core][devices][group-id]") {
+    Linking l;
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    l.admit();
+    CHECK(TestHelper::group_id(*l.applicant) == TestHelper::group_id(*l.core));
+}
+
+TEST_CASE(
+        "Devices - a group from before identifiers gets one from its first push",
+        "[core][devices][group-id]") {
+    Linking l;
+    l.admit();
+    for (auto* c : {&l.core, &l.applicant})
+        (*c)->database().conn().prepared_exec("DELETE FROM globals WHERE key = 'devices_group_id'");
+
+    auto message = l.core->devices.build_device_group_message().message;
+    auto minted = TestHelper::group_id(*l.core);
+    REQUIRE(minted);
+    CHECK(TestHelper::group_of(*l.core, message) == minted);
+
+    // And the rest of the group adopts it, rather than minting a different one of its own.
+    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G2");
+    CHECK(TestHelper::group_id(*l.applicant) == minted);
+}
+
+TEST_CASE(
+        "Devices - a readable message from another group is not merged",
+        "[core][devices][group-id]") {
+    Linking l;
+    l.admit();
+    auto ours = TestHelper::group_id(*l.core);
+    REQUIRE(ours);
+
+    device::Info info{};
+    info.description = "changed";
+    l.core->devices.update_info(info, await);
+    auto other = *ours;
+    other.value[7] ^= std::byte{0xff};
+    TestHelper::set_group_id(*l.core, other);
+    auto message = l.core->devices.build_device_group_message().message;
+
+    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G2");
+    auto [core_self, _] = l.core->devices.device_info(await);
+    auto seen = l.applicant->devices.devices(true, false, false, core_self.id);
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.begin()->second.description != "changed");
+    CHECK(TestHelper::group_id(*l.applicant) == ours);
+}
+
+TEST_CASE(
         "Devices - a removed device is told so, though it can read nothing else",
         "[core][devices][removal]") {
     Linking l;
