@@ -182,9 +182,10 @@ message is left unchanged rather than removed, a removal must be stated in this 
 all.
 
 A tombstone and a live record for one device ID cannot coexist, so a device that is removed and
-later rejoins the group must generate a new device ID, with new device keys to go with it.  That is
-all it replaces: its message history, the account seed and configs, and the account keys it already
-holds are all still valid, and are kept.  It then asks to join as any device outside a group does.
+later rejoins the group must generate a new device ID, with new device keys to go with it.  It also
+leaves behind the old group's account keys, as any device leaving a group does (see "Leaving a group
+to join another"); its message history, the account seed and configs are all still valid, and are
+kept.  It then asks to join as any device outside a group does.
 
 The removed device is not among the message recipients and cannot decrypt the payload; see
 "Announcing removals" below.
@@ -633,6 +634,13 @@ Once accepted into the new group, it leaves the old one:
   that the remaining members stop encrypting to it.  Being a departure rather than a removal, it
   does not appear in the `kicked` list.  It also remembers the old group's identifier as dismissed,
   so as not to alert about the group it has just left.
+
+Either way it leaves all of the old group behind -- its devices, its messages, and its account keys
+-- and takes on the new group's, all of which arrive with the message admitting it.  A group's
+account keys never carry into another: they would be handed to the new group's members in every
+message the device pushed, and the newest of them could displace the new group's current key.  For
+the same reason a device starting a group starts it with a newly generated account key, whatever it
+held before.
 
 The departed device still holds every account key the old group had, and the group must move to one
 it does not.  A removal does this in the same step: the removing device generates a new account key
