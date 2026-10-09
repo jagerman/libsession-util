@@ -609,6 +609,22 @@ class Client {
     void attachment_cache_size(result_function<int64_t> cb);
     int64_t attachment_cache_size(await_t);
 
+    /// API: client/Client::config_sizes
+    ///
+    /// How large each of the account's configs is: the size of the dump each would write now,
+    /// which is what is stored for it and close to what it costs to push.  For diagnostics -- the
+    /// header of an exported log, where a config that has grown unexpectedly is the first thing
+    /// worth seeing -- rather than for deciding anything.
+    ///
+    /// Measured by dumping each config, so it costs one serialisation of each; cheap for a header,
+    /// not something to poll.
+    ///
+    /// Keyed by config: `user_profile`, `contacts`, `convo_info_volatile`, `user_groups` and
+    /// `local`.  Empty when there is no account yet: the configs are built from it on first use,
+    /// and there is nothing to measure before then.
+    void config_sizes(result_function<std::unordered_map<std::string, int>> cb);
+    std::unordered_map<std::string, int> config_sizes(await_t);
+
     /// The largest attachment that will be fetched *unasked*, or nullopt for no limit.
     ///
     /// Compared against the size in the pointer, which is the file's own length — so a limit of 2MB
@@ -1033,6 +1049,7 @@ class Client {
     // connection is for callers that already hold one and are about to write through it -- eviction
     // reads this to decide whether it has work to do.
     int64_t _attachment_cache_size();
+    std::unordered_map<std::string, int> _config_sizes();
     int64_t _attachment_cache_size(sqlite::Connection& c);
 
     // Where a profile reached us from, which is what a field it does not carry means.
