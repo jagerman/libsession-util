@@ -2214,6 +2214,49 @@ void Devices::_rebaseline_membership() {
         _reported_membership = m;
 }
 
+void Devices::start_group(result_function<device::GroupId> cb) {
+    async([this] { return _start_group(); }, std::move(cb));
+}
+
+device::GroupId Devices::start_group(await_t) {
+    return jq().call_get([this] { return _start_group(); });
+}
+
+device::GroupId Devices::_start_group() {
+    assert(on_loop());
+    switch (_membership().membership) {
+        case device::Membership::Unknown:
+            throw session::error{
+                    err::membership_unknown,
+                    "Cannot start a group before a fetch has shown what the swarm holds"};
+        case device::Membership::InGroup:
+        case device::Membership::CutOff:
+            throw session::error{err::already_registered, "This device is already in a group"};
+        case device::Membership::Removed:
+            // Its tables still hold the group it was removed from, which a group started from them
+            // would carry on as its own members.
+            throw session::error{
+                    err::removed,
+                    "This device was removed from its group; it must rejoin under a new device id "
+                    "before starting one"};
+        case device::Membership::Waiting: _withdraw_own_request(); break;
+        case device::Membership::NoGroup:
+        case device::Membership::GroupsVisible: break;
+    }
+
+    _mark_group_owed();
+    establish_group();
+    auto group = _group_id();
+    if (!group)
+        throw std::logic_error{"Started a group but it has no identifier"};
+    log::info(cat, "Started a new device group");
+
+    _devices_changed = true;
+    _rebaseline_membership();
+    _flush_events();
+    return *group;
+}
+
 void Devices::dismiss_group(device::GroupId group, result_function<bool> cb) {
     async([this, group] { return _dismiss_group(group); }, std::move(cb));
 }

@@ -518,6 +518,18 @@ class Devices final : detail::CoreComponent {
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
+    // Starts a new device group with this device as its only member, and answers its identifier.
+    // For `NoGroup`, and for `GroupsVisible`, where the new group is started *alongside* those
+    // already there: it replaces and deletes nothing, and their devices are alerted to it, so that
+    // a group started by mistake can be undone by joining one of theirs instead.  A device
+    // `Waiting` on a link request withdraws it.
+    //
+    // Fails with `err::already_registered` for a device already in a group, `err::removed` for one
+    // removed from its group, and `err::membership_unknown` before the first fetch of this run:
+    // starting a group is the user's decision, made from what the swarm holds.
+    void start_group(result_function<device::GroupId> cb);
+    device::GroupId start_group(await_t);
+
     // Dismisses the alert for another group, so that `group_appeared` does not fire for it again --
     // here only: each device dismisses for itself.  Remembered across restarts.  It does not quiet
     // `CutOff`, which is never dismissable.  Answers false for a group not seen in the swarm.
@@ -527,6 +539,7 @@ class Devices final : detail::CoreComponent {
   private:
     bool _remove_device(std::span<const std::byte, 32> id);
     device::MembershipState _membership();
+    device::GroupId _start_group();
     bool _dismiss_group(const device::GroupId& group);
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.

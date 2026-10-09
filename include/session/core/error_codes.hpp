@@ -23,4 +23,12 @@ inline constexpr std::string_view already_registered = "device.already_registere
 /// never seen at all, or its messages have since expired.
 inline constexpr std::string_view unknown_group = "device.unknown_group";
 
+/// Where this device stands is not known yet -- no fetch has completed this run -- and the call
+/// depends on it.  See `Devices::membership`.
+inline constexpr std::string_view membership_unknown = "device.membership_unknown";
+
+/// This device was removed from its group, and must come back under a new device identity before
+/// it can do this.
+inline constexpr std::string_view removed = "device.removed";
+
 }  // namespace session::core::err

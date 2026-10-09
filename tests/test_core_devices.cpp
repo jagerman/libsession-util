@@ -1933,6 +1933,75 @@ TEST_CASE(
     CHECK(l.events.membership.back() == device::Membership::CutOff);
 }
 
+namespace {
+// The code a call failed with, or empty if it did not.
+template <typename F>
+std::string failure_code(F&& f) {
+    try {
+        f();
+    } catch (const session::error& e) {
+        return std::string{e.err().code};
+    }
+    return {};
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a device can start a group alongside those already there",
+        "[core][devices][membership]") {
+    Linking l;
+    auto theirs = l.show_group();
+    REQUIRE(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+
+    auto mine = l.applicant->devices.start_group(await);
+    CHECK(mine != theirs);
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.group == mine);
+    REQUIRE(state.others.size() == 1);
+    CHECK(state.others[0].id == theirs);
+
+    // Its own doing, so not news to it; news to the group it started beside.
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    TestHelper::finish_fetch(*l.core);
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "B1");
+    CHECK(l.events.appeared == std::vector{mine});
+}
+
+TEST_CASE(
+        "Devices - a group is started only when the user can have decided to",
+        "[core][devices][membership]") {
+    Linking l;
+
+    // Before any fetch, nothing is known of what the swarm holds.
+    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) ==
+          err::membership_unknown);
+
+    // Already in one.
+    TestHelper::finish_fetch(*l.core);
+    CHECK(failure_code([&] { l.core->devices.start_group(await); }) == err::already_registered);
+
+    // Waiting on a request: starting a group instead withdraws it.
+    l.show_group();
+    TestHelper::build_link_request(*l.applicant, *l.core);
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Waiting);
+    l.applicant->devices.start_group(await);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(own_state(l.applicant) == device::State::Registered);
+}
+
+TEST_CASE("Devices - a removed device cannot start a group", "[core][devices][membership]") {
+    Linking l;
+    l.admit();
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
+
+    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) == err::removed);
+}
+
 TEST_CASE(
         "Devices - a removed device is told so, though it can read nothing else",
         "[core][devices][removal]") {
