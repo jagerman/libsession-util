@@ -2044,7 +2044,7 @@ void Core::_swarm_push(
         std::vector<std::string> obsolete,
         std::function<void(std::optional<std::vector<SwarmStoreResult>>)> done) {
 
-    if (stores.empty())
+    if (stores.empty() && obsolete.empty())
         return;
 
     auto now_ms = epoch_ms(clock_now_ms());

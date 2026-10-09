@@ -404,10 +404,12 @@ class Core {
     // first failure, so nothing is dropped before its replacement has been stored.  The deletes are
     // one subrequest for all the hashes together, since they go to the same swarm.
     //
+    // Either list may be empty: deletes alone are how a message is withdrawn from the swarm.
+    //
     // `done` is given one result per store, positionally, or `nullopt` if the request never
     // produced a usable answer -- no network, no swarm member reachable, or an unreadable response.
     // It runs on Core's queue, as every `_swarm_request` reply does, and is not called at all if
-    // `stores` is empty.
+    // both lists are empty.
     //
     // The transport and nothing more: how often to push, whether a partial result counts, and what
     // to record afterwards all differ between the things that push, and belong to them.

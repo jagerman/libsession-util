@@ -1911,7 +1911,8 @@ std::optional<std::vector<std::byte>> Devices::_decrypt_link_request(
     return std::nullopt;
 }
 
-void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expiry) {
+void Devices::receive_link_request(
+        std::span<const std::byte> data, const std::string& hash, sys_ms expiry) {
     oxenc::bt_dict_consumer outer{data};
     outer.require<std::string_view>("");
     auto E = outer.require_span<std::byte, 32>("E");
@@ -1999,12 +2000,13 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
             *dev_id);
 
     c.prepared_exec(
-            R"(INSERT INTO device_link_requests (device, received_at, expires_at, sas_seed)
-               VALUES (?, ?, ?, ?))",
+            R"(INSERT INTO device_link_requests (device, received_at, expires_at, sas_seed, hash)
+               VALUES (?, ?, ?, ?, ?))",
             *dev_id,
             epoch_seconds(clock_now_s()),
             epoch_seconds(expiry),
-            sas_seed);
+            sas_seed,
+            hash);
 
     tx.commit();
 }
@@ -2187,14 +2189,24 @@ bool Devices::_accept_request(int reqid) {
 }
 
 void Devices::ignore_request(int reqid, result_function<bool> cb) {
-    async([this, reqid] { return _ignore_request(reqid); }, std::move(cb));
+    ignore_request(reqid, false, std::move(cb));
+}
+
+void Devices::ignore_request(int reqid, bool delete_from_swarm, result_function<bool> cb) {
+    async([this, reqid, delete_from_swarm] { return _ignore_request(reqid, delete_from_swarm); },
+          std::move(cb));
 }
 
 bool Devices::ignore_request(int reqid, await_t) {
-    return jq().call_get([this, reqid] { return _ignore_request(reqid); });
+    return ignore_request(reqid, false, await);
 }
 
-bool Devices::_ignore_request(int reqid) {
+bool Devices::ignore_request(int reqid, bool delete_from_swarm, await_t) {
+    return jq().call_get(
+            [this, reqid, delete_from_swarm] { return _ignore_request(reqid, delete_from_swarm); });
+}
+
+bool Devices::_ignore_request(int reqid, bool delete_from_swarm) {
     assert(on_loop());
     auto row = _row_for(reqid);
     if (!row)
@@ -2203,13 +2215,13 @@ bool Devices::_ignore_request(int reqid) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    auto dev = c.prepared_maybe_get<int64_t>(
+    auto ignored = c.prepared_maybe_get<std::string>(
             "UPDATE device_link_requests SET status = ? WHERE id = ? AND status = ?"
-            " RETURNING device",
+            " RETURNING hash",
             static_cast<int>(device::LinkStatus::Ignored),
             *row,
             static_cast<int>(device::LinkStatus::Pending));
-    if (!dev)
+    if (!ignored)
         return false;
 
     // The device row stays Pending, deliberately: a redelivery of the same request then fails the
@@ -2217,6 +2229,16 @@ bool Devices::_ignore_request(int reqid) {
     tx.commit();
 
     _ended.insert(*row);
+
+    if (delete_from_swarm) {
+        if (core.network())
+            core._swarm_push({}, {std::move(*ignored)}, [](auto results) {
+                if (!results)
+                    log::warning(cat, "Could not delete an ignored link request from the swarm");
+            });
+        else
+            log::warning(cat, "Not deleting an ignored link request from the swarm: no network");
+    }
     return true;
 }
 
@@ -2539,7 +2561,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
                 _record_group(msg);
                 receive_device_group_message(msg.data, msg.hash);
             } else if (type == "L")
-                receive_link_request(msg.data, msg.expiry);
+                receive_link_request(msg.data, msg.hash, msg.expiry);
             else
                 log::warning(cat, "Ignoring device message with unknown type '{}'", type);
         } catch (const std::exception& e) {

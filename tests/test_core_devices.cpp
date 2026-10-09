@@ -1941,6 +1941,34 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - ignoring a request deletes it from the swarm only when asked to",
+        "[core][devices][linking]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.core);
+
+    // The group's own pushes go the same way, so look for the deletion by what it names.
+    auto deleted = [&](std::string_view hash) {
+        for (auto* push : pushes(*net))
+            for (const auto& req : push_requests(*push))
+                if (req["method"] == "delete" &&
+                    req["params"]["messages"] == nlohmann::json::array({hash}))
+                    return true;
+        return false;
+    };
+
+    l.ask(in(10min), "L1");
+    REQUIRE(l.core->devices.ignore_request(l.events.added.at(0).id, await));
+    TestHelper::drain(*l.core);
+    CHECK_FALSE(deleted("L1"));
+
+    // One the user does not recognise.
+    l.ask(in(10min), "L2");
+    REQUIRE(l.core->devices.ignore_request(l.events.added.at(1).id, true, await));
+    TestHelper::drain(*l.core);
+    CHECK(deleted("L2"));
+}
+
+TEST_CASE(
         "Devices - a device admitted only by an impostor's group does not join",
         "[core][devices][linking][confirm]") {
     Linking l;

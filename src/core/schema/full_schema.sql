@@ -72,7 +72,10 @@ CREATE TABLE device_link_requests (
     -- `status = 0 AND expires_at <= now`, so there is no flag to fall out of step with the
     -- timestamp that decides it.
     status INTEGER NOT NULL DEFAULT 0 CHECK(status >= 0 AND status <= 3),
-    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16)  -- 16-byte Argon2id output for SAS display
+    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),  -- 16-byte Argon2id output for SAS display
+    -- The swarm's hash for the message the request arrived in, which is what deleting it from the
+    -- swarm names.
+    hash TEXT NOT NULL
 ) STRICT;
 CREATE INDEX device_link_requests_device ON device_link_requests(device);
 

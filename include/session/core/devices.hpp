@@ -380,8 +380,10 @@ class Devices final : detail::CoreComponent {
     void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
     //
     // The link request takes the swarm's expiry, which is what bounds the request: it is when the
-    // message stops being fetchable, so after it no device can accept the request at all.
-    void receive_link_request(std::span<const std::byte> data, sys_ms expiry);
+    // message stops being fetchable, so after it no device can accept the request at all.  And its
+    // hash, which is what ignoring it can delete it from the swarm by.
+    void receive_link_request(
+            std::span<const std::byte> data, const std::string& hash, sys_ms expiry);
 
     // Handlers for incoming swarm messages by namespace, called from Core::receive_messages.
     void parse_device_messages(std::span<const SwarmMessage> messages, bool is_final);
@@ -499,11 +501,18 @@ class Devices final : detail::CoreComponent {
     void accept_request(int reqid, result_function<bool> cb);
     bool accept_request(int reqid, await_t);
 
-    // Dismisses a request here.  Local and silent: nothing is sent, and another device may still
-    // accept it.  Answers false if it was no longer pending.  An id this session never handed out
-    // is an error (std::invalid_argument).
+    // Dismisses a request here.  Answers false if it was no longer pending.  An id this session
+    // never handed out is an error (std::invalid_argument).
+    //
+    // By default local and silent: nothing is sent, and another device may still accept it -- the
+    // ordinary case of a request being answered on a different device.  With `delete_from_swarm`,
+    // for a request the user does not recognise, it is also deleted from the swarm, so that a
+    // device yet to fetch it never sees it.  A device that has already fetched it is not told, and
+    // can still accept it until it expires.  The deletion is attempted once, and not reported on.
     void ignore_request(int reqid, result_function<bool> cb);
+    void ignore_request(int reqid, bool delete_from_swarm, result_function<bool> cb);
     bool ignore_request(int reqid, await_t);
+    bool ignore_request(int reqid, bool delete_from_swarm, await_t);
 
     // Removes link requests from the log, for a user tidying up ones already dealt with.  Answers
     // how many were removed.
@@ -617,7 +626,7 @@ class Devices final : detail::CoreComponent {
     void _arm_expiry(std::optional<std::chrono::sys_seconds> deadline);
 
     bool _accept_request(int reqid);
-    bool _ignore_request(int reqid);
+    bool _ignore_request(int reqid, bool delete_from_swarm);
     size_t _forget_link_requests(std::span<const int> reqids);
 
   public:
