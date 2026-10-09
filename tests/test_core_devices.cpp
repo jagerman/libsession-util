@@ -1236,6 +1236,81 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices events - another device joining or leaving the group is a notice",
+        "[core][devices][events]") {
+    Linking l;
+    l.ask();
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto deliver = [&](const device::Info& applicant, std::string hash) {
+        TestHelper::deliver_device_message(
+                *l.core,
+                TestHelper::encrypt_device_data(
+                        l.core->devices, {{self.id, self}, {applicant.id, applicant}}),
+                in(10min),
+                std::move(hash));
+    };
+
+    // Admitted by another device.
+    auto admitted = l.state_of_applicant();
+    admitted.state = device::State::Registered;
+    deliver(admitted, "G1");
+    REQUIRE(l.events.members.size() == 1);
+    CHECK(l.events.members[0].id == l.applicant_id());
+    CHECK(l.events.members[0].state == device::State::Registered);
+
+    // The notice, then the list to redraw.
+    auto member = std::ranges::find(l.events.order, "member");
+    REQUIRE(member != l.events.order.end());
+    CHECK(std::ranges::find(member, l.events.order.end(), "replaced") != l.events.order.end());
+
+    auto gone = admitted;
+    gone.kicked = clock_now_s();
+    SECTION("removed elsewhere") {
+        gone.state = device::State::Kicked;
+        deliver(gone, "G2");
+        REQUIRE(l.events.members.size() == 2);
+        CHECK(l.events.members[1].state == device::State::Kicked);
+    }
+    SECTION("left") {
+        gone.state = device::State::Left;
+        deliver(gone, "G2");
+        REQUIRE(l.events.members.size() == 2);
+        CHECK(l.events.members[1].state == device::State::Left);
+    }
+}
+
+TEST_CASE(
+        "Devices events - no notice for a change made here, or for a new group's members",
+        "[core][devices][events]") {
+    Linking l;
+
+    // Accepted here, and the applicant admitted: neither side has news of the other.
+    l.admit();
+    CHECK(l.events.members.empty());
+    CHECK(l.applicant_events.members.empty());
+
+    // Removed here.
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.events.members.empty());
+
+    // A tombstone for a device this one never knew of says nothing about the group it knew.
+    auto [self, registered] = l.core->devices.device_info(await);
+    device::Info stranger{};
+    random::fill(stranger.id);
+    stranger.state = device::State::Kicked;
+    stranger.kicked = clock_now_s();
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(
+                    l.core->devices, {{self.id, self}, {stranger.id, stranger}}),
+            in(10min),
+            "G9");
+    CHECK(l.events.members.empty());
+}
+
+TEST_CASE(
         "Devices events - an unanswered request closes when its deadline passes",
         "[core][devices][linking][events]") {
     Linking l;

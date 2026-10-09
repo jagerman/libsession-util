@@ -318,6 +318,9 @@ class Devices final : detail::CoreComponent {
     // and `_ended` holds the ones since closed: reported closed, or closed by this device itself,
     // which the caller does not need telling about.
     bool _devices_changed = false;
+    // Other devices admitted, removed or departed since the last flush, for
+    // `device_membership_changed`.
+    std::vector<std::array<std::byte, 32>> _member_changes;
     bool _fetched = false;
     device::Membership _reported_membership = device::Membership::Unknown;
     std::set<std::array<std::byte, 8>> _announced_groups;
@@ -337,7 +340,10 @@ class Devices final : detail::CoreComponent {
     // The reporting half, for when there is someone to report to.  Answers the earliest deadline
     // among the requests it has handed out and are still open.
     std::optional<std::chrono::sys_seconds> _report_events(
-            DeviceEvents& events, bool devices_changed, std::chrono::sys_seconds now);
+            DeviceEvents& events,
+            bool devices_changed,
+            std::span<const std::array<std::byte, 32>> member_changes,
+            std::chrono::sys_seconds now);
 
     // Reads link requests with the device each came from.  `pending_only` restricts to those still
     // awaiting an answer and not yet past their deadline.

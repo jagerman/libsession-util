@@ -1369,6 +1369,7 @@ void Devices::receive_device_group_message(
     }
 
     bool departed = false;
+    std::vector<std::array<std::byte, 32>> members;
     for (const auto& [id, info] : payload.devices) {
         if (info.state == device::State::Kicked || info.state == device::State::Left) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
@@ -1386,6 +1387,9 @@ void Devices::receive_device_group_message(
                 if (info.state == device::State::Left &&
                     was < static_cast<int>(device::State::Left))
                     departed = true;
+                // Gone from the group, rather than a tombstone for a device we never knew of.
+                if (was == static_cast<int>(device::State::Registered) && id != self_id)
+                    members.push_back(id);
             }
             continue;
         }
@@ -1427,6 +1431,8 @@ void Devices::receive_device_group_message(
         if (!was_registered) {
             c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
             c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
+            if (id != self_id)
+                members.push_back(id);
         }
     }
 
@@ -1451,8 +1457,11 @@ void Devices::receive_device_group_message(
 
     tx.commit();
 
+    // Being admitted, every member is new to us, and none of them is news.
     if (admitting)
         _forget_own_request();
+    else
+        _member_changes.insert(_member_changes.end(), members.begin(), members.end());
 }
 
 void Devices::_leave_group() {
@@ -2587,8 +2596,9 @@ void Devices::_flush_events() {
     }
 
     bool changed = std::exchange(_devices_changed, false);
+    auto members = std::exchange(_member_changes, {});
     if (auto* events = cb().devices)
-        if (auto theirs = _report_events(*events, changed, now))
+        if (auto theirs = _report_events(*events, changed, members, now))
             next_deadline = std::min(next_deadline.value_or(*theirs), *theirs);
 
     _arm_expiry(next_deadline);
@@ -2606,7 +2616,10 @@ void Devices::_arm_expiry(std::optional<std::chrono::sys_seconds> deadline) {
 }
 
 std::optional<std::chrono::sys_seconds> Devices::_report_events(
-        DeviceEvents& events, bool devices_changed, std::chrono::sys_seconds now) {
+        DeviceEvents& events,
+        bool devices_changed,
+        std::span<const std::array<std::byte, 32>> member_changes,
+        std::chrono::sys_seconds now) {
     // One handler throwing must not take the others' reports down with it.
     auto report = [](std::string_view which, auto&& call) {
         try {
@@ -2665,6 +2678,13 @@ std::optional<std::chrono::sys_seconds> Devices::_report_events(
                 report("link_request_added",
                        [&] { events.link_request_added(std::move(request)); });
             }
+
+    // Each as it stands now, which is what it changed to: a device admitted and removed again
+    // within one fetch reads as removed, which is the news.
+    for (const auto& id : member_changes)
+        for (auto& [_, info] : devices(true, false, true, id))
+            report("device_membership_changed",
+                   [&] { events.device_membership_changed(std::move(info)); });
 
     if (devices_changed)
         report("devices_replaced", [&] { events.devices_replaced(devices(true, false, true)); });

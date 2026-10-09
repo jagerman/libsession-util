@@ -423,6 +423,12 @@ void Client::devices_replaced(core::device::map devices) {
     });
 }
 
+void Client::device_membership_changed(core::device::Info device) {
+    _emit([device = std::move(device)](const callbacks& cbs) mutable {
+        cbs.devices->device_membership_changed(std::move(device));
+    });
+}
+
 void Client::membership_changed(core::device::Membership membership) {
     _emit([membership](const callbacks& cbs) { cbs.devices->membership_changed(membership); });
 }

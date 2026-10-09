@@ -1474,6 +1474,7 @@ class Client : private core::DeviceEvents {
     void link_request_added(core::device::LinkRequest request) override;
     void link_request_ended(int reqid, core::device::LinkRequestEnd why) override;
     void devices_replaced(core::device::map devices) override;
+    void device_membership_changed(core::device::Info device) override;
     void membership_changed(core::device::Membership membership) override;
     void group_appeared(core::device::GroupId group) override;
 

@@ -106,6 +106,13 @@ class DeviceEvents {
     /// was in the group.  Not the ones asking to join, which arrive as link requests instead.
     virtual void devices_replaced(device::map devices) = 0;
 
+    /// Another device joined the group, or stopped being in it: removed, or left of its own accord.
+    /// Its record as it now stands -- `state` says which (Registered, Kicked or Left), and `kicked`
+    /// when it went.  For a notice ("Alice's laptop was added"); `devices_replaced` follows for
+    /// redrawing the list.  Not for a change this device made itself through `accept_request` or
+    /// `remove_device`, nor for the members of a group this device has just been admitted to.
+    virtual void device_membership_changed(device::Info device) = 0;
+
     /// This device's membership changed, or became known with the first fetch of this run; see
     /// device::Membership for what each value means.  `Removed` and `CutOff` are the two to alert
     /// on, and arrive as soon as the fetch that reveals them is merged.  Not for the move to
