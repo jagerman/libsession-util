@@ -66,7 +66,7 @@ cmake -G 'Unix Makefiles' \
     "$@" \
     "$projdir"
 
-make -j${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)} VERBOSE=1 session-util
+make -j${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)} VERBOSE=1 session-util session-util-check
 
 if [ -z "$archive" ]; then
     exit 0

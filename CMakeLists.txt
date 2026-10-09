@@ -190,7 +190,8 @@ if(STATIC_BUNDLE)
 
     include(combine_archives)
 
-    combine_archives(session-util libsession-static-bundle "${LIBSESSION_STATIC_BUNDLE_LIBS}")
+    libsession_static_bundle_libs(bundle_libs)
+    combine_archives(session-util libsession-static-bundle ${bundle_libs})
     set(lib_folder lib)
     if(IOS)
         set(lib_folder "${lib_folder}-${ARCH}")
@@ -198,6 +199,28 @@ if(STATIC_BUNDLE)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a
         ARCHIVE DESTINATION ${lib_folder})
+
+    # The bundle is all of libsession an application links, so it has to resolve everything
+    # libsession calls on its own: checked by linking it alone into a shared object, as an
+    # application does, with nothing beside it but the system libraries.  Compiled through the
+    # targets, for their headers, and linked against the bundle only.
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+        find_package(Threads REQUIRED)
+        add_library(session-util-check-obj OBJECT EXCLUDE_FROM_ALL tests/shared_link_check.cpp)
+        target_link_libraries(session-util-check-obj PRIVATE libsession::client libsession::image)
+        add_library(session-util-check MODULE EXCLUDE_FROM_ALL
+            $<TARGET_OBJECTS:session-util-check-obj>)
+        target_link_libraries(session-util-check PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}/libsession-util.a Threads::Threads ${CMAKE_DL_LIBS} m)
+        if(ANDROID)
+            target_link_libraries(session-util-check PRIVATE log)
+        endif()
+        target_link_options(session-util-check PRIVATE "LINKER:--no-undefined")
+        add_dependencies(session-util-check session-util)
+    else()
+        add_custom_target(session-util-check
+            COMMAND ${CMAKE_COMMAND} -E echo "session-util-check: only checked on Linux and Android")
+    endif()
 endif()
 
 
