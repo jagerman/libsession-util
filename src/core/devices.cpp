@@ -814,6 +814,26 @@ namespace {
             consume_extra(dev, info.extra);
     }
 
+    // The device record a stored link request asks to have admitted.  Already verified when the
+    // request was received.
+    device::Info requested_record(
+            std::span<const std::byte, 32> id, std::span<const std::byte> encoded) {
+        device::Info info;
+        std::ranges::copy(id, info.id.begin());
+        decode_one(info, oxenc::bt_dict_consumer{encoded}, device::State::Pending);
+        info.digest = hash::blake2b<8>(encoded);
+        return info;
+    }
+
+    // The digest a device record has as a group message carries it: the last term of the merge
+    // comparison, so a record we change ourselves has to carry the digest every other device will
+    // compute for it.
+    std::array<std::byte, 8> record_digest(const device::Info& info) {
+        oxenc::bt_dict_producer out;
+        encode_device_info(std::move(out), info);
+        return hash::blake2b<8>(std::move(out).str());
+    }
+
     // Decodes the plaintext bt-encoded device group payload.  The returned device map will include
     // both full device records and tombstoned devices: the latter have a mostly default-constructed
     // Info where only id, state (Kicked or Left), and kicked are set.
@@ -1260,6 +1280,31 @@ static const std::string ANSWER_REQUEST_SQL =
                 static_cast<int>(device::LinkStatus::Accepted),
                 static_cast<int>(device::LinkStatus::Pending));
 
+// The same for a device already in the group, whose record changing says nothing on its own: it
+// changes whenever the device updates its details or rotates its keys.  A request was answered if
+// the record now carries the keys it asked for.
+static void answer_replacements(
+        sqlite::Connection& c,
+        int64_t dev_id,
+        std::span<const std::byte, 32> id,
+        const device::Info& record) {
+    std::vector<int64_t> answered;
+    for (auto [row, encoded] : c.prepared_results<int64_t, sqlite::blob>(
+                 "SELECT id, info FROM device_link_requests"
+                 " WHERE device = ? AND replaces = 1 AND status = {}"_format(
+                         static_cast<int>(device::LinkStatus::Pending)),
+                 dev_id)) {
+        auto asked = requested_record(id, encoded);
+        if (asked.pk_x25519 == record.pk_x25519 && asked.pk_mlkem768 == record.pk_mlkem768)
+            answered.push_back(row);
+    }
+    for (auto row : answered)
+        c.prepared_exec(
+                "UPDATE device_link_requests SET status = ? WHERE id = ?",
+                static_cast<int>(device::LinkStatus::Accepted),
+                row);
+}
+
 // Restates a removal that an incoming message tried to undo, moving the tombstone to the front of
 // the removed list and marking it for broadcast.
 //
@@ -1433,6 +1478,8 @@ void Devices::receive_device_group_message(
             c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
             if (id != self_id)
                 members.push_back(id);
+        } else {
+            answer_replacements(c, *dev_id, id, info);
         }
     }
 
@@ -2016,6 +2063,7 @@ void Devices::receive_link_request(
 
     // {"I": device id, "i": device info dict, "~": signature by the account key}
     device::Info info;
+    std::string_view raw;
     try {
         oxenc::bt_dict_consumer pt{std::span<const std::byte>{*plaintext}};
         auto in_id = pt.require_span<unsigned char, 32>("I");
@@ -2027,7 +2075,7 @@ void Devices::receive_link_request(
             consume_extra(pt, extra_outer);
         if (pt.is_finished() || pt.key() != "i")
             throw std::runtime_error{"missing 'i' device info dict"};
-        auto raw = pt.consume_dict_data();
+        raw = pt.consume_dict_data();
         decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Pending);
         info.digest = hash::blake2b<8>(raw);
 
@@ -2051,22 +2099,38 @@ void Devices::receive_link_request(
 
     auto c = conn();
 
-    // Reject if already registered or unregistered; only Pending (or absent) is valid
+    // A device already in the group is asking to replace its record: it lost track of having joined
+    // -- restored from a backup, say -- and no longer holds the keys the group encrypts to.  Its
+    // row keeps the record in use until the request is accepted.  A device that was removed, or
+    // left, cannot ask at all: its id is spent.
+    auto existing = c.prepared_maybe_get<int64_t, int, int64_t>(
+            "SELECT id, state, timestamp FROM devices WHERE unique_id = ?", info.id);
     auto existing_state =
-            c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", info.id)
-                    .value_or(-1);
-    if (existing_state != -1 && existing_state != static_cast<int>(device::State::Pending)) {
+            existing ? static_cast<device::State>(std::get<1>(*existing)) : device::State::Pending;
+    bool replaces = existing_state == device::State::Registered;
+
+    // Only a request made after the record it would replace: an older one is the request that
+    // admitted the device in the first place, or one it has since moved past, still in the swarm
+    // and fetched late.
+    if (replaces && info.timestamp.time_since_epoch().count() <= std::get<2>(*existing)) {
+        log::debug(
+                cat,
+                "Ignoring link request from {}: older than its record in the group",
+                oxenc::to_hex(info.id));
+        return;
+    }
+    if (!replaces && existing_state != device::State::Pending) {
         log::debug(
                 cat,
                 "Ignoring link request from {}: device already in state {}",
                 oxenc::to_hex(info.id),
-                existing_state);
+                static_cast<int>(existing_state));
         return;
     }
 
     SQLite::Transaction tx{c.sql};
 
-    auto dev_id = upsert_device_info(c, info);
+    auto dev_id = replaces ? std::optional{std::get<0>(*existing)} : upsert_device_info(c, info);
     if (!dev_id) {
         log::debug(
                 cat,
@@ -2087,13 +2151,16 @@ void Devices::receive_link_request(
             *dev_id);
 
     c.prepared_exec(
-            R"(INSERT INTO device_link_requests (device, received_at, expires_at, sas_seed, hash)
-               VALUES (?, ?, ?, ?, ?))",
+            R"(INSERT INTO device_link_requests
+                (device, received_at, expires_at, sas_seed, hash, info, replaces)
+               VALUES (?, ?, ?, ?, ?, ?, ?))",
             *dev_id,
             epoch_seconds(clock_now_s()),
             epoch_seconds(expiry),
             sas_seed,
-            hash);
+            hash,
+            to_span<std::byte>(raw),
+            replaces ? 1 : 0);
 
     tx.commit();
 }
@@ -2141,59 +2208,36 @@ std::vector<std::pair<int64_t, device::LinkRequest>> Devices::_read_link_request
     auto c = conn();
     std::vector<std::pair<int64_t, device::LinkRequest>> out;
 
-    for (auto [row,
-               received,
-               expires,
-               status,
-               sas_seed,
-               dev_row,
-               devid,
-               state,
-               seqno,
-               timestamp,
-               type,
-               desc,
-               ver,
-               pk_ml,
-               pk_x,
-               kicked] :
+    for (auto [row, received, expires, status, sas_seed, record, replaces, devid] :
          c.prepared_results<
                  int64_t,
                  int64_t,
                  int64_t,
                  int,
                  sqlite::blob_guts<std::array<std::byte, 16>>,
-                 int64_t,
-                 sqlite::blob_guts<std::array<std::byte, 32>>,
+                 sqlite::blob,
                  int,
-                 int,
-                 int64_t,
-                 std::string,
-                 std::string,
-                 int64_t,
-                 sqlite::blobn<mlkem768::PUBLICKEYBYTES>,
-                 sqlite::blobn<32>,
-                 std::optional<int64_t>>(
-                 "SELECT r.id, r.received_at, r.expires_at, r.status, r.sas_seed,"
-                 "       d.id, d.unique_id, d.state, d.seqno, d.timestamp, d.device_type,"
-                 "       d.description, d.version, d.pubkey_mlkem768, d.pubkey_x25519,"
-                 "       d.kicked_timestamp"
+                 sqlite::blob_guts<std::array<std::byte, 32>>>(
+                 "SELECT r.id, r.received_at, r.expires_at, r.status, r.sas_seed, r.info,"
+                 "       r.replaces, d.unique_id"
                  "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
                  " WHERE ? = 0 OR (r.status = {} AND r.expires_at > ?)"
                  " ORDER BY r.id DESC"_format(static_cast<int>(device::LinkStatus::Pending)),
                  pending_only ? 1 : 0,
                  epoch_seconds(clock_now_s()))) {
-        auto info = fill_device_info(
-                devid, state, seqno, timestamp, std::move(type), std::move(desc), ver, pk_ml, pk_x);
-        if (kicked)
-            info.kicked.emplace(std::chrono::seconds{*kicked});
-        load_device_extras(c, dev_row, info);
+        std::optional<device::Info> current;
+        if (replaces) {
+            auto held = devices(true, true, true, devid);
+            if (auto it = held.find(devid); it != held.end())
+                current = std::move(it->second);
+        }
 
         out.emplace_back(
                 row,
                 device::LinkRequest{
                         .id = 0,
-                        .device = std::move(info),
+                        .device = requested_record(devid, record),
+                        .replaces = std::move(current),
                         .sas = sas_from_seed(sas_seed),
                         .received = std::chrono::sys_seconds{std::chrono::seconds{received}},
                         .expires = std::chrono::sys_seconds{std::chrono::seconds{expires}},
@@ -2243,23 +2287,27 @@ bool Devices::_accept_request(int reqid) {
                 static_cast<int>(device::State::Registered)))
         return false;
 
-    auto dev = c.prepared_maybe_get<int64_t>(
-            "SELECT device FROM device_link_requests"
+    auto request = c.prepared_maybe_get<int64_t, int>(
+            "SELECT device, replaces FROM device_link_requests"
             " WHERE id = ? AND status = {} AND expires_at > ?"_format(
                     static_cast<int>(device::LinkStatus::Pending)),
             *row,
             epoch_seconds(clock_now_s()));
-    if (!dev)
+    if (!request)
         return false;
+    auto [dev, replaces] = *request;
 
-    // Only from Pending: a device kicked since the request arrived is gone for good, and the rank
-    // rule would refuse to lower it anyway.
-    if (!c.prepared_maybe_get<int64_t>(
-                "UPDATE devices SET state = ?, broadcast_needed = 1"
-                " WHERE id = ? AND state = ? RETURNING id",
-                static_cast<int>(device::State::Registered),
-                *dev,
-                static_cast<int>(device::State::Pending)))
+    // A new device only from Pending: one kicked since the request arrived is gone for good, and
+    // the rank rule would refuse to lower it anyway.
+    bool admitted = replaces ? _replace_record(*row)
+                             : c.prepared_maybe_get<int64_t>(
+                                        "UPDATE devices SET state = ?, broadcast_needed = 1"
+                                        " WHERE id = ? AND state = ? RETURNING id",
+                                        static_cast<int>(device::State::Registered),
+                                        dev,
+                                        static_cast<int>(device::State::Pending))
+                                       .has_value();
+    if (!admitted)
         return false;
 
     c.prepared_exec(
@@ -2272,6 +2320,37 @@ bool Devices::_accept_request(int reqid) {
     _ended.insert(*row);
     _devices_changed = true;
     _flush_events();
+    return true;
+}
+
+bool Devices::_replace_record(int64_t row) {
+    assert(on_loop());
+    auto c = conn();
+    std::optional<device::Info> info;
+    for (auto [record, id, seqno] :
+         c.prepared_results<sqlite::blob, sqlite::blob_guts<std::array<std::byte, 32>>, int64_t>(
+                 "SELECT r.info, d.unique_id, d.seqno"
+                 "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
+                 " WHERE r.id = ? AND d.state = ?",
+                 row,
+                 static_cast<int>(device::State::Registered))) {
+        info = requested_record(id, record);
+        // Above both, so that the record wins every merge: the one it replaces everywhere it is
+        // held, and the requesting device's own row, which may have fallen behind with whatever
+        // else it lost.
+        info->seqno = std::max(seqno, info->seqno) + 1;
+    }
+    if (!info)
+        return false;
+
+    info->state = device::State::Registered;
+    info->digest = record_digest(*info);
+    auto dev = upsert_device_info(c, *info);
+    assert(dev);
+    c.prepared_exec(REGISTER_DEVICE_SQL, *dev);
+
+    log::info(cat, "Replacing the record of device {}; rotating the account key", info->id);
+    rotate_account_keys();
     return true;
 }
 

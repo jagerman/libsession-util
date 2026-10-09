@@ -75,7 +75,13 @@ CREATE TABLE device_link_requests (
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),  -- 16-byte Argon2id output for SAS display
     -- The swarm's hash for the message the request arrived in, which is what deleting it from the
     -- swarm names.
-    hash TEXT NOT NULL
+    hash TEXT NOT NULL,
+    -- The device record the request asks to have admitted, bt-encoded as it was signed.  Kept here
+    -- rather than read from `devices` because a device already in the group keeps the record it has
+    -- there, keys and all, until a request replacing it is accepted.
+    info BLOB NOT NULL,
+    -- 1 if the device was already in the group when it asked, so accepting replaces its record.
+    replaces INTEGER NOT NULL DEFAULT 0 CHECK(replaces IN (0, 1))
 ) STRICT;
 CREATE INDEX device_link_requests_device ON device_link_requests(device);
 

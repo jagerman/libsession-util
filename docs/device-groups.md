@@ -134,6 +134,12 @@ automatically.
    user has stopped typing for a few seconds, so that a keystroke can't answer it by accident.
    Re-read `incoming_link_requests()` when drawing the prompt rather than trusting a copy held from
    earlier: a request can be replaced or answered in between.
+   If `replaces` is set, the request comes from a device already in the group, under the same
+   identity: usually one that lost track of having joined, such as one restored from a backup.
+   Say so plainly, and show `replaces` (its current description and when it last updated) beside
+   the request: "This will replace *Alice's laptop* in your device group." The emoji check matters
+   as much as for a new device, since someone holding the recovery phrase could ask under that
+   identity too.
 2. Offer three answers:
    - **Approve:** `accept_request(id)`. Only if the user confirms the emoji match what the new
      device shows.
@@ -147,8 +153,9 @@ automatically.
    accept or ignore: close the prompt when that call returns.
 
 `accept_request` answers false if the request can no longer be accepted (approved elsewhere,
-replaced, expired, or this device has left the group meanwhile). That is not an error: close the
-prompt.
+replaced, expired, the device removed, or this device has left the group meanwhile). That is not an
+error: close the prompt. Accepting a replacement also gives the group a new account key; there is
+nothing for the application to do about that.
 
 Request ids are counters for this run only. Never persist or display them.
 

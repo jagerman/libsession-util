@@ -214,6 +214,13 @@ namespace device {
         /// The requesting device, as it described itself.
         Info device;
 
+        /// Set when the requesting device's id is already in the group: its record as it stands
+        /// now, which accepting the request replaces with `device`.  The user must be told so
+        /// before they accept.  This is how a device that lost track of having joined -- restored
+        /// from a backup, say -- gets back in: it confirms the SAS like any new device, and the
+        /// group moves to new keys.
+        std::optional<Info> replaces;
+
         /// The 21 emoji to compare against what the requesting device is showing.  The first 7 are
         /// the standard display; all 21 are there for an extended view.
         std::array<std::string_view, 21> sas;
@@ -488,9 +495,9 @@ class Devices final : detail::CoreComponent {
     // Every link request this device has seen, newest first: pending, answered, superseded and
     // expired alike.  For a history view.
     //
-    // `device` is the requesting device's record as it now stands, which for an older request may
-    // have moved on since -- a device that asked twice appears in both rows with its later
-    // description.  The SAS always belongs to that row's own request.
+    // `device` is the record each request asked to have admitted, so a device that asked twice
+    // appears in each row as it described itself that time.  `replaces`, by contrast, is the
+    // record as it stands now.
     //
     // These and the calls below read and write the device tables and hand out request ids, all of
     // which the loop owns, so they happen there either way.
@@ -505,6 +512,10 @@ class Devices final : detail::CoreComponent {
 
     // Admits the requesting device to the group.  The acceptance reaches the other devices with the
     // next group push, which happens once the next fetch completes.
+    //
+    // For a request that `replaces` a device, the requesting device's record takes the place of the
+    // one held, and the account key is rotated: a copy of the device as it was, still holding the
+    // replaced record's keys, must not read what comes after.
     //
     // Answers false if the request can no longer be accepted: answered here or elsewhere,
     // superseded by a newer request from the same device, past its deadline, or this device is no
@@ -669,6 +680,11 @@ class Devices final : detail::CoreComponent {
     void _arm_expiry(std::optional<std::chrono::sys_seconds> deadline);
 
     bool _accept_request(int reqid);
+
+    // Puts the record link request `row` asks for in place of the one its device holds in the
+    // group, and rotates the account key.  False if the device is no longer in the group.  Inside
+    // the caller's transaction.
+    bool _replace_record(int64_t row);
     bool _ignore_request(int reqid, bool delete_from_swarm);
     size_t _forget_link_requests(std::span<const int> reqids);
 

@@ -2359,6 +2359,133 @@ TEST_CASE(
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 }
 
+namespace {
+
+// The applicant as it would be after losing track of having joined -- restored from a backup taken
+// before, at `seqno`: not in a group as far as it knows, and holding keys the group never saw.
+void lose_track(Linking& l, int64_t seqno) {
+    auto id = l.applicant_id();
+    TestHelper::on_loop(*l.applicant, [&] {
+        l.applicant->database().conn().prepared_exec(
+                "UPDATE devices SET state = ?, seqno = ? WHERE unique_id = ?",
+                static_cast<int>(device::State::Unregistered),
+                seqno,
+                id);
+        l.applicant->devices.rotate_device_keys();
+        return 0;
+    });
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a device that lost track of joining asks to replace its record",
+        "[core][devices][linking]") {
+    Linking l;
+    auto backup = l.applicant->devices.device_info(await).first.seqno;
+    l.admit();
+
+    // Details changed since joining, which the group holds and the backup does not: the request
+    // comes from a device whose seqno is behind its record's.
+    auto renamed = l.applicant->devices.device_info(await).first;
+    renamed.description = "renamed";
+    l.applicant->devices.update_info(renamed, await);
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "G1b");
+    auto before = l.state_of_applicant();
+    REQUIRE(before.description == "renamed");
+    auto keys_before = account_key_count(l.core);
+
+    ScopedClockOffset later{1min};
+    lose_track(l, backup);
+    l.ask(in(10min), "L2");
+
+    REQUIRE(l.events.added.size() == 2);
+    auto asked = l.events.added[1];
+    REQUIRE(asked.replaces);
+    CHECK(asked.replaces->pk_x25519 == before.pk_x25519);
+    CHECK(asked.device.pk_x25519 != before.pk_x25519);
+    // Until someone accepts, the group goes on encrypting to the record it holds.
+    CHECK(l.state_of_applicant().pk_x25519 == before.pk_x25519);
+
+    REQUIRE(l.core->devices.accept_request(asked.id, await));
+    auto after = l.state_of_applicant();
+    CHECK(after.state == device::State::Registered);
+    CHECK(after.pk_x25519 == asked.device.pk_x25519);
+    CHECK(after.seqno > before.seqno);
+    CHECK(account_key_count(l.core) == keys_before + 1);
+
+    // And the device joins as any new device does: once its user has confirmed the SAS too.
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(l.applicant->devices.device_info(await).first.pk_x25519 == after.pk_x25519);
+}
+
+TEST_CASE(
+        "Devices - the request that admitted a device does not ask to replace it",
+        "[core][devices][linking]") {
+    Linking l;
+    auto first = l.ask();
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+
+    // Still in the swarm, and fetched again by a device that missed it the first time round.
+    TestHelper::deliver_device_message(*l.core, first.message, in(10min), "L1-again");
+    CHECK(l.events.added.size() == 1);
+    CHECK(l.core->devices.incoming_link_requests(await).empty());
+}
+
+TEST_CASE(
+        "Devices - a removed device cannot ask to replace its record", "[core][devices][linking]") {
+    Linking l;
+    auto backup = l.applicant->devices.device_info(await).first.seqno;
+    l.admit();
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+
+    ScopedClockOffset later{1min};
+    lose_track(l, backup);
+    l.ask(in(10min), "L2");
+    CHECK(l.events.added.size() == 1);
+    CHECK(l.core->devices.incoming_link_requests(await).empty());
+}
+
+TEST_CASE(
+        "Devices - a replacement accepted elsewhere closes the prompt here",
+        "[core][devices][linking]") {
+    Linking l;
+    auto backup = l.applicant->devices.device_info(await).first.seqno;
+    l.admit();
+
+    // A third device in the group, to see the request without answering it.
+    DeviceEventsRecorder third_events;
+    TempCore third{
+            core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
+            Linking::reporting_to(third_events)};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*third, *l.core).message, in(10min), "L3");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    REQUIRE(third->devices.confirm_link(await));
+    TestHelper::deliver_device_message(
+            *third, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    REQUIRE(third->devices.membership(await).membership == device::Membership::InGroup);
+
+    ScopedClockOffset later{1min};
+    lose_track(l, backup);
+    auto asked = TestHelper::build_link_request(*l.applicant, *l.core);
+    TestHelper::deliver_device_message(*l.core, asked.message, in(10min), "L4");
+    TestHelper::deliver_device_message(*third, asked.message, in(10min), "L4");
+    REQUIRE(third_events.added.size() == 1);
+    REQUIRE(third_events.added[0].replaces);
+
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    TestHelper::deliver_device_message(
+            *third, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    CHECK(third_events.ended ==
+          std::vector{std::pair{third_events.added[0].id, device::LinkRequestEnd::Accepted}});
+    CHECK(third->devices.incoming_link_requests(await).empty());
+}
+
 TEST_CASE("Devices - a removed device cannot start a group", "[core][devices][membership]") {
     Linking l;
     l.admit();

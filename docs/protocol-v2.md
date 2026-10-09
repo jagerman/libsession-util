@@ -555,7 +555,10 @@ In some circumstances, additional information might also need to be confirmed or
 - if the new device has the same device identifier as an existing device then the user should be
   told that accepting this will replace the existing device in the device group.  (This path is
   relatively rare, but would apply, for instance, if someone restores their system from a backup
-  with expired keys that needs to re-join the device group with new keys.)
+  with expired keys that needs to re-join the device group with new keys.)  Only a request made
+  after the record it would replace counts: an older one is the request that first admitted the
+  device, or one since superseded, fetched late.  A device identifier the group holds a removal or
+  departure for is spent, and a request under it is ignored.
 
 - if there are no available additional linked device slots (i.e. because the user is not a Pro user,
   and has used all available non-Pro device slots) then the user must be informed and given a list
@@ -581,6 +584,14 @@ Upon accepting a device linking request, the existing linked device accepting th
 - regenerate the new linked device encryption with the new details, and newly encrypted for the new
   device.
 - push the updated linked device config to the account's swarm.
+
+Accepting a request that replaces an existing device puts the requested record in place of the one
+held, with a seqno above both that record's and the request's, so that it wins the merge on every
+device -- the requesting device's own included, which may have lost track of its seqno along with
+its membership.  The accepting device also rotates the account key: a copy of the device as it was
+still holds the replaced record's keys, and must not read what comes after.  A device that saw the
+request without answering it treats it as accepted once a group message gives the device the keys
+the request asked for.
 
 The device that requested linking, meanwhile, continues to monitor namespace 21 for an updated
 device message that it is successfully able to decrypt.

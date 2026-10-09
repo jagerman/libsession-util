@@ -1,7 +1,7 @@
 -- A device can now leave a group as well as be removed from one, so Left takes rank 3 and Kicked
--- moves up to 4.  Changing the CHECKs that pin that down means recreating `devices`, and with it the
--- two tables that reference it: migrations run with foreign keys on, so dropping the old parent would
--- cascade into the children's rows.
+-- moves up to 4.  Changing the CHECKs that pin that down means recreating `devices`, and with it
+-- the two tables that reference it: migrations run with foreign keys on, so dropping the old parent
+-- would cascade into the children's rows.
 CREATE TABLE devices_new (
     id INTEGER PRIMARY KEY NOT NULL,
     unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 32),
@@ -34,7 +34,9 @@ CREATE TABLE device_link_requests_new (
     expires_at INTEGER NOT NULL,
     status INTEGER NOT NULL DEFAULT 0 CHECK(status >= 0 AND status <= 3),
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
-    hash TEXT NOT NULL
+    hash TEXT NOT NULL,
+    info BLOB NOT NULL,
+    replaces INTEGER NOT NULL DEFAULT 0 CHECK(replaces IN (0, 1))
 ) STRICT;
 
 -- A digest is only recorded as a record is merged, so the next message to carry each device fills
@@ -52,9 +54,9 @@ INSERT INTO device_unknown_new (device, key, bt_value)
     SELECT device, key, bt_value FROM device_unknown;
 
 -- Link requests are not carried over.  Those stored so far were not encrypted to a group, which no
--- device can answer any more, and lack the swarm hash and expiry now recorded for each; they would
--- have lapsed within ten minutes regardless.  The requesting devices stay Pending, as an ignored
--- request leaves them.
+-- device can answer any more, and lack the swarm hash, expiry and record now kept for each; they
+-- would have lapsed within ten minutes regardless.  The requesting devices stay Pending, as an
+-- ignored request leaves them.
 
 -- Children before parents, so that nothing is left referencing a table as it goes.
 DROP TABLE device_link_requests;
