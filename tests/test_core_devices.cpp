@@ -2105,6 +2105,42 @@ TEST_CASE(
     CHECK(own_state(l.applicant) == device::State::Registered);
 }
 
+TEST_CASE(
+        "Devices - a removed device comes back under a new identity",
+        "[core][devices][membership]") {
+    Linking l;
+    CHECK_FALSE(l.core->devices.renew_device_identity(await));
+
+    l.admit();
+    auto old_id = l.applicant_id();
+    REQUIRE(l.core->devices.remove_device(old_id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
+    auto account_keys = l.applicant->devices.active_account_keys().size();
+
+    REQUIRE(l.applicant->devices.renew_device_identity(await));
+    CHECK(l.applicant_id() != old_id);
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::GroupsVisible);
+    CHECK_FALSE(state.group);
+    CHECK(l.applicant->devices.active_account_keys().size() == account_keys);
+
+    // Nothing of its old group left to carry into one it starts, or to mistake for the one it
+    // joins.
+    CHECK(l.applicant->devices.devices(true, true, true).empty());
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+
+    // And joins again like any device asking: the new id is not the one the group removed.
+    l.ask(in(10min), "L2");
+    REQUIRE(l.events.added.size() == 2);
+    REQUIRE(l.core->devices.accept_request(l.events.added[1].id, await));
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+}
+
 TEST_CASE("Devices - a removed device cannot start a group", "[core][devices][membership]") {
     Linking l;
     l.admit();

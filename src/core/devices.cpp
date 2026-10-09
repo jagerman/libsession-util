@@ -2300,6 +2300,54 @@ void Devices::_rebaseline_membership() {
         _reported_membership = m;
 }
 
+void Devices::renew_device_identity(result_function<bool> cb) {
+    async([this] { return _renew_device_identity(); }, std::move(cb));
+}
+
+bool Devices::renew_device_identity(await_t) {
+    return jq().call_get([this] { return _renew_device_identity(); });
+}
+
+bool Devices::_renew_device_identity() {
+    assert(on_loop());
+    if (!conn().prepared_maybe_get<int>(
+                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                self_id,
+                static_cast<int>(device::State::Kicked)))
+        return false;
+
+    // Before the transaction, which it would otherwise nest inside.
+    rotate_device_keys();
+
+    std::array<std::byte, 32> id;
+    random::fill(id);
+    {
+        auto c = conn();
+        SQLite::Transaction tx{c.sql};
+
+        // All of its old group, ourselves included: a group it went on to start from these would
+        // carry them over as members, and on rejoining, the group it joins says who is in it.
+        c.prepared_exec("DELETE FROM devices");
+        c.prepared_exec("DELETE FROM device_group_merged");
+        core.globals.set(dev_key, std::span<const std::byte>{id});
+        core.globals.erase(group_id_key);
+        core.globals.erase(own_request_expires_key);
+        core.globals.erase(own_request_sas_key);
+        _forget_confirmation();
+        tx.commit();
+    }
+
+    log::info(cat, "Replaced removed device id {} with {}", self_id, id);
+    self_id = id;
+    _reqid_by_row.clear();
+    _row_by_reqid.clear();
+    _ended.clear();
+
+    _rebaseline_membership();
+    _flush_events();
+    return true;
+}
+
 void Devices::start_group(result_function<device::GroupId> cb) {
     async([this] { return _start_group(); }, std::move(cb));
 }

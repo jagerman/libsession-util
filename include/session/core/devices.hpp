@@ -544,6 +544,16 @@ class Devices final : detail::CoreComponent {
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
+    // Gives a removed device a new identity, so that it can ask to join again: a removed id is
+    // spent, and can never rejoin the group that removed it.  A new device id and new device keys
+    // replace the old, and what it held of its old group is forgotten, leaving it `GroupsVisible`
+    // or `NoGroup` like any device outside a group.  Its messages, its account's configs and keys,
+    // and the groups it has seen in the swarm are all kept.
+    //
+    // Answers false for a device that has not been removed.
+    void renew_device_identity(result_function<bool> cb);
+    bool renew_device_identity(await_t);
+
     // Starts a new device group with this device as its only member, and answers its identifier.
     // For `NoGroup`, and for `GroupsVisible`, where the new group is started *alongside* those
     // already there: it replaces and deletes nothing, and their devices are alerted to it, so that
@@ -566,6 +576,7 @@ class Devices final : detail::CoreComponent {
     bool _remove_device(std::span<const std::byte, 32> id);
     device::MembershipState _membership();
     device::GroupId _start_group();
+    bool _renew_device_identity();
     bool _dismiss_group(const device::GroupId& group);
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
