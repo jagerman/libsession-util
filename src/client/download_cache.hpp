@@ -131,6 +131,16 @@ class Writer {
 /// what is *not* referenced, and a download that has not finished is not referenced yet.
 inline constexpr std::string_view PARTIAL_SUFFIX = ".part";
 
+/// What a cached attachment's thumbnail is called: its file's name with this appended, beside it.
+/// A sweep reads a name with this suffix as belonging to the entry named by the rest.
+inline constexpr std::string_view THUMBNAIL_SUFFIX = ".thumb";
+
+inline std::string thumbnail_name(std::string_view name) {
+    std::string thumb{name};
+    thumb += THUMBNAIL_SUFFIX;
+    return thumb;
+}
+
 /// The names of the finished files in `dir/kind`, in no particular order.
 ///
 /// Filesystem only, reading nothing else, so this half of a sweep can run off the event loop --

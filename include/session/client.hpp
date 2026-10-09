@@ -1140,6 +1140,10 @@ class Client {
     // Every message whose attachment names cache entry `id`.
     std::vector<int64_t> _messages_cached_as(sqlite::Connection& c, int64_t id);
 
+    // Takes a thumbnail whose file has gone out of entry `id`'s row, and returns the messages that
+    // were drawing it, or nothing if the row had none to take.
+    std::vector<int64_t> _forget_thumbnail(sqlite::Connection& c, int64_t id);
+
     // What the cache index says its files add up to, in bytes on disk.  The overload taking a
     // connection is for callers that already hold one and are about to write through it -- eviction
     // reads this to decide whether it has work to do.

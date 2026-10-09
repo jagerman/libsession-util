@@ -779,11 +779,22 @@ void Client::_reconcile_cache(
 
     // An attachment file without a row cannot be found by a lookup or counted by eviction, so it is
     // not a cache entry at all -- it is a file taking up room under a name nobody can resolve.
+    //
+    // A thumbnail belongs to the row named by the rest of its name, and is as orphaned as any other
+    // file if that row does not say it has one.
     std::vector<std::string> orphans;
-    for (auto& name : attachments)
+    for (auto& name : attachments) {
+        bool thumb = name.ends_with(cache::THUMBNAIL_SUFFIX);
+        auto entry = thumb ? std::string_view{name}.substr(
+                                     0, name.size() - cache::THUMBNAIL_SUFFIX.size())
+                           : std::string_view{name};
         if (!c.prepared_get<int64_t>(
-                    "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)", name))
+                    thumb ? "SELECT EXISTS(SELECT 1 FROM attachment_cache"
+                            " WHERE name = ? AND thumbnail IS NOT NULL)"
+                          : "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)",
+                    entry))
             orphans.push_back(std::move(name));
+    }
 
     // The other direction, which is not cosmetic: eviction totals `size` over the rows, so a row
     // naming a file that is gone makes the cache look fuller than it is and evicts live files to
@@ -792,12 +803,19 @@ void Client::_reconcile_cache(
     // Rows the listing covers are fine by definition.  The rest are checked against the disk rather
     // than assumed missing, because a row inserted after the listing was taken is legitimately
     // absent from it and dropping it would strand the file it names.
+    //
+    // A missing thumbnail is the same mistake on a smaller scale -- its bytes are counted in `size`
+    // -- and costs only the thumbnail: the file it was made from is still good.
     std::set<std::string> listed{attachments.begin(), attachments.end()};
-    std::vector<std::pair<int64_t, std::string>> unlisted;
-    for (auto&& [id, name] :
-         c.prepared_results<int64_t, std::string>("SELECT id, name FROM attachment_cache"))
+    std::vector<std::pair<int64_t, std::string>> unlisted, unlisted_thumbs;
+    for (auto&& [id, name, thumb] :
+         c.prepared_results<int64_t, std::string, std::optional<int64_t>>(
+                 "SELECT id, name, thumbnail FROM attachment_cache")) {
         if (!listed.contains(name))
             unlisted.emplace_back(id, std::move(name));
+        else if (thumb && !listed.contains(cache::thumbnail_name(name)))
+            unlisted_thumbs.emplace_back(id, std::move(name));
+    }
 
     // A picture is referenced by an account naming its url and by nothing else, so the referenced
     // set is that column.  Recomputed here rather than passed in, so that an account that appeared
@@ -817,6 +835,7 @@ void Client::_reconcile_cache(
                 dir = _cache_dir,
                 orphans = std::move(orphans),
                 unlisted = std::move(unlisted),
+                unlisted_thumbs = std::move(unlisted_thumbs),
                 unreferenced = std::move(unreferenced)]() mutable {
         size_t dropped_files = 0, dropped_pictures = 0;
         for (const auto& name : orphans)
@@ -830,8 +849,19 @@ void Client::_reconcile_cache(
             if (!std::filesystem::exists(dir / cache::ATTACHMENT_DIR / name, ec))
                 gone.emplace_back(id, std::move(name));
         }
+        std::vector<int64_t> thumbs_gone;
+        for (auto& [id, name] : unlisted_thumbs) {
+            std::error_code ec;
+            if (!std::filesystem::exists(
+                        dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(name), ec))
+                thumbs_gone.push_back(id);
+        }
 
-        call([this, gone = std::move(gone), dropped_files, dropped_pictures] {
+        call([this,
+              gone = std::move(gone),
+              thumbs_gone = std::move(thumbs_gone),
+              dropped_files,
+              dropped_pictures] {
             // Through the same path an eviction takes, so a file that went missing behind our back
             // is reported to the messages drawing it exactly as one we deleted on purpose would be
             // -- and as one report for the sweep, not one per file.
@@ -841,15 +871,20 @@ void Client::_reconcile_cache(
                 auto showing = _drop_cached(c, id, name);
                 affected.insert(affected.end(), showing.begin(), showing.end());
             }
+            for (auto id : thumbs_gone) {
+                auto showing = _forget_thumbnail(c, id);
+                affected.insert(affected.end(), showing.begin(), showing.end());
+            }
             _emit_messages_showing(c, affected);
 
-            if (dropped_files || !gone.empty() || dropped_pictures)
+            if (dropped_files || !gone.empty() || !thumbs_gone.empty() || dropped_pictures)
                 log::info(
                         cat,
                         "Cache sweep: dropped {} untracked attachment(s), {} row(s) for missing "
-                        "files, {} unreferenced picture(s)",
+                        "files, {} missing thumbnail(s), {} unreferenced picture(s)",
                         dropped_files,
                         gone.size(),
+                        thumbs_gone.size(),
                         dropped_pictures);
         });
     });
@@ -3820,9 +3855,11 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
 
     auto st = c.prepared_st(
             R"(
-        SELECT message, idx, content_type, filename, flags, width, height, thumbhash,
-               size, url, unavailable, cached, saved_at
-        FROM message_attachments WHERE message IN ({}) ORDER BY message, idx
+        SELECT a.message, a.idx, a.content_type, a.filename, a.flags, a.width, a.height,
+               a.thumbhash, a.size, a.url, a.unavailable, a.cached, a.saved_at,
+               c.thumbnail IS NOT NULL
+        FROM message_attachments a LEFT JOIN attachment_cache c ON c.id = a.cached
+        WHERE a.message IN ({}) ORDER BY a.message, a.idx
     )"_format(sqlite::placeholders(msgs.size())));
 
     int n = 1;
@@ -3841,7 +3878,8 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                  url,
                  unavailable,
                  cached,
-                 saved_at] :
+                 saved_at,
+                 thumbnail] :
          sqlite::IterableStatementWrapper<
                  int64_t,
                  int64_t,
@@ -3857,7 +3895,8 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                  std::optional<std::string>,
                  std::optional<Unavailable>,
                  std::optional<int64_t>,
-                 std::optional<int64_t>>{std::move(st)}) {
+                 std::optional<int64_t>,
+                 int>{std::move(st)}) {
         auto found = by_id.find(message);
         if (found == by_id.end())
             continue;
@@ -3884,6 +3923,7 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                 .availability = status.availability,
                 .fetch_done = status.done,
                 .fetch_total = status.total,
+                .has_thumbnail = thumbnail != 0,
                 .saved_at = saved_at ? std::optional{from_epoch_ms(*saved_at)} : std::nullopt});
     }
 }
@@ -5436,13 +5476,15 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
 bool Client::_record_cached(
         const std::string& url, const std::filesystem::path& file, int64_t on_disk) {
     // Recorded after the file exists, so a row never describes something that is not there.
+    //
+    // A name already recorded is the same url and so the same picture, and keeps its thumbnail.
 
     auto c = core.database().conn();
     auto name = file.filename().string();
     c.prepared_exec(
             R"(
         INSERT INTO attachment_cache (name, size, last_used) VALUES (?1, ?2, ?3)
-        ON CONFLICT (name) DO UPDATE SET size = ?2, last_used = ?3
+        ON CONFLICT (name) DO UPDATE SET size = ?2 + coalesce(thumbnail, 0), last_used = ?3
     )",
             name,
             on_disk,
@@ -5533,9 +5575,10 @@ std::vector<int64_t> Client::_drop_cached(
     // The file goes after the row, on the disk loop.  In order there, so a read of it posted while
     // the row still stood finishes first, and a download of the same file started after this
     // commits after it.
-    _post_disk([file = _cache_dir / cache::ATTACHMENT_DIR / name] {
+    _post_disk([dir = _cache_dir / cache::ATTACHMENT_DIR, name] {
         std::error_code ec;
-        std::filesystem::remove(file, ec);
+        std::filesystem::remove(dir / name, ec);
+        std::filesystem::remove(dir / cache::thumbnail_name(name), ec);
     });
 
     return showing;
@@ -5547,6 +5590,17 @@ std::vector<int64_t> Client::_messages_cached_as(sqlite::Connection& c, int64_t 
                  "SELECT DISTINCT message FROM message_attachments WHERE cached = ?"s, id))
         found.push_back(message);
     return found;
+}
+
+std::vector<int64_t> Client::_forget_thumbnail(sqlite::Connection& c, int64_t id) {
+    if (!c.prepared_exec(
+                R"(
+        UPDATE attachment_cache SET size = size - thumbnail, thumbnail = NULL
+        WHERE id = ? AND thumbnail IS NOT NULL
+    )",
+                id))
+        return {};
+    return _messages_cached_as(c, id);
 }
 
 void Client::_touch_cached(int64_t id) {

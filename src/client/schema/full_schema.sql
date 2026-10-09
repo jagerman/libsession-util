@@ -303,8 +303,15 @@ CREATE TABLE attachment_cache (
     -- Keyed (`cache::name_for`) so that someone reading the cache directory cannot tell which
     -- files this account has fetched.
     name TEXT NOT NULL UNIQUE,
+    -- Both files when the entry has a thumbnail (see below), so that eviction and the limit see
+    -- what the entry actually costs.
     size INTEGER NOT NULL,
-    last_used INTEGER NOT NULL      -- ms since epoch
+    last_used INTEGER NOT NULL,     -- ms since epoch
+    -- The bytes on disk of the entry's thumbnail, or NULL while it has none.  The thumbnail is part
+    -- of the entry rather than an entry of its own: it is made from this file, kept beside it as
+    -- `name` + `cache::THUMBNAIL_SUFFIX`, and evicted and deleted with it.  Kept apart from `size`
+    -- so that a thumbnail found missing can be taken back out of it.
+    thumbnail INTEGER
 ) STRICT;
 
 CREATE INDEX attachment_cache_lru ON attachment_cache(last_used);

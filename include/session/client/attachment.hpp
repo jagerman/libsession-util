@@ -224,7 +224,7 @@ struct Attachment {
     /// Whether `Client::attachment_thumbnail` has a thumbnail to serve: a small square JPEG of the
     /// picture, for drawing it in a grid or a list without decoding the whole file.
     ///
-    /// Only ever true alongside `availability == cached`, because the thumbnail is part of the
+    /// Only ever true while the file itself is in the cache, because the thumbnail is part of the
     /// cached copy: made from it once it is here, and evicted or deleted with it.  So it turns
     /// true a little after the file arrives -- reported through `messages_updated` like any other
     /// change to the message -- and false again when the file leaves the cache.
