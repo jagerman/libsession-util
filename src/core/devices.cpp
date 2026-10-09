@@ -85,6 +85,7 @@ static device::GroupId new_group_id() {
 // Our own link request, from the swarm storing it until it is withdrawn.
 static constexpr auto own_request_expires_key = "devices_link_request_expires"sv;
 static constexpr auto own_request_sas_key = "devices_link_request_sas"sv;
+static constexpr auto own_request_group_key = "devices_link_request_group"sv;
 
 // The user's confirmation that our request's SAS matched, and a group message admitting us that
 // arrived before it, held until it does: a fetch delivers a message only once.
@@ -1304,30 +1305,40 @@ void Devices::receive_device_group_message(
         return;
     }
 
-    // A group we can read but are not in is one we are switching to, and its contents are not ours
-    // to merge into the group we are in.
+    // A message admitting us while we wait on our own request: from outside any group, or from
+    // inside one, switching.  Being able to read it shows only that some holder of the seed
+    // encrypted it to us, so it waits for the user to confirm the SAS; see confirm_link.
     auto theirs = _group_of(data);
     auto ours = _group_id();
-    if (theirs && ours && *theirs != *ours) {
+    auto self = payload.devices.find(self_id);
+    bool admits_us =
+            self != payload.devices.end() && self->second.state == device::State::Registered;
+    std::array<std::byte, 8> asked;
+    bool switching = theirs && ours && *theirs != *ours && admits_us &&
+                     core.globals.get_blob_to(own_request_group_key, asked) &&
+                     device::GroupId{asked} == *theirs;
+    bool admitting = switching || (admits_us && conn().prepared_maybe_get<int>(
+                                                        "SELECT 1 FROM devices"
+                                                        " WHERE unique_id = ? AND state = ?",
+                                                        self_id,
+                                                        static_cast<int>(device::State::Pending)));
+
+    // Otherwise a group we can read but are not in is not ours to merge into the one we are in.
+    if (theirs && ours && *theirs != *ours && !switching) {
         log::warning(cat, "Not merging a readable device group message from another group");
         return;
     }
 
-    // A message admitting us while we wait on our own request.  Being able to read it shows only
-    // that some holder of the seed encrypted it to us, so it waits for the user to confirm the SAS;
-    // see confirm_link.
-    auto self = payload.devices.find(self_id);
-    bool admitting = self != payload.devices.end() &&
-                     self->second.state == device::State::Registered &&
-                     conn().prepared_maybe_get<int>(
-                             "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                             self_id,
-                             static_cast<int>(device::State::Pending));
     if (admitting && !core.globals.get_integer(confirmed_key).value_or(0)) {
         core.globals.set(held_admission_key, data);
         core.globals.set(held_admission_hash_key, std::string_view{hash});
         log::info(cat, "Admitted to a device group; holding it until the user confirms the SAS");
         return;
+    }
+
+    if (switching) {
+        _leave_group();
+        ours.reset();
     }
 
     auto c = conn();
@@ -1441,7 +1452,52 @@ void Devices::receive_device_group_message(
     tx.commit();
 
     if (admitting)
-        _forget_confirmation();
+        _forget_own_request();
+}
+
+void Devices::_leave_group() {
+    assert(on_loop());
+    auto c = conn();
+    auto old = _group_id();
+
+    std::vector<std::string> messages;
+    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        messages.push_back(std::move(hash));
+
+    // A departure for the members left, so they stop encrypting to us and rotate to a key we do not
+    // hold, pushed as an ordinary group message: so it replaces the old group's messages as any
+    // push does.  With nobody left, the messages are only deleted: nothing could read them, and
+    // devices elsewhere would go on alerting about a group nobody is in.
+    std::vector<SwarmStore> stores;
+    if (c.prepared_get<int>(
+                "SELECT count(*) FROM devices WHERE state = ? AND unique_id != ?",
+                static_cast<int>(device::State::Registered),
+                self_id) > 0) {
+        c.prepared_exec(
+                "UPDATE devices SET state = ?, kicked_timestamp = ? WHERE unique_id = ?",
+                static_cast<int>(device::State::Left),
+                epoch_seconds(clock_now_s()),
+                self_id);
+        stores.push_back(
+                {.ns = config::Namespace::Devices,
+                 .data = encrypt_device_data(devices(true, true, true)),
+                 .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+    }
+    if (core.network())
+        core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
+            if (!results)
+                log::warning(cat, "Could not leave the old device group cleanly");
+        });
+    else
+        log::warning(cat, "Leaving the old device group without telling it: no network");
+
+    // The group we have just left is not one to be alerted about.
+    if (old)
+        c.prepared_exec(
+                "UPDATE device_groups SET dismissed = 1 WHERE group_id = ?",
+                std::span<const std::byte>{old->value});
+    _forget_group();
+    log::info(cat, "Left the device group, to join another");
 }
 
 void Devices::_record_group(const SwarmMessage& msg) {
@@ -1519,9 +1575,8 @@ void Devices::_request_link(
     // network cannot be attached without one.
     if (!core.network())
         throw session::error{err::network_unavailable, "Cannot request a link: no network"};
-    if (_device_info().second)
-        throw session::error{
-                err::already_registered, "This device is already in the account's device group"};
+    if (_group_id() == group && _device_info().second)
+        throw session::error{err::already_registered, "This device is already in that group"};
 
     auto link_x25519 = conn().prepared_maybe_get<sqlite::blob_guts<std::array<std::byte, 32>>>(
             "SELECT link_x25519 FROM device_groups WHERE group_id = ? AND expires_at > ?",
@@ -1537,8 +1592,7 @@ void Devices::_request_link(
 
     // Whatever we asked before is being replaced, so its SAS must not be what the waiting screen
     // shows while this upload is in flight.
-    core.globals.erase(own_request_expires_key);
-    core.globals.erase(own_request_sas_key);
+    _forget_own_request();
 
     std::vector<SwarmStore> stores;
     stores.push_back(
@@ -1553,6 +1607,7 @@ void Devices::_request_link(
              alive = std::weak_ptr<int>{_alive},
              which,
              sent,
+             group,
              sas_seed = req.sas_seed,
              cb = std::move(cb)](std::optional<std::vector<SwarmStoreResult>> results) {
                 if (alive.expired())
@@ -1562,6 +1617,8 @@ void Devices::_request_link(
                     if (which == _own_request) {
                         core.globals.set(own_request_expires_key, epoch_seconds(sent.expires));
                         core.globals.set(own_request_sas_key, std::span{sas_seed});
+                        core.globals.set(
+                                own_request_group_key, std::span<const std::byte>{group.value});
                         _flush_events();
                     }
                     if (cb)
@@ -1603,14 +1660,6 @@ std::optional<Devices::OutgoingLinkRequest> Devices::_outgoing_link_request() {
     if (!expires || *expires <= clock_now() || !core.globals.get_blob_to(own_request_sas_key, seed))
         return std::nullopt;
 
-    // Kept until it lapses rather than cleared on admission, so the state is what says whether it
-    // is still waiting.
-    if (!conn().prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Pending)))
-        return std::nullopt;
-
     return OutgoingLinkRequest{
             .sas = sas_from_seed(seed),
             .expires = *expires,
@@ -1625,12 +1674,20 @@ bool Devices::confirm_link(await_t) {
     return jq().call_get([this] { return _confirm_link(); });
 }
 
-bool Devices::_confirm_link() {
-    assert(on_loop());
-    if (!conn().prepared_maybe_get<int>(
+bool Devices::_asking() {
+    if (conn().prepared_maybe_get<int>(
                 "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
                 self_id,
                 static_cast<int>(device::State::Pending)))
+        return true;
+    std::array<std::byte, 8> group;
+    return core.globals.get_blob_to(own_request_group_key, group) &&
+           device::GroupId{group} != _group_id();
+}
+
+bool Devices::_confirm_link() {
+    assert(on_loop());
+    if (!_asking())
         return false;
 
     core.globals.set(confirmed_key, int64_t{1});
@@ -1648,11 +1705,16 @@ void Devices::_forget_confirmation() {
     core.globals.erase(held_admission_hash_key);
 }
 
-bool Devices::_withdraw_own_request() {
-    assert(on_loop());
+void Devices::_forget_own_request() {
     core.globals.erase(own_request_expires_key);
     core.globals.erase(own_request_sas_key);
+    core.globals.erase(own_request_group_key);
     _forget_confirmation();
+}
+
+bool Devices::_withdraw_own_request() {
+    assert(on_loop());
+    _forget_own_request();
     return conn()
             .prepared_maybe_get<int64_t>(
                     "UPDATE devices SET state = ? WHERE unique_id = ? AND state = ? RETURNING id",
@@ -1666,11 +1728,6 @@ Devices::LinkRequestResult Devices::_build_link_request(
         std::span<const std::byte, 32> link_x25519) {
     assert(on_loop());
     auto [info, is_registered] = _device_info();
-
-    if (is_registered)
-        throw std::logic_error{
-                "Cannot build a link request: this device is already registered in the device "
-                "group"};
 
     info.id = self_id;
     info.seqno++;
@@ -1688,13 +1745,14 @@ Devices::LinkRequestResult Devices::_build_link_request(
             reinterpret_cast<const std::byte*>(keys.front().mlkem768_pub.data()),
             info.pk_mlkem768.size());
 
-    // Upsert our own device row with the updated seqno, timestamp, and pubkeys.  The pending link
-    // request is detectable via state=Pending on our own row; needs_push() detects dirty state via
-    // the seqno increment above exceeding pushed_seqno.
+    // Outside a group, our own row moves to Pending with the updated seqno, timestamp, and pubkeys:
+    // Pending is what says we are waiting.  In one, we are asking to switch to another, and stay a
+    // working member of ours, row untouched, until we are admitted.
     auto c = conn();
     auto ver = info.version[0] * 1000000 + info.version[1] * 1000 + info.version[2];
-    c.prepared_exec(
-            R"(INSERT INTO devices
+    if (!is_registered)
+        c.prepared_exec(
+                R"(INSERT INTO devices
                 (unique_id, state, seqno, timestamp, device_type, description, version,
                  pubkey_mlkem768, pubkey_x25519)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1707,15 +1765,15 @@ Devices::LinkRequestResult Devices::_build_link_request(
                    version = excluded.version,
                    pubkey_mlkem768 = excluded.pubkey_mlkem768,
                    pubkey_x25519 = excluded.pubkey_x25519)",
-            self_id,
-            static_cast<int>(device::State::Pending),
-            info.seqno,
-            info.timestamp.time_since_epoch().count(),
-            info.encoded_type(),
-            info.description,
-            ver,
-            info.pk_mlkem768,
-            info.pk_x25519);
+                self_id,
+                static_cast<int>(device::State::Pending),
+                info.seqno,
+                info.timestamp.time_since_epoch().count(),
+                info.encoded_type(),
+                info.description,
+                ver,
+                info.pk_mlkem768,
+                info.pk_x25519);
 
     auto seed = core.globals.account_seed();
     auto plaintext = encode_link_request_plaintext(self_id, info, seed.ed25519_secret());
@@ -2358,9 +2416,7 @@ bool Devices::_renew_device_identity() {
         SQLite::Transaction tx{c.sql};
         _forget_group();
         core.globals.set(dev_key, std::span<const std::byte>{id});
-        core.globals.erase(own_request_expires_key);
-        core.globals.erase(own_request_sas_key);
-        _forget_confirmation();
+        _forget_own_request();
         tx.commit();
     }
 

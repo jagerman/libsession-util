@@ -439,14 +439,21 @@ class Devices final : detail::CoreComponent {
     // Asks the devices of the group `group` to admit this one: uploads a link request for them to
     // accept, and answers once the swarm has stored it.  The request is encrypted to that group, so
     // that only its members can read it; the group must be one this device has seen in the swarm.
-    // The account must already be restored here, and this device not yet in a group.
+    // The account must already be restored here.
     //
-    // What happens next is reported through `callbacks::devices`: `membership_changed(Registered)`
-    // once a device accepts, or `membership_changed(Unregistered)` if `expires` passes first.
+    // A device already in a group may ask to switch to another.  It stays a working member of its
+    // own until admitted, and then leaves it: a departure pushed to the members left, or the old
+    // group's messages deleted if it was the only one.  The old group is dismissed and forgotten,
+    // its account keys included, and the new group's arrive with the message admitting it.
+    //
+    // Either way it is admitted only once a group message admitting it has arrived *and* its user
+    // has confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` --
+    // or, from outside a group, `membership_changed` with what it sees if `expires` passes first.
     // Asking again replaces the request, and its SAS, with a new one.
     //
-    // Fails with `err::already_registered`, `err::network_unavailable`, `err::unknown_group`, or
-    // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
+    // Fails with `err::already_registered` for the group it is already in,
+    // `err::network_unavailable`, `err::unknown_group`, or `err::store_failed` -- the last worth
+    // retrying.  None of them leaves a request outstanding.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting for an answer: stored by the
@@ -636,6 +643,19 @@ class Devices final : detail::CoreComponent {
     // Forgets the user's confirmation and any admission held back for one: both belong to a request
     // that has been replaced, withdrawn, or answered.
     void _forget_confirmation();
+
+    // Forgets our own request -- its deadline, SAS, the group it asked and the user's confirmation
+    // of it -- for one replaced, withdrawn or answered.
+    void _forget_own_request();
+
+    // Whether this device is waiting to be admitted to a group: from outside any group (Pending),
+    // or from inside one, asking to switch to another.
+    bool _asking();
+
+    // Leaves the group this device is in, on its admission to another: a departure pushed to the
+    // old group's other members, or the old group's messages deleted if it had none, and the old
+    // group dismissed and forgotten.  See "Leaving a group to join another".
+    void _leave_group();
 
     bool _confirm_link();
 
