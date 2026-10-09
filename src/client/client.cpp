@@ -818,7 +818,7 @@ void Client::_reconcile_cache(
     // absent from it and dropping it would strand the file it names.
     //
     // A missing thumbnail is the same mistake on a smaller scale -- its bytes are counted in `size`
-    // -- and costs only the thumbnail: the file it was made from is still good.
+    // -- and is simply made again: the file it was made from is still good.
     std::set<std::string> listed{attachments.begin(), attachments.end()};
     std::vector<std::pair<int64_t, std::string>> unlisted, unlisted_thumbs;
     for (auto&& [id, name, thumb] :
@@ -887,6 +887,7 @@ void Client::_reconcile_cache(
             for (auto id : thumbs_gone) {
                 auto showing = _forget_thumbnail(c, id);
                 affected.insert(affected.end(), showing.begin(), showing.end());
+                _queue_thumbnail(id);
             }
             _emit_messages_showing(c, affected);
 
