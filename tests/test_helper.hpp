@@ -466,6 +466,14 @@ class TestHelper {
         return c._cache_path(kind, url);
     }
 
+    /// Whether a Client has no thumbnail queued or being made.  Made on a thread of their own and
+    /// then written and recorded, so this is the only way a test can know that nothing more is
+    /// coming, rather than that nothing has come yet.
+    template <typename Client>
+    static bool thumbnails_idle(Client& c) {
+        return c.core.call_get([&c] { return !c._thumb_running && c._thumb_pending.empty(); });
+    }
+
     /// Drives the database-to-config direction directly, which is what makes the round-trip
     /// assertable: applying a config and then deriving one back has to be the identity, and only a
     /// test can ask for the second half in isolation.

@@ -52,19 +52,19 @@ struct TempClient {
     std::filesystem::path path;
     std::unique_ptr<Client> client;
 
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     explicit TempClient(Opts&&... opts) :
             path{std::filesystem::temp_directory_path() /
                  fmt::format("{}.db", random::unique_id("test_client", 7))},
             client{std::make_unique<Client>(path, std::forward<Opts>(opts)...)} {}
 
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     explicit TempClient(callbacks cbs, Opts&&... opts) :
             path{std::filesystem::temp_directory_path() /
                  fmt::format("{}.db", random::unique_id("test_client", 7))},
             client{std::make_unique<Client>(path, std::move(cbs), std::forward<Opts>(opts)...)} {}
 
-    template <core::CoreOption... Opts>
+    template <ClientOption... Opts>
     void reopen(Opts&&... opts) {
         client.reset();
         client = std::make_unique<Client>(path, std::forward<Opts>(opts)...);
