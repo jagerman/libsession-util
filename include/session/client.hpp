@@ -71,9 +71,10 @@ namespace session::client {
 
 using namespace std::literals;
 
-/// The thumbnail edge used when neither the application nor a stored setting gives one: 240 points
-/// at the 2x density most phones have.
-inline constexpr uint32_t DEFAULT_THUMBNAIL_EDGE = 480;
+/// The thumbnail edge used when neither the application nor a stored setting gives one: the 240
+/// points a tile is drawn at, at 1x.  An application on a denser display passes its own through
+/// `default_thumbnail_edge`.
+inline constexpr uint32_t DEFAULT_THUMBNAIL_EDGE = 240;
 
 /// A Client constructor option: the edge, in pixels, of the attachment thumbnails this Client
 /// makes for as long as none has been stored with `Client::set_thumbnail_edge`.  A stored value
