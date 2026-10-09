@@ -444,12 +444,14 @@ device::map Devices::devices(
     // Encode included states as a bitmask, one bit per State value, so the query string is stable
     // regardless of which states are selected.
     //
-    // `include_unregistered` covers Kicked as well as Unregistered: the two were one state until
-    // the merge rules needed them apart, and a caller asking for devices that are not in the group
-    // means both.  Separating them here is a caller-visible change worth making on its own.
+    // `include_unregistered` covers Left and Kicked as well as Unregistered: they were one state
+    // until the merge rules needed them apart, and a caller asking for devices that are not in the
+    // group means all three.  Separating them here is a caller-visible change worth making on its
+    // own.
     int state_mask = (include_registered ? 1 << static_cast<int>(device::State::Registered) : 0) |
                      (include_pending ? 1 << static_cast<int>(device::State::Pending) : 0) |
                      (include_unregistered ? (1 << static_cast<int>(device::State::Unregistered)) |
+                                                     (1 << static_cast<int>(device::State::Left)) |
                                                      (1 << static_cast<int>(device::State::Kicked))
                                            : 0);
     if (state_mask == 0)
@@ -670,17 +672,20 @@ namespace {
                             "Skipping pending device {} in device group data",
                             oxenc::to_hex(id));
                     continue;
-                } else if (info.state == device::State::Kicked) {
-                    // A kicked device goes in as a bare timestamp: that is how every other device
-                    // learns of the removal, since a record merely absent from a message means
-                    // "unchanged" rather than "removed".
+                } else if (
+                        info.state == device::State::Kicked || info.state == device::State::Left) {
+                    // A removed device goes in as a bare timestamp: that is how every other device
+                    // learns it is gone, since a record merely absent from a message means
+                    // "unchanged" rather than "removed".  Negated for one that left, which is what
+                    // keeps it out of the `kicked` list.
                     //
-                    // TODO: we should stop writing devices kicked a long time ago.  Pruning means
+                    // TODO: we should stop writing devices gone a long time ago.  Pruning means
                     // dropping them from *this payload* and never from the table -- the budget is
                     // on what the message carries, a local row costs nothing, and forgetting one
                     // would lower its rank and let a stale group resurrect the device.
                     assert(info.kicked);
-                    devs.append(id_sv, info.kicked->time_since_epoch().count());
+                    auto t = info.kicked->time_since_epoch().count();
+                    devs.append(id_sv, info.state == device::State::Left ? -t : t);
                     continue;
                 } else if (info.state == device::State::Unregistered) {
                     // Never in the group rather than removed from it, so there is nothing to say
@@ -775,7 +780,7 @@ namespace {
 
     // Decodes the plaintext bt-encoded device group payload.  The returned device map will include
     // both full device records and tombstoned devices: the latter have a mostly default-constructed
-    // Info where only id, state (=State::Kicked), and kicked (=removal timestamp) are set.
+    // Info where only id, state (Kicked or Left), and kicked are set.
     GroupPayload decode_group_payload(std::span<const std::byte> data) {
         GroupPayload result;
 
@@ -799,14 +804,13 @@ namespace {
             info.id = id;
 
             if (devs.is_integer()) {
-                // An integer indicates a "device removed" timestamp, used to distinguish between
-                // "device removed" and "I don't know about the device yet".  It gets pruned when
-                // updating once it hits a certain age threshold.
-                //
-                // If the device wants to get re-added to the group then it must generate a new
-                // device id.
-                info.state = device::State::Kicked;
-                info.kicked.emplace(std::chrono::seconds{devs.consume_integer<int64_t>()});
+                // A tombstone: the time the device was removed, or negated, the time it left.
+                // Either way the id is spent, and the device must generate a new one to come back.
+                auto t = devs.consume_integer<int64_t>();
+                if (t == 0 || t == std::numeric_limits<int64_t>::min())
+                    throw std::runtime_error{"Invalid encoded device data: invalid tombstone"};
+                info.state = t > 0 ? device::State::Kicked : device::State::Left;
+                info.kicked.emplace(std::chrono::seconds{t > 0 ? t : -t});
             } else {
                 // The encoded record itself, rather than what we would make of it again: taking the
                 // view costs nothing here, and re-encoding to hash would.
@@ -1043,27 +1047,28 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     return out;
 }
 
-// Records a device as kicked, inserting a bare tombstone row if we hold no record of it.
+// Records a device as removed (?3 = Kicked) or departed (?3 = Left) at ?1, inserting a bare
+// tombstone row if we hold no record of it.
 //
 // The insert half is what makes a removal durable for a device that joined after it: an update
 // alone matches nothing, stores nothing, and leaves that device free to accept the removed one back
 // into the group.  A tombstone needs no details to do its job -- rank alone settles the merge -- so
 // the columns the schema requires are filled with zeroes and the seqno left at 0, which no record
 // off the wire can be.
-static const std::string KICK_DEVICE_SQL =
+//
+// Ranked like every other merge: Kicked outranks Left outranks any live record, and between two
+// tombstones of one kind the later wins.  Every group message carries every tombstone, so most of
+// these restate what is already held, and only a real change returns a row.
+static const std::string TOMBSTONE_SQL =
         "INSERT INTO devices"
         " (unique_id, state, seqno, timestamp, device_type, description, version,"
         "  pubkey_mlkem768, pubkey_x25519, kicked_timestamp)"
-        " VALUES (?2, {0}, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
+        " VALUES (?2, ?3, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
         " ON CONFLICT(unique_id) DO UPDATE SET"
-        "     state = {0}, kicked_timestamp = excluded.kicked_timestamp,"
-        "     broadcast_needed = CASE WHEN state = {1} THEN 1 ELSE broadcast_needed END"
-        // Every group message carries every tombstone, so most of these restate what is already
-        // held; only a real change should count as one.
-        "   WHERE state != {0} OR kicked_timestamp IS NOT excluded.kicked_timestamp"
-        " RETURNING id"_format(
-                static_cast<int>(device::State::Kicked),
-                static_cast<int>(device::State::Registered));
+        "     state = excluded.state, kicked_timestamp = excluded.kicked_timestamp,"
+        "     broadcast_needed = CASE WHEN state = {} THEN 1 ELSE broadcast_needed END"
+        "   WHERE (excluded.state, excluded.kicked_timestamp) > (state, kicked_timestamp)"
+        " RETURNING id"_format(static_cast<int>(device::State::Registered));
 
 static const std::string REGISTER_DEVICE_SQL =
         "UPDATE devices SET broadcast_needed = 1 WHERE id = ?";
@@ -1088,7 +1093,9 @@ static const std::string ANSWER_REQUEST_SQL =
 // the most recently removed: a tombstone left to age could be evicted while the device it names is
 // still trying to return, either by waiting out the window or by provoking enough other removals to
 // displace it.
-static const std::string REASSERT_KICK_SQL =
+//
+// Applies equally to a device that left: it holds the seed just the same.
+static const std::string REASSERT_TOMBSTONE_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
 void Devices::receive_device_group_message(
@@ -1126,35 +1133,38 @@ void Devices::receive_device_group_message(
     }
 
     for (const auto& [id, info] : payload.devices) {
-        if (info.state == device::State::Kicked) {
+        if (info.state == device::State::Kicked || info.state == device::State::Left) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
-            // device we have never heard of gets a bare tombstone -- see KICK_DEVICE_SQL.
+            // device we have never heard of gets a bare tombstone -- see TOMBSTONE_SQL.
             assert(info.kicked);
             if (c.prepared_maybe_get<int64_t>(
-                        KICK_DEVICE_SQL, info.kicked->time_since_epoch().count(), id))
+                        TOMBSTONE_SQL,
+                        info.kicked->time_since_epoch().count(),
+                        id,
+                        static_cast<int>(info.state)))
                 _devices_changed = true;
             continue;
         }
 
         // A removal is one-way: a device we hold a tombstone for cannot be returned to the group by
         // a record in a message, only by a fresh link request under a new device id.  Anything
-        // claiming otherwise is either a device that was removed and is re-adding itself -- it
-        // still holds the account seed, so it can sign and push whatever it likes -- or a device
-        // relaying such a record.  Either way the answer is to restate the removal rather than to
-        // adopt it.
+        // claiming otherwise is either a device that was removed (or left) and is re-adding itself
+        // -- it still holds the account seed, so it can sign and push whatever it likes -- or a
+        // device relaying such a record.  Either way the answer is to restate the removal rather
+        // than to adopt it.
         //
-        // Asks the state, which now says only this: `Kicked` is removal and nothing else, where
-        // `Unregistered` covers a device that was never in the group -- our own row before the
-        // group is established, and an ignored link request -- both of which must still be able to
-        // register.
-        auto kicked = c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
-                              .value_or(-1) == static_cast<int>(device::State::Kicked);
-        if (kicked) {
+        // Asks the state, which now says only this: Left and Kicked are a device gone and nothing
+        // else, where `Unregistered` covers a device that was never in the group -- our own row
+        // before the group is established, and an ignored link request -- both of which must still
+        // be able to register.
+        auto gone = c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", id)
+                            .value_or(-1) >= static_cast<int>(device::State::Left);
+        if (gone) {
             log::warning(
                     cat,
                     "Device group message tried to restore removed device {}; restating removal",
                     oxenc::to_hex(id));
-            c.prepared_exec(REASSERT_KICK_SQL, epoch_seconds(clock_now_s()), id);
+            c.prepared_exec(REASSERT_TOMBSTONE_SQL, epoch_seconds(clock_now_s()), id);
             _devices_changed = true;
             continue;
         }

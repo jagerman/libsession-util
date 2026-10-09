@@ -10,14 +10,15 @@ CREATE TABLE devices (
     id INTEGER PRIMARY KEY NOT NULL,
     unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 32),
 
-    -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 kicked.  Ordered least to most
-    -- authoritative because merging compares (state, seqno) as a row value -- see device::State.
-    state INTEGER NOT NULL CHECK(state >= 0 AND state <= 3),
+    -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 left, 4 kicked.  Ordered least to
+    -- most authoritative because merging compares (state, seqno) as a row value -- see
+    -- device::State.
+    state INTEGER NOT NULL CHECK(state >= 0 AND state <= 4),
     seqno INTEGER NOT NULL DEFAULT 1,
     pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
     broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
     timestamp INTEGER NOT NULL,
-    kicked_timestamp INTEGER,  -- set when the device was kicked from the device group
+    kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),  -- when the device was removed, or left
     device_type TEXT NOT NULL, -- typically a/i/d (Android/iOS/Desktop), but can be anything
     description TEXT NOT NULL, -- freeform device description
     version INTEGER NOT NULL, -- = 1000000*V + 1000*v + p for version "V.v.p"
@@ -30,9 +31,9 @@ CREATE TABLE devices (
     -- a forgery produces that, so the ordering only has to be consistent, not meaningful.
     digest BLOB CHECK(digest IS NULL OR length(digest) == 8),
 
-    -- A kick is the one state that carries a timestamp, and is meaningless without one, so the two
-    -- are tied together here rather than left to each call site to remember.
-    CHECK((state == 3) == (kicked_timestamp IS NOT NULL))
+    -- The two tombstone states are the only ones that carry a timestamp, and are meaningless without
+    -- one, so the two are tied together here rather than left to each call site to remember.
+    CHECK((state >= 3) == (kicked_timestamp IS NOT NULL))
 ) STRICT;
 
 -- This table holds any extra info not captured by the above.  The data is stored as key/value pairs

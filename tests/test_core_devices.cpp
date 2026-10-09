@@ -736,6 +736,89 @@ TEST_CASE("Devices - a tombstone for an unknown device is kept", "[core][devices
     CHECK(after.description != "back again");
 }
 
+TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][devices]") {
+    TempCore c;
+    auto k = c->devices.rotate_device_keys();
+
+    auto [self, registered] = c->devices.device_info(await);
+    REQUIRE(registered);
+
+    auto deliver = [&](const device::map& m) {
+        TestHelper::receive_device_group_message(
+                c->devices, TestHelper::encrypt_device_data(c->devices, m));
+    };
+    auto state_of = [&](const std::array<std::byte, 32>& id) {
+        auto devs = c->devices.devices(true, true, true);
+        auto found = devs.find(id);
+        REQUIRE(found != devs.end());
+        return found->second;
+    };
+    auto tombstone = [&](const std::array<std::byte, 32>& id, device::State state, auto when) {
+        device::Info t{};
+        t.id = id;
+        t.state = state;
+        t.kicked = when;
+        return t;
+    };
+
+    std::array<std::byte, 32> id;
+    random::fill(id);
+    auto t0 = clock_now_s() - 3h;
+    auto t1 = clock_now_s() - 2h;
+    auto t2 = clock_now_s() - 1h;
+
+    // It leaves.
+    deliver({{self.id, self}, {id, tombstone(id, device::State::Left, t1)}});
+    CHECK(state_of(id).state == device::State::Left);
+    CHECK(state_of(id).kicked == t1);
+
+    // And is written back as a departure: the timestamp negated.
+    auto plaintext = TestHelper::decrypt_device_data(
+            c->devices,
+            TestHelper::encrypt_device_data(c->devices, c->devices.devices(true, true, true)));
+    oxenc::bt_dict_consumer btdc{to_string_view(plaintext)};
+    REQUIRE(btdc.skip_until("D"));
+    auto devs = btdc.consume_dict_consumer();
+    REQUIRE(devs.skip_until(std::string_view{reinterpret_cast<const char*>(id.data()), id.size()}));
+    CHECK(devs.consume_integer<int64_t>() == -t1.time_since_epoch().count());
+
+    // A removal beats it, even one timestamped earlier: a device that left and was then removed
+    // must read as removed everywhere, or it would never be told.
+    deliver({{self.id, self}, {id, tombstone(id, device::State::Kicked, t0)}});
+    CHECK(state_of(id).state == device::State::Kicked);
+    CHECK(state_of(id).kicked == t0);
+
+    // A later departure does not undo it.
+    deliver({{self.id, self}, {id, tombstone(id, device::State::Left, t2)}});
+    CHECK(state_of(id).state == device::State::Kicked);
+    CHECK(state_of(id).kicked == t0);
+
+    // Between removals the later wins, and an older one changes nothing.
+    deliver({{self.id, self}, {id, tombstone(id, device::State::Kicked, t2)}});
+    CHECK(state_of(id).kicked == t2);
+    deliver({{self.id, self}, {id, tombstone(id, device::State::Kicked, t1)}});
+    CHECK(state_of(id).kicked == t2);
+
+    // A device that left cannot re-add itself any more than a removed one can.
+    std::array<std::byte, 32> leaver;
+    random::fill(leaver);
+    deliver({{self.id, self}, {leaver, tombstone(leaver, device::State::Left, t1)}});
+    device::Info returning{};
+    returning.id = leaver;
+    returning.state = device::State::Registered;
+    returning.seqno = 5;
+    returning.timestamp = clock_now_s();
+    returning.description = "back again";
+    returning.type = device::Type::Session_Android;
+    returning.version = {1, 0, 0};
+    returning.pk_x25519 = k.x25519_pub;
+    returning.pk_mlkem768 = k.mlkem768_pub;
+    deliver({{self.id, self}, {leaver, returning}});
+    CHECK(state_of(leaver).state == device::State::Left);
+    CHECK(state_of(leaver).description != "back again");
+    CHECK(state_of(leaver).kicked > t1);
+}
+
 TEST_CASE("Devices - a single-recipient group is readable", "[core][devices]") {
     TempCore c;
 

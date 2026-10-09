@@ -78,11 +78,16 @@ namespace device {
         Registered = 2,  ///< Device is in the account's registered device set.  Outranks Pending so
                          ///< that an acceptance propagates even against a newer link request, which
                          ///< is what lets registration complete at all.
-        Kicked = 3,      ///< Removed from the group, and permanently: a kicked device id can never
-                         ///< rejoin, only be replaced by a fresh one.  Outranks everything, so the
-                         ///< tombstone that carries a removal cannot be undone by a stale record
-                         ///< replaying an earlier state.  Always accompanied by `kicked`, which the
-                         ///< schema enforces.
+        Left = 3,  ///< Left the group of its own accord, to join another.  As permanent as Kicked:
+                   ///< the id can never rejoin this group.  Outranks Registered for the same
+                   ///< reason Kicked does, and is outranked by it, so that a device that left and
+                   ///< was then removed reads as removed everywhere.  Always accompanied by
+                   ///< `kicked`.
+        Kicked = 4,  ///< Removed from the group by another device, and permanently: a kicked device
+                     ///< id can never rejoin, only be replaced by a fresh one.  Outranks
+                     ///< everything, so the tombstone that carries a removal cannot be undone by a
+                     ///< stale record replaying an earlier state.  Always accompanied by `kicked`,
+                     ///< which the schema enforces.
     };
 
     /// What became of a link request this device saw.
@@ -141,9 +146,9 @@ namespace device {
         // Indicates whether the device is registered, pending registration, or not registered.
         State state;
 
-        // For state == State::Unregistered, this timestamp (if set) indicates that the device was
-        // removed from the device group at that timestamp.  It will be nullopt for a device that
-        // was never in the device group.
+        // For State::Kicked, when the device was removed; for State::Left, when it left.  Unset in
+        // every other state.  A removal restated against a device trying to re-add itself moves
+        // this to the restatement, so it is the latest of those rather than the first.
         std::optional<std::chrono::sys_seconds> kicked;
 
         // Application version triplet as reported by the device.  The 2nd and 3rd values will
