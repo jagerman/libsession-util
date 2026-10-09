@@ -456,6 +456,22 @@ TEST_CASE("Devices - account keys", "[core][devices]") {
     }
 }
 
+TEST_CASE(
+        "Devices - a push confirmed after its keys were forgotten distributes no other",
+        "[core][devices]") {
+    TempCore c;
+    auto push = c->devices.build_device_group_message();
+    REQUIRE_FALSE(push.keys.empty());
+
+    // What leaving the group does to them, while the push is still in flight.
+    c->database().conn().prepared_exec("DELETE FROM device_account_keys");
+    c->devices.rotate_account_keys();
+
+    c->devices.mark_device_group_pushed(push, "h");
+    CHECK(c->database().conn().prepared_get<int64_t>(
+                  "SELECT distributed FROM device_account_keys") == 0);
+}
+
 TEST_CASE("Devices - build_link_request", "[core][devices]") {
     // Restored, not generated: asking to join a group only makes sense for a device that adopted
     // an existing account's seed.  A device that generated the account *is* the group.
@@ -2048,6 +2064,11 @@ TEST_CASE("Devices - a new request needs confirming again", "[core][devices][lin
 }
 
 namespace {
+// Counted directly: active_account_keys() mints one when there are none.
+int account_key_count(TempCore& c) {
+    return c->database().conn().prepared_get<int>("SELECT count(*) FROM device_account_keys");
+}
+
 // The code a call failed with, or empty if it did not.
 template <typename F>
 std::string failure_code(F&& f) {
@@ -2066,9 +2087,14 @@ TEST_CASE(
     Linking l;
     auto theirs = l.show_group();
     REQUIRE(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    auto held_before = l.applicant->devices.active_account_keys().front().x25519_pub;
 
     auto mine = l.applicant->devices.start_group(await);
     CHECK(mine != theirs);
+
+    // With a key of its own, not whatever it held before.
+    CHECK(account_key_count(l.applicant) == 1);
+    CHECK(l.applicant->devices.active_account_keys().front().x25519_pub != held_before);
     auto state = l.applicant->devices.membership(await);
     CHECK(state.membership == device::Membership::InGroup);
     CHECK(state.group == mine);
@@ -2117,19 +2143,18 @@ TEST_CASE(
     TestHelper::deliver_device_message(
             *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
     REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
-    auto account_keys = l.applicant->devices.active_account_keys().size();
 
     REQUIRE(l.applicant->devices.renew_device_identity(await));
     CHECK(l.applicant_id() != old_id);
     auto state = l.applicant->devices.membership(await);
     CHECK(state.membership == device::Membership::GroupsVisible);
     CHECK_FALSE(state.group);
-    CHECK(l.applicant->devices.active_account_keys().size() == account_keys);
 
     // Nothing of its old group left to carry into one it starts, or to mistake for the one it
-    // joins.
+    // joins -- its account keys included.
     CHECK(l.applicant->devices.devices(true, true, true).empty());
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(account_key_count(l.applicant) == 0);
 
     // And joins again like any device asking: the new id is not the one the group removed.
     l.ask(in(10min), "L2");

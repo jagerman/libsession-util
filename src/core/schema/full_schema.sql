@@ -136,7 +136,11 @@ END;
 -- group and have their public keys published for remote users to use to encrypt messages.
 -- Unlike device_privkeys, these keys are shared among all devices in the device group.
 CREATE TABLE device_account_keys (
-    id INTEGER PRIMARY KEY NOT NULL,
+    -- AUTOINCREMENT because a device group push names the rows it distributes, and confirming it
+    -- marks them distributed.  Leaving a group deletes every key, so without it a key minted while
+    -- that push was in flight would take a named id and be marked distributed by a message that
+    -- never carried it.
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     created INTEGER NOT NULL,
     rotated INTEGER, -- timestamp when a new key superceded this key
     distributed INTEGER NOT NULL DEFAULT 0,  -- 1 once this key's seed has been included in a confirmed device group push

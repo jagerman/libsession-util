@@ -546,9 +546,10 @@ class Devices final : detail::CoreComponent {
 
     // Gives a removed device a new identity, so that it can ask to join again: a removed id is
     // spent, and can never rejoin the group that removed it.  A new device id and new device keys
-    // replace the old, and what it held of its old group is forgotten, leaving it `GroupsVisible`
-    // or `NoGroup` like any device outside a group.  Its messages, its account's configs and keys,
-    // and the groups it has seen in the swarm are all kept.
+    // replace the old, and what it held of its old group -- its devices and its account keys
+    // included -- is forgotten, leaving it `GroupsVisible` or `NoGroup` like any device outside a
+    // group.  Its messages, the account's configs, and the groups it has seen in the swarm are
+    // kept.
     //
     // Answers false for a device that has not been removed.
     void renew_device_identity(result_function<bool> cb);
@@ -558,7 +559,8 @@ class Devices final : detail::CoreComponent {
     // For `NoGroup`, and for `GroupsVisible`, where the new group is started *alongside* those
     // already there: it replaces and deletes nothing, and their devices are alerted to it, so that
     // a group started by mistake can be undone by joining one of theirs instead.  A device
-    // `Waiting` on a link request withdraws it.
+    // `Waiting` on a link request withdraws it.  The group starts with a newly generated account
+    // key, whatever the device held before.
     //
     // Fails with `err::already_registered` for a device already in a group, `err::removed` for one
     // removed from its group, and `err::membership_unknown` before the first fetch of this run:
@@ -577,6 +579,10 @@ class Devices final : detail::CoreComponent {
     device::MembershipState _membership();
     device::GroupId _start_group();
     bool _renew_device_identity();
+
+    // Forgets everything of the group this device was in: its devices, its messages, its account
+    // keys and its identifier.
+    void _forget_group();
     bool _dismiss_group(const device::GroupId& group);
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.

@@ -2308,6 +2308,18 @@ bool Devices::renew_device_identity(await_t) {
     return jq().call_get([this] { return _renew_device_identity(); });
 }
 
+void Devices::_forget_group() {
+    assert(on_loop());
+    auto c = conn();
+    // Its devices, ourselves included: a group started from these would carry them over as members,
+    // and a group joined says who is in it.  Its account keys, which never carry into another group
+    // -- a group joined brings its own, and a group started mints a fresh one.
+    c.prepared_exec("DELETE FROM devices");
+    c.prepared_exec("DELETE FROM device_group_merged");
+    c.prepared_exec("DELETE FROM device_account_keys");
+    core.globals.erase(group_id_key);
+}
+
 bool Devices::_renew_device_identity() {
     assert(on_loop());
     if (!conn().prepared_maybe_get<int>(
@@ -2324,13 +2336,8 @@ bool Devices::_renew_device_identity() {
     {
         auto c = conn();
         SQLite::Transaction tx{c.sql};
-
-        // All of its old group, ourselves included: a group it went on to start from these would
-        // carry them over as members, and on rejoining, the group it joins says who is in it.
-        c.prepared_exec("DELETE FROM devices");
-        c.prepared_exec("DELETE FROM device_group_merged");
+        _forget_group();
         core.globals.set(dev_key, std::span<const std::byte>{id});
-        core.globals.erase(group_id_key);
         core.globals.erase(own_request_expires_key);
         core.globals.erase(own_request_sas_key);
         _forget_confirmation();
@@ -2378,6 +2385,8 @@ device::GroupId Devices::_start_group() {
         case device::Membership::GroupsVisible: break;
     }
 
+    // Whatever it held before is no group's, and the group starts with a fresh key.
+    _forget_group();
     _mark_group_owed();
     establish_group();
     auto group = _group_id();
