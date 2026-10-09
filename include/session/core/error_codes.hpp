@@ -19,4 +19,8 @@ inline constexpr std::string_view store_failed = "swarm.store_failed";
 /// This device is already in the account's device group, so there is nothing to ask to join.
 inline constexpr std::string_view already_registered = "device.already_registered";
 
+/// No device group with the identifier asked about is in the swarm, as far as this device has seen:
+/// never seen at all, or its messages have since expired.
+inline constexpr std::string_view unknown_group = "device.unknown_group";
+
 }  // namespace session::core::err

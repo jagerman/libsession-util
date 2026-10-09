@@ -12,7 +12,6 @@
 #include <oxen/log/format.hpp>
 #include <oxen/quic/format.hpp>
 #include <ranges>
-#include <session/config/encrypt.hpp>
 #include <session/core.hpp>
 #include <session/core/devices.hpp>
 #include <session/core/error_codes.hpp>
@@ -729,12 +728,19 @@ namespace {
         return std::move(out).str();
     }
 
+    // The signed request: {"I": device id, "i": info dict, "~": signature by the account key}.  The
+    // signature is what stops a request being forged by anyone who merely knows the group's link
+    // key, which is published.
     std::string encode_link_request_plaintext(
-            std::span<const std::byte, 32> device_id, const device::Info& info) {
+            std::span<const std::byte, 32> device_id,
+            const device::Info& info,
+            std::span<const std::byte, 64> ed25519_secret) {
         oxenc::bt_dict_producer out;
-        // "I" (device id) sorts before "i" (info dict)
         out.append("I", device_id);
         encode_device_info(out.append_dict("i"), info);
+        out.append_signature("~", [&](std::span<const std::byte> body) {
+            return ed25519::sign(ed25519_secret, body);
+        });
         return std::move(out).str();
     }
 
@@ -859,6 +865,37 @@ namespace {
     constexpr auto PERS_GROUP_ID_KEY = "SessionDvGrpID_K"_b2b_pers;
     constexpr auto PERS_GROUP_ID_NONCE = "SessionDvGrpID_N"_b2b_pers;
     constexpr auto PERS_GROUP_SAS = "SessionDvGrp_SAS"_b2b_pers;
+    constexpr auto PERS_LINK = "SessionDvGrpLink"_b2b_pers;
+    constexpr auto PERS_LINK_KISS = "SessionDvGrpKISS"_b2b_pers;
+
+    // A link request's key and nonce, from the secret its sender's ephemeral key `E` shares with
+    // the group's link key `X`.
+    struct LinkKey {
+        cleared_b32 key;
+        std::array<std::byte, encryption::XCHACHA20_NONCEBYTES> nonce;
+    };
+    LinkKey link_request_key(
+            std::span<const std::byte, 32> shared,
+            std::span<const std::byte, 32> E,
+            std::span<const std::byte, 32> X) {
+        cleared_array<std::byte, 56> kn;
+        hash::blake2b_pers(kn, PERS_LINK, shared, E, X);
+        LinkKey out;
+        std::ranges::copy(std::span{kn}.first<32>(), out.key.begin());
+        std::ranges::copy(std::span{kn}.last<24>(), out.nonce.begin());
+        return out;
+    }
+
+    // What a link request's key indicator is masked with: the secret `E` shares with the account's
+    // long-term key `S`, so that only a seed holder can tell which group a request is for.
+    std::array<std::byte, 2> link_request_kiss(
+            std::span<const std::byte, 32> shared,
+            std::span<const std::byte, 32> E,
+            std::span<const std::byte, 32> S) {
+        std::array<std::byte, 2> out;
+        hash::blake2b_key_pers(out, shared, PERS_LINK_KISS, E, S);
+        return out;
+    }
 
     // Encrypts or decrypts a group identifier for a message's outer `@` (XChaCha20 being its own
     // inverse): readable by any holder of the account seed, and different in every message to
@@ -1408,12 +1445,12 @@ bool Devices::_names_us_kicked(std::span<const std::byte> data) {
     return false;
 }
 
-void Devices::request_link(result_function<OutgoingLinkRequest> cb) {
-    enqueue([this, cb = std::move(cb)]() mutable {
+void Devices::request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb) {
+    enqueue([this, group, cb = std::move(cb)]() mutable {
         // Everything that can throw comes before the upload takes `cb`, so this reports at most
         // once.
         try {
-            _request_link(cb);
+            _request_link(group, cb);
         } catch (const std::exception& e) {
             detail::log_component_failure(e);
             if (cb)
@@ -1422,7 +1459,8 @@ void Devices::request_link(result_function<OutgoingLinkRequest> cb) {
     });
 }
 
-void Devices::_request_link(result_function<OutgoingLinkRequest>& cb) {
+void Devices::_request_link(
+        const device::GroupId& group, result_function<OutgoingLinkRequest>& cb) {
     assert(on_loop());
 
     // Also what stops a device with no account getting as far as building a request, since a
@@ -1433,7 +1471,15 @@ void Devices::_request_link(result_function<OutgoingLinkRequest>& cb) {
         throw session::error{
                 err::already_registered, "This device is already in the account's device group"};
 
-    auto req = _build_link_request();
+    auto link_x25519 = conn().prepared_maybe_get<sqlite::blob_guts<std::array<std::byte, 32>>>(
+            "SELECT link_x25519 FROM device_groups WHERE group_id = ? AND expires_at > ?",
+            std::span<const std::byte>{group.value},
+            epoch_seconds(clock_now_s()));
+    if (!link_x25519)
+        throw session::error{
+                err::unknown_group, "Cannot request a link: no such group is in the swarm"};
+
+    auto req = _build_link_request(*link_x25519);
     OutgoingLinkRequest sent{.sas = req.sas, .expires = clock_now_s() + LINK_REQUEST_TTL};
     auto which = ++_own_request;
 
@@ -1529,7 +1575,8 @@ bool Devices::_withdraw_own_request() {
             .has_value();
 }
 
-Devices::LinkRequestResult Devices::_build_link_request() {
+Devices::LinkRequestResult Devices::_build_link_request(
+        std::span<const std::byte, 32> link_x25519) {
     assert(on_loop());
     auto [info, is_registered] = _device_info();
 
@@ -1583,30 +1630,47 @@ Devices::LinkRequestResult Devices::_build_link_request() {
             info.pk_mlkem768,
             info.pk_x25519);
 
-    auto plaintext = encode_link_request_plaintext(self_id, info);
-    auto sas_seed = derive_sas_seed(to_span<std::byte>(plaintext));
-
-    // Encrypt the plaintext
-    std::vector<std::byte> encrypted(plaintext.size() + config::ENCRYPT_DATA_OVERHEAD);
-    std::memcpy(encrypted.data(), plaintext.data(), plaintext.size());
     auto seed = core.globals.account_seed();
-    config::encrypt_prealloced(encrypted, seed.seed(), "link-request");
-
-    // Wrap in outer bt-dict: {"": "L", "L": <encrypted>}
-    std::vector<std::byte> out(
-            2                                         // Outer "d" ... "e" delimiters
-            + 5                                       // "0:" + "1:L" (message type indicator)
-            + 3 + bt_bytes_encoded(encrypted.size())  // "1:L" + "NNN:...(encrypted blob)..."
-    );
-    oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
-    o.append("", "L");
-    o.append("L", std::span<const std::byte>{encrypted});
-    assert(o.view().size() == out.size());
+    auto plaintext = encode_link_request_plaintext(self_id, info, seed.ed25519_secret());
+    auto sas_seed = derive_sas_seed(to_span<std::byte>(plaintext));
+    auto out = _encrypt_link_request(to_span(plaintext), link_x25519);
 
     // Now waiting on our own request, which the caller knows: it is the one asking.
     _reported_state = device::State::Pending;
 
     return {std::move(out), sas_seed, sas_from_seed(sas_seed)};
+}
+
+std::vector<std::byte> Devices::_encrypt_link_request(
+        std::span<const std::byte> plaintext, std::span<const std::byte, 32> link_x25519) {
+    // Encrypted to the group being asked, so that only its members can read it -- not every holder
+    // of the seed, which includes any device ever removed.  See "Initiating a device link".
+    auto [E, e] = x25519::keypair();
+    cleared_b32 shared_x, shared_s;
+    const auto& S = core.globals.pubkey_x25519();
+    if (!x25519::scalarmult(shared_x, e, link_x25519) || !x25519::scalarmult(shared_s, e, S))
+        throw std::runtime_error{"Cannot encrypt a link request: degenerate X25519 key"};
+    auto kiss = link_request_kiss(shared_s, E, S);
+    std::array<std::byte, 2> indicator{link_x25519[0] ^ kiss[0], link_x25519[1] ^ kiss[1]};
+
+    auto [key, nonce] = link_request_key(shared_x, E, link_x25519);
+    std::vector<std::byte> encrypted(plaintext.size() + encryption::XCHACHA20_ABYTES);
+    encryption::xchacha20poly1305_encrypt(encrypted, plaintext, nonce, key);
+
+    std::vector<std::byte> out(
+            2                                         // Outer "d" ... "e" delimiters
+            + 5                                       // "0:" + "1:L" (message type indicator)
+            + 3 + bt_bytes_encoded(E.size())          // "1:E" + "32:...(ephemeral pubkey)..."
+            + 3 + bt_bytes_encoded(encrypted.size())  // "1:L" + "NNN:...(encrypted request)..."
+            + 3 + bt_bytes_encoded(indicator.size())  // "1:i" + "2:...(key indicator)..."
+    );
+    oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
+    o.append("", "L");
+    o.append("E", E);
+    o.append("L", std::span<const std::byte>{encrypted});
+    o.append("i", indicator);
+    assert(o.view().size() == out.size());
+    return out;
 }
 
 std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> enc_data) {
@@ -1746,26 +1810,56 @@ std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> e
     return plaintext_devices;
 }
 
-void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expiry) {
-    // Parse outer bt-dict: {"": "L", "L": <encrypted>}
-    oxenc::bt_dict_consumer outer{data};
-    outer.require<std::string_view>("");  // skip type indicator
-    auto encrypted = outer.require_span<std::byte>("L");
+std::optional<std::vector<std::byte>> Devices::_decrypt_link_request(
+        std::span<const std::byte, 32> E,
+        std::span<const std::byte> encrypted,
+        std::span<const std::byte, 2> indicator) {
+    if (encrypted.size() < encryption::XCHACHA20_ABYTES)
+        return std::nullopt;
 
-    // Decrypt using the account seed
-    std::vector<std::byte> plaintext;
-    try {
-        auto seed = core.globals.account_seed();
-        plaintext = config::decrypt(encrypted, seed.seed(), "link-request");
-    } catch (const config::decrypt_error& e) {
-        log::warning(cat, "Ignoring incoming link request: decryption failed: {}", e.what());
+    auto seed = core.globals.account_seed();
+    cleared_b32 shared_s;
+    if (!x25519::scalarmult(shared_s, seed.x25519_key(), E))
+        return std::nullopt;
+    auto kiss = link_request_kiss(shared_s, E, core.globals.pubkey_x25519());
+    std::array<std::byte, 2> prefix{indicator[0] ^ kiss[0], indicator[1] ^ kiss[1]};
+
+    // Any key we still hold, not only the current one: the group may have rotated since the
+    // request's sender read its link key.
+    for (auto account_seed : conn().prepared_results<sqlite::blobn<32>>(
+                 "SELECT seed FROM device_account_keys WHERE substr(pubkey_x25519, 1, 2) = ?",
+                 std::span<const std::byte>{prefix})) {
+        auto keys = keys_from_seed<AccountKeys>(account_seed);
+        cleared_b32 shared_x;
+        if (!x25519::scalarmult(shared_x, keys.x25519_sec, E))
+            continue;
+        auto [key, nonce] = link_request_key(shared_x, E, keys.x25519_pub);
+        std::vector<std::byte> plaintext(encrypted.size() - encryption::XCHACHA20_ABYTES);
+        if (encryption::xchacha20poly1305_decrypt(plaintext, encrypted, nonce, key))
+            return plaintext;
+    }
+    return std::nullopt;
+}
+
+void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expiry) {
+    oxenc::bt_dict_consumer outer{data};
+    outer.require<std::string_view>("");
+    auto E = outer.require_span<std::byte, 32>("E");
+    auto encrypted = outer.require_span<std::byte>("L");
+    auto indicator = outer.require_span<std::byte, 2>("i");
+
+    // Encrypted to one group's link key, so failing here is the ordinary case for a request asking
+    // to join a different group.
+    auto plaintext = _decrypt_link_request(E, encrypted, indicator);
+    if (!plaintext) {
+        log::debug(cat, "Ignoring a link request for a group this device is not in");
         return;
     }
 
-    // Parse plaintext: {"I": <32-byte device id>, "i": {device info dict}}
+    // {"I": device id, "i": device info dict, "~": signature by the account key}
     device::Info info;
     try {
-        oxenc::bt_dict_consumer pt{std::span<const std::byte>{plaintext}};
+        oxenc::bt_dict_consumer pt{std::span<const std::byte>{*plaintext}};
         auto in_id = pt.require_span<unsigned char, 32>("I");
         std::memcpy(info.id.data(), in_id.data(), info.id.size());
 
@@ -1778,6 +1872,15 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
         auto raw = pt.consume_dict_data();
         decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Pending);
         info.digest = hash::blake2b<8>(raw);
+
+        // The group's link key is published, so anything could have encrypted to it; only a seed
+        // holder could have signed.
+        pt.require_signature(
+                "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
+                    if (sig.size() != 64 ||
+                        !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
+                        throw std::runtime_error{"signature verification failed"};
+                });
     } catch (const std::exception& e) {
         log::warning(cat, "Ignoring incoming link request: failed to parse: {}", e.what());
         return;
@@ -1814,7 +1917,7 @@ void Devices::receive_link_request(std::span<const std::byte> data, sys_ms expir
         return;
     }
 
-    auto sas_seed = derive_sas_seed(as_span<std::byte>(std::span{plaintext}));
+    auto sas_seed = derive_sas_seed(std::span<const std::byte>{*plaintext});
 
     // A newer request from the same device replaces the earlier one for the user's purposes, but
     // does not erase it: the older row stays readable as something this device saw.  Marked before

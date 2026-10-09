@@ -605,10 +605,20 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         d.receive_device_group_message(data, hash);
     }
 
-    // A link request as `request_link` builds it, without the upload, for a test that hands it to
-    // another device itself.  Leaves no deadline behind, so the request never lapses on its own.
-    static auto build_link_request(core::Core& core) {
-        return on_loop(core, [&] { return core.devices._build_link_request(); });
+    // A link request as `request_link` builds it, asking to join `member`'s group, without the
+    // upload, for a test that hands it to another device itself.  Leaves no deadline behind, so the
+    // request never lapses on its own.
+    static auto build_link_request(core::Core& core, core::Core& member) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        return on_loop(core, [&] { return core.devices._build_link_request(link_x25519); });
+    }
+
+    // A link request from `core` to `member`'s group carrying arbitrary contents, signed or not.
+    static std::vector<std::byte> encrypt_link_request(
+            core::Core& core, core::Core& member, std::span<const std::byte> plaintext) {
+        auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
+        return on_loop(
+                core, [&] { return core.devices._encrypt_link_request(plaintext, link_x25519); });
     }
 
     static std::optional<core::device::GroupId> group_id(core::Core& core) {

@@ -396,17 +396,18 @@ class Devices final : detail::CoreComponent {
         std::chrono::sys_seconds expires;
     };
 
-    // Asks the account's other devices to admit this one: uploads a link request for them to
-    // accept, and answers once the swarm has stored it.  The account must already be restored here
-    // -- the request is encrypted to its root key -- and this device not yet in its group.
+    // Asks the devices of the group `group` to admit this one: uploads a link request for them to
+    // accept, and answers once the swarm has stored it.  The request is encrypted to that group, so
+    // that only its members can read it; the group must be one this device has seen in the swarm.
+    // The account must already be restored here, and this device not yet in a group.
     //
     // What happens next is reported through `callbacks::devices`: `membership_changed(Registered)`
     // once a device accepts, or `membership_changed(Unregistered)` if `expires` passes first.
     // Asking again replaces the request, and its SAS, with a new one.
     //
-    // Fails with `err::already_registered`, `err::network_unavailable`, or `err::store_failed` --
-    // the last worth retrying.  None of them leaves a request outstanding.
-    void request_link(result_function<OutgoingLinkRequest> cb);
+    // Fails with `err::already_registered`, `err::network_unavailable`, `err::unknown_group`, or
+    // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
+    void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting for an answer: stored by the
     // swarm, not yet accepted, and not past its deadline.  Nothing otherwise -- including while the
@@ -489,13 +490,25 @@ class Devices final : detail::CoreComponent {
         std::array<std::string_view, 21> sas;
     };
 
-    // Builds our link request and moves our own row to Pending.  Throws std::logic_error if this
-    // device is already registered.
-    LinkRequestResult _build_link_request();
+    // Builds our link request, encrypted to the group whose link key is `link_x25519`, and moves
+    // our own row to Pending.  Throws std::logic_error if this device is already registered.
+    LinkRequestResult _build_link_request(std::span<const std::byte, 32> link_x25519);
 
     // Takes the handler by reference and moves from it only once nothing more can throw, so that
     // `request_link` can still report a failure through it.
-    void _request_link(result_function<OutgoingLinkRequest>& cb);
+    void _request_link(const device::GroupId& group, result_function<OutgoingLinkRequest>& cb);
+
+    // The outer link request message carrying `plaintext`, encrypted to the group whose link key is
+    // `link_x25519`; see "Initiating a device link".
+    std::vector<std::byte> _encrypt_link_request(
+            std::span<const std::byte> plaintext, std::span<const std::byte, 32> link_x25519);
+
+    // A link request's signed contents, if it was encrypted to an account key we hold -- which is
+    // to say, if it asks to join our group.
+    std::optional<std::vector<std::byte>> _decrypt_link_request(
+            std::span<const std::byte, 32> E,
+            std::span<const std::byte> encrypted,
+            std::span<const std::byte, 2> indicator);
 
     // Which of our requests is the latest: an upload answering must record, or withdraw, only the
     // request it carried, not one asked for after it.

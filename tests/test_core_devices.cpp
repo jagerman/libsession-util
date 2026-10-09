@@ -1,3 +1,4 @@
+#include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
 #include <oxenc/hex.h>
 #include <sodium/crypto_sign_ed25519.h>
@@ -459,9 +460,10 @@ TEST_CASE("Devices - build_link_request", "[core][devices]") {
     // Restored, not generated: asking to join a group only makes sense for a device that adopted
     // an existing account's seed.  A device that generated the account *is* the group.
     auto c = restored_core();
+    TempCore group;  // only its link key is used, to encrypt to
 
     SECTION("returns non-empty message and 21-entry SAS") {
-        auto result = TestHelper::build_link_request(*c);
+        auto result = TestHelper::build_link_request(*c, *group);
         CHECK_FALSE(result.message.empty());
         CHECK(result.sas.size() == 21);
         for (const auto& s : result.sas)
@@ -469,8 +471,8 @@ TEST_CASE("Devices - build_link_request", "[core][devices]") {
     }
 
     SECTION("consecutive calls produce different messages") {
-        auto r1 = TestHelper::build_link_request(*c);
-        auto r2 = TestHelper::build_link_request(*c);
+        auto r1 = TestHelper::build_link_request(*c, *group);
+        auto r2 = TestHelper::build_link_request(*c, *group);
         CHECK(r1.message != r2.message);
     }
 }
@@ -906,9 +908,23 @@ struct Linking {
     ask(std::chrono::sys_seconds expiry = std::chrono::floor<std::chrono::seconds>(clock_now_s()) +
                                           10min,
         std::string hash = "L1") {
-        auto req = TestHelper::build_link_request(*applicant);
+        auto req = TestHelper::build_link_request(*applicant, *core);
         TestHelper::deliver_device_message(*core, req.message, expiry, std::move(hash));
         return req;
+    }
+
+    // The existing device's group, as the applicant sees it once it has fetched a group message:
+    // what it asks to join.
+    device::GroupId show_group() {
+        TestHelper::deliver_device_message(
+                *applicant,
+                core->devices.build_device_group_message().message,
+                std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min,
+                "G0",
+                /*is_final=*/false);
+        auto group = TestHelper::group_id(*core);
+        REQUIRE(group);
+        return *group;
     }
 
     device::Info state_of_applicant() {
@@ -1112,7 +1128,7 @@ TEST_CASE(
         "Devices events - nothing is announced before the first fetch",
         "[core][devices][linking][events]") {
     Linking l;
-    auto req = TestHelper::build_link_request(*l.applicant);
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
 
     // Stored, as a request left over from before a restart would be, but the swarm not yet asked.
     TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1", /*is_final=*/false);
@@ -1131,7 +1147,7 @@ TEST_CASE(
         "Devices events - a request the application already read is not announced",
         "[core][devices][linking][events]") {
     Linking l;
-    auto req = TestHelper::build_link_request(*l.applicant);
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
     TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1", /*is_final=*/false);
 
     // Drawn from before the fetch: the application has it, so the fetch must not hand it over
@@ -1145,9 +1161,9 @@ TEST_CASE(
         "Devices events - a request read after it closed is not reported closed",
         "[core][devices][linking][events]") {
     Linking l;
-    auto first = TestHelper::build_link_request(*l.applicant);
+    auto first = TestHelper::build_link_request(*l.applicant, *l.core);
     TestHelper::deliver_device_message(*l.core, first.message, in(10min), "L1", /*is_final=*/false);
-    auto second = TestHelper::build_link_request(*l.applicant);
+    auto second = TestHelper::build_link_request(*l.applicant, *l.core);
     TestHelper::deliver_device_message(
             *l.core, second.message, in(10min), "L2", /*is_final=*/false);
 
@@ -1217,7 +1233,7 @@ TEST_CASE(
         "Devices events - a deadline closes the prompt with no fetch to notice it",
         "[core][devices][linking][events]") {
     Linking l;
-    auto req = TestHelper::build_link_request(*l.applicant);
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
     TestHelper::deliver_device_message(*l.core, req.message, clock_now_ms() + 1500ms, "L1");
     auto id = l.events.added.at(0).id;
 
@@ -1229,7 +1245,7 @@ TEST_CASE(
         "Devices events - a request read rather than announced still closes at its deadline",
         "[core][devices][linking][events]") {
     Linking l;
-    auto req = TestHelper::build_link_request(*l.applicant);
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
     TestHelper::deliver_device_message(
             *l.core, req.message, clock_now_ms() + 1500ms, "L1", /*is_final=*/false);
     auto id = l.core->devices.incoming_link_requests(await).at(0).id;
@@ -1319,10 +1335,15 @@ using Asked = std::optional<Expected<Devices::OutgoingLinkRequest>>;
 
 // Asks for a link from `c` and runs the job, so that the upload has been sent by the time this
 // returns.  What it answers lands in `into`, once the upload is answered.
-void request_link(TempCore& c, Asked& into) {
+void request_link(TempCore& c, const device::GroupId& group, Asked& into) {
     c->devices.request_link(
-            [&into](Expected<Devices::OutgoingLinkRequest> r) { into = std::move(r); });
+            group, [&into](Expected<Devices::OutgoingLinkRequest> r) { into = std::move(r); });
     TestHelper::drain(*c);
+}
+
+// The applicant asks to join the existing device's group, having first seen it in the swarm.
+void request_link(Linking& l, Asked& into) {
+    request_link(l.applicant, l.show_group(), into);
 }
 
 bool same(const Devices::OutgoingLinkRequest& a, const Devices::OutgoingLinkRequest& b) {
@@ -1366,7 +1387,7 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked got;
-    request_link(l.applicant, got);
+    request_link(l, got);
 
     auto sent = pushes(*net);
     REQUIRE(sent.size() == 1);
@@ -1410,7 +1431,7 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked got;
-    request_link(l.applicant, got);
+    request_link(l, got);
     answer_upload(l.applicant, *net, false);
 
     REQUIRE(got);
@@ -1430,8 +1451,8 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked first, second;
-    request_link(l.applicant, first);
-    request_link(l.applicant, second);
+    request_link(l, first);
+    request_link(l, second);
 
     answer_upload(l.applicant, *net, false);
     REQUIRE(first);
@@ -1453,12 +1474,12 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked first, second;
-    request_link(l.applicant, first);
+    request_link(l, first);
     answer_upload(l.applicant, *net, true);
     REQUIRE(l.applicant->devices.outgoing_link_request(await));
 
     // Its SAS is about to be superseded, so it must not be what a redraw shows in the meantime.
-    request_link(l.applicant, second);
+    request_link(l, second);
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
 
     answer_upload(l.applicant, *net, true);
@@ -1476,7 +1497,7 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked got;
-    request_link(l.applicant, got);
+    request_link(l, got);
     answer_upload(l.applicant, *net, true);
     REQUIRE(got);
     REQUIRE(got->has_value());
@@ -1507,7 +1528,7 @@ TEST_CASE(
     Linking l;
     auto* net = attach_mock_network(*l.applicant);
     Asked got;
-    request_link(l.applicant, got);
+    request_link(l, got);
     answer_upload(l.applicant, *net, true);
     REQUIRE(got);
     REQUIRE(got->has_value());
@@ -1532,7 +1553,7 @@ TEST_CASE(
     Linking l;
     attach_mock_network(*l.applicant);
     Asked got;
-    request_link(l.applicant, got);
+    request_link(l, got);
     REQUIRE(own_state(l.applicant) == device::State::Pending);
 
     restart_applicant(l);
@@ -1550,7 +1571,7 @@ TEST_CASE(
     Asked got;
 
     SECTION("no network") {
-        request_link(l.applicant, got);
+        request_link(l, got);
         REQUIRE(got);
         REQUIRE_FALSE(got->has_value());
         CHECK(got->error().code == err::network_unavailable);
@@ -1559,7 +1580,7 @@ TEST_CASE(
 
     SECTION("already registered") {
         attach_mock_network(*l.core);
-        request_link(l.core, got);
+        request_link(l.core, *TestHelper::group_id(*l.core), got);
         REQUIRE(got);
         REQUIRE_FALSE(got->has_value());
         CHECK(got->error().code == err::already_registered);
@@ -1698,6 +1719,88 @@ TEST_CASE(
     REQUIRE(seen.size() == 1);
     CHECK(seen.begin()->second.description != "changed");
     CHECK(TestHelper::group_id(*l.applicant) == ours);
+}
+
+TEST_CASE(
+        "Devices - a link request is readable only by the group it asks to join",
+        "[core][devices][linking]") {
+    Linking l;
+
+    // A seed holder outside the group -- what a removed device is.  It must learn nothing from a
+    // request: not the applicant's keys, not its SAS, not that there is one.
+    DeviceEventsRecorder outsider_events;
+    TempCore outsider{
+            core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
+            Linking::reporting_to(outsider_events)};
+
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
+    TestHelper::deliver_device_message(*outsider, req.message, in(10min), "L1");
+    CHECK(outsider_events.added.empty());
+    CHECK(outsider->devices.link_requests(await).empty());
+
+    // Nor does the key indicator say which group's key the request is for, to anyone without the
+    // seed: the group's key is visible in its messages, and a bare prefix of it would match.
+    oxenc::bt_dict_consumer outer{req.message};
+    auto indicator = outer.require_span<std::byte, 2>("i");
+    auto key = l.core->devices.active_account_keys().front().x25519_pub;
+    CHECK_FALSE((indicator[0] == key[0] && indicator[1] == key[1]));
+
+    TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1");
+    REQUIRE(l.events.added.size() == 1);
+    CHECK(l.events.added[0].sas == req.sas);
+}
+
+TEST_CASE(
+        "Devices - a link request not signed by the account is not prompted for",
+        "[core][devices][linking]") {
+    Linking l;
+    auto k = l.applicant->devices.active_device_keys().front();
+
+    // A request anything could encrypt, since the group's link key is published.
+    auto request = [&](std::optional<std::span<const std::byte, 64>> signer) {
+        oxenc::bt_dict_producer out;
+        out.append("I", l.applicant_id());
+        {
+            auto i = out.append_dict("i");
+            i.append("#", 1);
+            i.append("@", epoch_seconds(clock_now_s()));
+            i.append("M", k.mlkem768_pub);
+            i.append("X", k.x25519_pub);
+        }
+        if (signer)
+            out.append_signature("~", [&](std::span<const std::byte> body) {
+                return ed25519::sign(*signer, body);
+            });
+        auto s = std::move(out).str();
+        return TestHelper::encrypt_link_request(*l.applicant, *l.core, to_span(s));
+    };
+
+    b32 other_pk;
+    b64 other_sk;
+    ed25519::keypair(other_pk, other_sk);
+
+    TestHelper::deliver_device_message(*l.core, request(std::nullopt), in(10min), "L1");
+    TestHelper::deliver_device_message(*l.core, request(other_sk), in(10min), "L2");
+    CHECK(l.events.added.empty());
+
+    // The same request, signed as the account: so it was the signature that was missing above.
+    auto seed = l.applicant->globals.account_seed();
+    TestHelper::deliver_device_message(*l.core, request(seed.ed25519_secret()), in(10min), "L3");
+    CHECK(l.events.added.size() == 1);
+}
+
+TEST_CASE(
+        "Devices - a link request survives the group rotating its key",
+        "[core][devices][linking]") {
+    Linking l;
+
+    // Asked on the key the applicant last saw, which the group has since moved on from.
+    auto req = TestHelper::build_link_request(*l.applicant, *l.core);
+    l.core->devices.rotate_account_keys();
+
+    TestHelper::deliver_device_message(*l.core, req.message, in(10min), "L1");
+    REQUIRE(l.events.added.size() == 1);
+    CHECK(l.events.added[0].sas == req.sas);
 }
 
 TEST_CASE(
