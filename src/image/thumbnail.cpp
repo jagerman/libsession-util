@@ -84,7 +84,8 @@ namespace detail {
 
         // Scaled to cover side x side and cropped to its centre.  vips_thumbnail applies EXIF
         // orientation, loads only the first frame of an animation, and shrinks on load where the
-        // format allows (JPEG, WebP, HEIF), so a 12 MP photo is never decoded at full size.
+        // format allows (JPEG, WebP, HEIF), so a 12 MP photo is never decoded at full size.  It
+        // converts from an embedded ICC profile only when given an output profile.
         image_ptr cover(Source& source, const Info& info, uint32_t side) {
             VipsImage* out = nullptr;
             int rc;
@@ -105,6 +106,8 @@ namespace detail {
                         static_cast<int>(side),
                         "crop",
                         VIPS_INTERESTING_CENTRE,
+                        "output_profile",
+                        "srgb",
                         nullptr);
             } else {
                 VipsSource* vsrc = source_access::vips(source);
@@ -120,6 +123,8 @@ namespace detail {
                         static_cast<int>(side),
                         "crop",
                         VIPS_INTERESTING_CENTRE,
+                        "output_profile",
+                        "srgb",
                         nullptr);
                 source_access::rethrow_error(source);
             }

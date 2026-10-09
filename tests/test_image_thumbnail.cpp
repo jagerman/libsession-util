@@ -142,6 +142,26 @@ TEST_CASE("thumbnail makes a square JPEG with no metadata", "[image][thumbnail]"
     CHECK(img->Bands == 3);
 }
 
+TEST_CASE("thumbnail converts a wide-gamut picture to sRGB", "[image][thumbnail]") {
+    // sRGB's pure red, in Display P3's numbers: drawn as if they were sRGB, a duller red.
+    auto photo = draw(64, 64, [](int, int) { return rgba{234, 51, 35, 255}; });
+    VipsBlob* p3;
+    REQUIRE(vips_profile_load("p3", &p3, nullptr) == 0);
+    REQUIRE(p3);
+    size_t len;
+    auto* icc = vips_blob_get(p3, &len);
+    vips_image_set_blob_copy(photo.get(), VIPS_META_ICC_NAME, icc, len);
+    vips_area_unref(VIPS_AREA(p3));
+    auto jpeg = save(photo.get(), ".jpg");
+    REQUIRE(has_marker(jpeg, 0xE2));
+
+    auto out = thumb(jpeg, 32);
+    REQUIRE(out);
+    CHECK_FALSE(has_marker(*out, 0xE2));
+    auto img = decode_jpeg(*out);
+    CHECK(near(pixel(img.get(), 16, 16), RED, 8));
+}
+
 TEST_CASE("thumbnail edge is clamped and never upscales", "[image][thumbnail]") {
     auto big = save(draw(2000, 1500, [](int, int) { return BLUE; }).get(), ".jpg");
     auto small = save(draw(50, 40, [](int, int) { return BLUE; }).get(), ".png");
