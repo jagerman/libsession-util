@@ -28,6 +28,9 @@ inline constexpr std::string_view no_thumbnail = "attachment.no_thumbnail";
 /// be sent.
 inline constexpr std::string_view attachment_file_missing = "attachment.file_missing";
 
+/// The file is not in the cache, which is all that `Client::attachment_data_cached` reads.
+inline constexpr std::string_view not_cached = "file.not_cached";
+
 /// The file server does not have the file: it has expired, or was never there.  Only the sender
 /// sending it again fixes this.  Matches `AttachmentAvailability::not_found`.
 inline constexpr std::string_view file_not_found = "file.not_found";

@@ -1277,28 +1277,25 @@ void Client::_attachment_data(
             err::attachment_not_found, "Message {} has no attachment {}"_format(message_id, index)};
 }
 
-void Client::attachment_thumbnail(
-        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
-    call([this, message_id, index, cb = std::move(cb)]() mutable {
+void Client::_answer_bytes(
+        std::function<void(bytes_answer)> start, result_function<std::vector<std::byte>> cb) {
+    call([this, start = std::move(start), cb = std::move(cb)]() mutable {
         try {
-            _attachment_thumbnail(message_id, index, [this, cb](auto answer) mutable {
-                _report(cb, std::move(answer));
-            });
+            start([this, cb](auto answer) mutable { _report(cb, std::move(answer)); });
         } catch (const std::exception& e) {
             _fail<std::vector<std::byte>>(cb, error_from(e));
         }
     });
 }
 
-std::vector<std::byte> Client::attachment_thumbnail(int64_t message_id, size_t index, await_t) {
+std::vector<std::byte> Client::_await_bytes(std::function<void(bytes_answer)> start) {
     // Answered straight from Core's loop rather than through the dispatcher, which may be the
     // very thread blocked here.
     auto answer = std::make_shared<std::promise<Expected<std::vector<std::byte>>>>();
     auto future = answer->get_future();
-    call([this, message_id, index, answer] {
+    call([start = std::move(start), answer] {
         try {
-            _attachment_thumbnail(
-                    message_id, index, [answer](auto r) { answer->set_value(std::move(r)); });
+            start([answer](auto r) { answer->set_value(std::move(r)); });
         } catch (const std::exception& e) {
             answer->set_value(unexpected{error_from(e)});
         }
@@ -1309,16 +1306,89 @@ std::vector<std::byte> Client::attachment_thumbnail(int64_t message_id, size_t i
     return *std::move(r);
 }
 
+void Client::attachment_thumbnail(
+        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
+    _answer_bytes(
+            [this, message_id, index](bytes_answer done) {
+                _attachment_thumbnail(message_id, index, std::move(done));
+            },
+            std::move(cb));
+}
+std::vector<std::byte> Client::attachment_thumbnail(int64_t message_id, size_t index, await_t) {
+    return _await_bytes([this, message_id, index](bytes_answer done) {
+        _attachment_thumbnail(message_id, index, std::move(done));
+    });
+}
+
+void Client::attachment_data_cached(
+        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
+    _answer_bytes(
+            [this, message_id, index](bytes_answer done) {
+                _attachment_data_cached(message_id, index, std::move(done));
+            },
+            std::move(cb));
+}
+std::vector<std::byte> Client::attachment_data_cached(int64_t message_id, size_t index, await_t) {
+    return _await_bytes([this, message_id, index](bytes_answer done) {
+        _attachment_data_cached(message_id, index, std::move(done));
+    });
+}
+
+static session::error not_cached(int64_t message_id, size_t index) {
+    return session::error{
+            err::not_cached,
+            "Attachment {} of message {} is not in the cache"_format(index, message_id)};
+}
+
+void Client::_attachment_data_cached(int64_t message_id, size_t index, bytes_answer done) {
+    auto c = core.database().conn();
+    auto url = c.prepared_maybe_get<std::optional<std::string>>(
+            "SELECT url FROM message_attachments WHERE message = ? AND idx = ?",
+            message_id,
+            static_cast<int64_t>(index));
+    if (!url)
+        throw_missing_attachment(c, message_id, index);
+    auto entry = *url && !_cache_dir.empty() ? _cached_entry(c, **url) : std::nullopt;
+    if (!entry)
+        throw not_cached(message_id, index);
+
+    _post_disk([this,
+                file = _cache_dir / cache::ATTACHMENT_DIR / entry->second,
+                key = _cache_encryption_key(),
+                entry = std::move(*entry),
+                message_id,
+                index,
+                done = std::move(done)]() mutable {
+        auto bytes = cache::read(file, key);
+        call([this,
+              entry = std::move(entry),
+              message_id,
+              index,
+              bytes = std::move(bytes),
+              done = std::move(done)]() mutable {
+            if (bytes) {
+                _touch_cached(entry.first);
+                return done(std::move(*bytes));
+            }
+            // Missing, or unreadable and so removed by the read: the entry indexes nothing now.
+            // Only while it is still this entry, since an eviction and a new download meanwhile
+            // would have put a different file under the same name.
+            auto c = core.database().conn();
+            if (c.prepared_get<int64_t>(
+                        "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE id = ?)", entry.first))
+                _emit_messages_showing(c, _drop_cached(c, entry.first, entry.second));
+            done(unexpected{not_cached(message_id, index).err()});
+        });
+    });
+}
+
 static session::error no_thumbnail(int64_t message_id, size_t index) {
     return session::error{
             err::no_thumbnail,
             "Attachment {} of message {} has no thumbnail"_format(index, message_id)};
 }
 
-void Client::_attachment_thumbnail(
-        int64_t message_id,
-        size_t index,
-        std::function<void(Expected<std::vector<std::byte>>)> done) {
+void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answer done) {
     auto c = core.database().conn();
     auto st = c.prepared_bind(
             R"(

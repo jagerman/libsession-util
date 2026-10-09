@@ -3846,3 +3846,97 @@ TEST_CASE(
     CHECK(std::filesystem::is_empty(out.path));
     CHECK(partial_cache_files(dir.path).empty());
 }
+
+TEST_CASE("Client: a cache-only read never fetches", "[client][attachments][cache]") {
+    ScopedClockOffset clock{0s};
+    TempCacheDir dir;
+    TempClient c;
+    SenderKeys peer;
+    auto* net = attach_mock_network(c->core);
+    c->set_cache_dir(dir.path);
+    auto convo = ConversationId::dm(peer.session_id);
+    c->open_dm(convo, await);
+
+    auto seed = random::random(32);
+    std::vector<std::byte> data(3000);
+    random::fill(data);
+    auto [ct, key] = attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT);
+    net->served["f"] = ct;
+    auto url = network::file_server::generate_download_url("f", {}, true);
+    auto arrive = [&](std::string hash) {
+        deliver(*c,
+                peer,
+                "",
+                from_epoch_ms(1000),
+                std::move(hash),
+                "",
+                std::nullopt,
+                [&](SessionProtos::DataMessage& d) {
+                    auto* a = d.add_attachments();
+                    a->set_id(1);
+                    a->set_url(url);
+                    a->set_key(std::string{reinterpret_cast<const char*>(key.data()), key.size()});
+                    a->set_size(data.size());
+                    a->set_contenttype("application/pdf");
+                });
+        sync(*c);
+        return c->conversation(convo, await)->messages(await)[0].id;
+    };
+    auto code = [&](int64_t id, size_t index) -> std::optional<std::string_view> {
+        try {
+            c->attachment_data_cached(id, index, await);
+        } catch (const session::error& e) {
+            return e.err().code;
+        }
+        return std::nullopt;
+    };
+    auto rows = [&] {
+        return c->core.loop().call_get([&] {
+            return c->core.database().conn().prepared_get<int64_t>(
+                    "SELECT count(*) FROM attachment_cache");
+        });
+    };
+
+    // Not cached, with nothing set to fetch it: refused, and nothing is asked of the network.
+    auto id = arrive("h1");
+    CHECK(code(id, 0) == err::not_cached);
+    CHECK(code(id, 1) == err::attachment_not_found);
+    CHECK(code(id + 100, 0) == err::message_not_found);
+    sync(*c);
+    CHECK(net->downloads.empty());
+
+    // Cached: the bytes, from disk, and the entry marked used.
+    REQUIRE(c->save_attachment(id, 0, dir.path / "copy", nullptr, nullptr));
+    sync(*c);
+    REQUIRE(serve_downloads(*net) == 1);
+    sync(*c);
+    REQUIRE(c->message(id, await)->attachments[0].availability == AttachmentAvailability::cached);
+    auto used = [&] {
+        return c->core.loop().call_get([&] {
+            return c->core.database().conn().prepared_get<int64_t>(
+                    "SELECT last_used FROM attachment_cache");
+        });
+    };
+    auto before = used();
+    AdjustedClock::set_offset(10s);
+    CHECK(!!(c->attachment_data_cached(id, 0, await) == data));
+    CHECK(used() > before);
+
+    // The handler form answers the same.
+    std::promise<Expected<std::vector<std::byte>>> got;
+    c->attachment_data_cached(id, 0, [&](auto r) { got.set_value(std::move(r)); });
+    auto r = got.get_future().get();
+    REQUIRE(r);
+    CHECK(!!(*r == data));
+    CHECK(net->downloads.empty());
+
+    // Unreadable: removed, row and file, and refused as not cached rather than fetched.
+    auto file = TestHelper::cache_path(*c, cache::ATTACHMENT_DIR, url);
+    std::ofstream{file, std::ios::binary | std::ios::trunc} << "not what was cached";
+    CHECK(code(id, 0) == err::not_cached);
+    sync(*c);
+    CHECK(rows() == 0);
+    CHECK_FALSE(std::filesystem::exists(file));
+    CHECK(c->message(id, await)->attachments[0].availability == AttachmentAvailability::absent);
+    CHECK(net->downloads.empty());
+}
