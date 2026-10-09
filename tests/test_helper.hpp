@@ -629,7 +629,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     // request never lapses on its own.
     static auto build_link_request(core::Core& core, core::Core& member) {
         auto link_x25519 = member.devices.active_account_keys().front().x25519_pub;
-        return on_loop(core, [&] { return core.devices._build_link_request(link_x25519); });
+        auto group = *group_id(member);
+        return on_loop(core, [&] { return core.devices._build_link_request(group, link_x25519); });
     }
 
     // A link request from `core` to `member`'s group carrying arbitrary contents, signed or not.

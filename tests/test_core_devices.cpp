@@ -2140,6 +2140,102 @@ TEST_CASE("Devices - a new request needs confirming again", "[core][devices][lin
     CHECK(own_state(l.applicant) == device::State::Registered);
 }
 
+TEST_CASE(
+        "Devices - an admission after the request lapsed here still waits for the user",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.applicant);
+    Asked got;
+    request_link(l, got);
+    auto message = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    TestHelper::deliver_device_message(*l.core, message, in(20min), "L1");
+    l.applicant_events.membership.clear();
+
+    // Lapsed here, by the timer, before the acceptance reached this device.
+    ScopedClockOffset later{Devices::LINK_REQUEST_TTL + 1s};
+    TestHelper::finish_fetch(*l.applicant);
+    REQUIRE(eventually(*l.applicant, [&] { return !l.applicant_events.membership.empty(); }));
+    REQUIRE(l.applicant_events.membership.back() == device::Membership::GroupsVisible);
+
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+
+    // Not taken: any holder of the seed could have sent it.  Back to waiting, on the user.
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Waiting);
+    CHECK(l.applicant_events.membership.back() == device::Membership::Waiting);
+    auto shown = l.applicant->devices.outgoing_link_request(await);
+    REQUIRE(shown);
+    CHECK(shown->accepted);
+    CHECK(shown->sas == (**got).sas);
+
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+}
+
+TEST_CASE(
+        "Devices - an admission on no request of this device's is not taken",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    l.ask();
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+
+    // As though it had never asked: what an impostor's group, admitting it unbidden, looks like.
+    auto id = l.applicant_id();
+    TestHelper::on_loop(*l.applicant, [&] {
+        auto c = l.applicant->database().conn();
+        c.prepared_exec("DELETE FROM device_own_requests");
+        c.prepared_exec(
+                "UPDATE devices SET state = ? WHERE unique_id = ?",
+                static_cast<int>(device::State::Unregistered),
+                id);
+        return 0;
+    });
+
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    CHECK(own_state(l.applicant) == device::State::Unregistered);
+    CHECK_FALSE(l.applicant->devices.confirm_link(await));
+}
+
+TEST_CASE(
+        "Devices - asking again does not lose an earlier request accepted meanwhile",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    l.ask();
+
+    SECTION("confirmed before asking again: it admits the device") {
+        REQUIRE(l.applicant->devices.confirm_link(await));
+        REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+        l.ask(in(10min), "L2");  // never reaches the accepting device
+
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G1");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    }
+
+    SECTION("never confirmed: the user is looking at the newer one, which must admit it instead") {
+        REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+        auto second = TestHelper::build_link_request(*l.applicant, *l.core);
+
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G1");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::Waiting);
+        REQUIRE(l.applicant->devices.confirm_link(await));
+        CHECK(own_state(l.applicant) == device::State::Pending);
+    }
+}
+
 namespace {
 // Counted directly: active_account_keys() mints one when there are none.
 int account_key_count(TempCore& c) {

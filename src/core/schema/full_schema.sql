@@ -121,6 +121,31 @@ CREATE TABLE device_groups (
     dismissed INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
+-- The link requests this device has sent, so that a group message admitting it can be matched to
+-- the request it accepted.  A device can ask more than once -- again after a request seemed to go
+-- unanswered, say -- and any of them may be the one accepted, possibly after its deadline here has
+-- passed.  The user must have confirmed the SAS of that very request, since that is what the
+-- accepting device showed; an admission matching none of them is not ours to take, since any holder
+-- of the account seed could have sent it.
+CREATE TABLE device_own_requests (
+    id INTEGER PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    -- With the X25519 key, what identifies the request in an admission: the record admitted is the
+    -- one the request carried.  Unique because each request is stamped later than the one before.
+    timestamp INTEGER UNIQUE NOT NULL,
+    pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
+    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
+    expires_at INTEGER,  -- when the swarm drops it; NULL until the swarm confirms storing it
+    confirmed INTEGER NOT NULL DEFAULT 0,  -- the user said the SAS matched, through confirm_link
+    -- A group message admitting us on this request before the user confirmed it, held until they
+    -- do, with the hash and swarm timestamp (unix milliseconds) it arrived with: a fetch delivers a
+    -- message only once.
+    admission BLOB,
+    admission_hash TEXT,
+    admission_at INTEGER,
+    CHECK((admission IS NULL) == (admission_at IS NULL))
+) STRICT;
+
 -- This table holds current and recent device private keys for *this* device, including the
 -- timestamp then the device keypairs were created, and when they were rotated away from.
 CREATE TABLE device_privkeys (

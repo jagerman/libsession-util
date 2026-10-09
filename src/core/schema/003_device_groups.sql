@@ -117,3 +117,17 @@ CREATE TABLE device_groups (
     expires_at INTEGER NOT NULL,
     dismissed INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+
+CREATE TABLE device_own_requests (
+    id INTEGER PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    timestamp INTEGER UNIQUE NOT NULL,
+    pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
+    sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
+    expires_at INTEGER,
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    admission BLOB,
+    admission_hash TEXT,
+    admission_at INTEGER,
+    CHECK((admission IS NULL) == (admission_at IS NULL))
+) STRICT;

@@ -120,6 +120,13 @@ live. If the deadline passes unanswered, `membership_changed` reports the device
 `GroupsVisible`/`NoGroup`; offer to try again. Asking again replaces the request with one that has
 a new SAS, which needs confirming again.
 
+An approval can arrive after the deadline has passed here: the other device approved in time, but
+this one fetched the message late. Then `membership_changed(Waiting)` comes back, and
+`outgoing_link_request()` returns that request with `accepted` set, past its `expires`. Show it
+without the countdown: "Your other device approved this. Do these emoji match what it showed?"
+Joining still needs `confirm_link`. If the user had already confirmed a request and then asked
+again, an approval of the earlier one still admits the device; libsession sorts that out.
+
 **Why the confirmation on the new device matters.** Anyone who holds the account's recovery phrase
 (a removed device, a stolen backup) can publish a fake group. A device that asks *that* group to
 let it in would be admitted by the impostor, and from the new device alone that looks exactly like

@@ -640,6 +640,22 @@ cannot read such a request at all, and so never prompts for it.  Asking the user
 requesting device closes this: the user confirms only having seen the same SAS on one of their own
 devices, which happens only if the request reached the real group.
 
+The confirmation belongs to one request, so an admission is matched to the request it accepted: the
+record it admits is the one that request carried, identified by its timestamp and X25519 key.  A
+device stamps each of its requests later than the one before, so no two carry the same record.  It
+keeps its requests for as long as an admission accepting one could still be in the swarm, and:
+
+- an admission matching none of them is ignored: the device asked for nothing that it answers;
+- one matching a request the user confirmed admits the device;
+- one matching the device's newest request, unconfirmed, is held until the user confirms it --
+  even past that request's deadline, since the acceptance came in time and only the message
+  carrying it arrived late;
+- one matching an older request the user never confirmed is ignored.  The user has moved on to a
+  newer request, whose SAS is what they are now looking at, and that one admits them instead.
+
+This is what lets a device ask again, after a request seemed to go unanswered, without losing an
+earlier one that was accepted meanwhile.
+
 ## Multiple groups
 
 An account can come to have more than one device group, when a device starts a new group while

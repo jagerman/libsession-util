@@ -460,6 +460,11 @@ class Devices final : detail::CoreComponent {
         /// The user has confirmed, through `confirm_link`, that the emoji match the accepting
         /// device's; what is left is for that device to accept.
         bool confirmed = false;
+
+        /// Another device has accepted it, and this one joins once the user confirms the emoji.
+        /// Such a request stays here past `expires`: the acceptance came in time, even if the
+        /// message carrying it reached this device later.
+        bool accepted = false;
     };
 
     // Asks the devices of the group `group` to admit this one: uploads a link request for them to
@@ -482,9 +487,10 @@ class Devices final : detail::CoreComponent {
     // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
-    // The request `request_link` made, while it is still waiting for an answer: stored by the
-    // swarm, not yet accepted, and not past its deadline.  Nothing otherwise -- including while the
-    // upload is still in flight, when there is nothing another device could accept yet.
+    // The request `request_link` made, while it is still waiting: stored by the swarm and not past
+    // its deadline, or accepted and waiting for the user to confirm it (`accepted`), whatever the
+    // deadline.  Nothing otherwise -- including while the upload is still in flight, when there is
+    // nothing another device could accept yet.
     //
     // What a waiting screen is drawn from, each time it is drawn or reopened, and what to read
     // again on `membership_changed`.  Survives a restart for as long as the request itself does,
@@ -499,6 +505,12 @@ class Devices final : detail::CoreComponent {
     // device that encrypted its request there.  The real group can read no such request, and so
     // never prompts for it, which is what makes the user's confirmation mean something.  See
     // "Confirmation on the requesting device".
+    //
+    // An admission is matched to the request it accepted, and admits the device only if that is a
+    // request the user confirmed, or the one they are being shown now; one matching none of this
+    // device's requests is ignored.  So a device that asks again, after a request seemed to go
+    // unanswered, is still admitted if the earlier one is accepted after all -- provided the user
+    // confirmed it before moving on.
     //
     // Answers false if this device is not waiting on a request.  Asking again needs confirming
     // again: a new request has a new SAS.
@@ -632,13 +644,14 @@ class Devices final : detail::CoreComponent {
 
     struct LinkRequestResult {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
-        std::array<std::byte, 16> sas_seed;
         std::array<std::string_view, 21> sas;
+        int64_t row;  // in device_own_requests
     };
 
-    // Builds our link request, encrypted to the group whose link key is `link_x25519`, and moves
-    // our own row to Pending.  Throws std::logic_error if this device is already registered.
-    LinkRequestResult _build_link_request(std::span<const std::byte, 32> link_x25519);
+    // Builds our link request to the group `group`, whose link key is `link_x25519`, records it as
+    // our newest request, and moves our own row to Pending if we are not in a group.
+    LinkRequestResult _build_link_request(
+            const device::GroupId& group, std::span<const std::byte, 32> link_x25519);
 
     // Takes the handler by reference and moves from it only once nothing more can throw, so that
     // `request_link` can still report a failure through it.
@@ -656,31 +669,45 @@ class Devices final : detail::CoreComponent {
             std::span<const std::byte> encrypted,
             std::span<const std::byte, 2> indicator);
 
-    // Which of our requests is the latest: an upload answering must record, or withdraw, only the
-    // request it carried, not one asked for after it.
-    int _own_request = 0;
+    // One of our own link requests; see device_own_requests.
+    struct OwnRequest {
+        int64_t row;
+        device::GroupId group;
+        std::array<std::byte, 16> sas_seed;
+        std::chrono::sys_seconds asked;                   // the record's timestamp
+        std::optional<std::chrono::sys_seconds> expires;  // unset until the swarm stores it
+        bool confirmed;
+        bool held;  // an admission on it waits for the user's confirmation
+    };
 
-    // Our request's deadline and SAS seed, kept in Globals from the swarm storing it until it is
-    // withdrawn.  Kept rather than held in memory so that the waiting screen can be drawn again
-    // after a restart, for a request the swarm still holds.
+    template <typename... T>
+    std::optional<OwnRequest> _select_own_request(std::string_view where, const T&... bind);
+
+    // The request the user deals with: our newest.  An admission is only ever held for it, so that
+    // what the user confirms is always what the waiting screen shows.
+    std::optional<OwnRequest> _newest_request();
+
+    // The request of ours that a group message admitting `record` to `group` accepted: the one
+    // that carried that record.
+    std::optional<OwnRequest> _own_request_admitted(
+            const device::GroupId& group, const device::Info& record);
+
+    // The newest request's deadline, while it can still lapse and until it has: unset once an
+    // admission is held for it, which waits on the user instead.
     std::optional<std::chrono::sys_seconds> _own_deadline();
     std::optional<OutgoingLinkRequest> _outgoing_link_request();
 
-    // Returns our own row from Pending to Unregistered and forgets the request, answering whether
-    // it was Pending.  Local only: a request already in the swarm can still be accepted, though it
-    // admits us only if the user confirms it.
+    // Returns our own row from Pending to Unregistered, answering whether it was Pending.  The
+    // request is kept: one already in the swarm can still be accepted, and admits us once the user
+    // confirms it.
     bool _withdraw_own_request();
 
-    // Forgets the user's confirmation and any admission held back for one: both belong to a request
-    // that has been replaced, withdrawn, or answered.
-    void _forget_confirmation();
+    // Forgets every request of ours, for a device admitted to a group, starting one, or taking a
+    // new identity: none of them can admit it to anything after that.
+    void _forget_own_requests();
 
-    // Forgets our own request -- its deadline, SAS, the group it asked and the user's confirmation
-    // of it -- for one replaced, withdrawn or answered.
-    void _forget_own_request();
-
-    // Whether this device is waiting to be admitted to a group: from outside any group (Pending),
-    // or from inside one, asking to switch to another.
+    // Whether this device is waiting to be admitted to a group: from outside any group (Pending, or
+    // with an admission held for the user's confirmation), or from inside one, asking to switch.
     bool _asking();
 
     // Leaves the group this device is in, on its admission to another: a departure pushed to the
