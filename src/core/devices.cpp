@@ -1079,6 +1079,12 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
         k.rotated = rotated;
     }
 
+    // The current account key's X25519 half, published outside the payload so that a device asking
+    // to join can encrypt its request to the group: only members hold the secret half.
+    if (acc_keys.empty() || acc_keys.front().rotated)
+        throw std::logic_error{"Cannot build a device group message without a current account key"};
+    auto link_x25519 = keys_from_seed<AccountKeys>(acc_keys.front().seed).x25519_pub;
+
     auto plaintext_devices = encode_group_payload(devices, acc_keys);
     // 2300 + 6400N: at least one bucket, so a payload smaller than the account key allowance still
     // pads up rather than down to nothing.
@@ -1144,6 +1150,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
             + 3 + bt_bytes_encoded(A.size())               // "1:A" + "32:...(A eph pk)..."
             + 3 + bt_bytes_encoded(ciphertext_raw.size())  // "1:C" + "NNNN:...(mlkem cts)..."
             + 3 + bt_bytes_encoded(enc_key_raw.size())     // "1:K" + "NNN:...(encrypted keys)..."
+            + 3 + bt_bytes_encoded(link_x25519.size())     // "1:X" + "32:...(link x25519 pk)..."
             + 3 + bt_bytes_encoded(enc_devices.size())     // "1:d" + "MMMM:...(enc device info)..."
             +
             (kicked_raw.empty() ? 0 : 3 + bt_bytes_encoded(kicked_raw.size()))  // "1:k" + "NN:..."
@@ -1157,6 +1164,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     o.append("A", A);
     o.append("C", ciphertext_raw);
     o.append("K", enc_key_raw);
+    o.append("X", link_x25519);
     o.append("d", enc_devices);
     if (!kicked_raw.empty())
         o.append("k", kicked_raw);
@@ -1345,6 +1353,41 @@ void Devices::receive_device_group_message(
                 "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
     tx.commit();
+}
+
+void Devices::_record_group(const SwarmMessage& msg) {
+    oxenc::bt_dict_consumer in{msg.data};
+    in.require<std::string_view>("");
+    if (!in.skip_until("@"))
+        return;
+    auto encrypted_id = in.consume_span<std::byte, 8>();
+    auto A = in.require_span<std::byte, 32>("A");
+    auto X = in.require_span<std::byte, 32>("X");
+
+    // Checked even though only a seed holder could have encrypted the identifier: without the
+    // signature a storage server could still replay one group's identifier with a link key of its
+    // own, and have requests to join that group encrypted to it.
+    in.require_signature(
+            "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
+                if (sig.size() != 64 ||
+                    !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
+                    throw std::runtime_error{"Invalid device group message signature"};
+            });
+
+    auto seed = core.globals.account_seed();
+    auto group = crypt_group_id(encrypted_id, A, seed.seed());
+    conn().prepared_exec(
+            "INSERT INTO device_groups (group_id, link_x25519, seen_at, expires_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(group_id) DO UPDATE SET"
+            "   link_x25519 = CASE WHEN excluded.seen_at >= seen_at"
+            "       THEN excluded.link_x25519 ELSE link_x25519 END,"
+            "   seen_at = MAX(seen_at, excluded.seen_at),"
+            "   expires_at = MAX(expires_at, excluded.expires_at)",
+            std::span<const std::byte>{group},
+            X,
+            epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.timestamp)),
+            epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.expiry)));
 }
 
 bool Devices::_names_us_kicked(std::span<const std::byte> data) {
@@ -2197,9 +2240,10 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
         try {
             oxenc::bt_dict_consumer in{msg.data};
             auto type = in.require<std::string_view>("");
-            if (type == "G")
+            if (type == "G") {
+                _record_group(msg);
                 receive_device_group_message(msg.data, msg.hash);
-            else if (type == "L")
+            } else if (type == "L")
                 receive_link_request(msg.data, msg.expiry);
             else
                 log::warning(cat, "Ignoring device message with unknown type '{}'", type);

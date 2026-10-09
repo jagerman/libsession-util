@@ -617,6 +617,24 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     static void set_group_id(core::Core& core, const core::device::GroupId& id) {
         on_loop(core, [&] { core.devices._set_group_id(id); });
     }
+    // What `device_groups` holds for a group: its link key and when it expires.
+    static std::optional<std::pair<std::array<std::byte, 32>, int64_t>> seen_group(
+            core::Core& core, const core::device::GroupId& group) {
+        return on_loop(core, [&]() -> std::optional<std::pair<std::array<std::byte, 32>, int64_t>> {
+            auto row = core.devices.conn()
+                               .prepared_maybe_get<
+                                       sqlite::blob_guts<std::array<std::byte, 32>>,
+                                       int64_t>(
+                                       "SELECT link_x25519, expires_at FROM device_groups"
+                                       " WHERE group_id = ?",
+                                       std::span<const std::byte>{group.value});
+            if (!row)
+                return std::nullopt;
+            auto& [key, expires] = *row;
+            return std::pair{std::array<std::byte, 32>{key}, expires};
+        });
+    }
+
     static std::optional<core::device::GroupId> group_of(
             core::Core& core, std::span<const std::byte> message) {
         return on_loop(core, [&] { return core.devices._group_of(message); });

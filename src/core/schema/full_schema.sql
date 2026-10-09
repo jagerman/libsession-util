@@ -92,6 +92,24 @@ CREATE TABLE device_group_merged (
     hash TEXT PRIMARY KEY NOT NULL
 ) STRICT;
 
+-- The device groups this device has seen messages from in the swarm, its own included: what a device
+-- asking to join chooses among, and what tells a device that another group exists alongside its own.
+-- One row per group, kept up to date from the newest of its messages seen.
+--
+-- Kept rather than worked out afresh at each fetch, because fetches are incremental: a message is
+-- delivered once, by the fetch after it arrives, and a group whose devices are quiet would otherwise
+-- vanish from view at the next restart.
+CREATE TABLE device_groups (
+    group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
+    -- The X25519 half of the group's account key, as its newest message published it: what a link
+    -- request asking to join the group is encrypted to.
+    link_x25519 BLOB NOT NULL CHECK(length(link_x25519) == 32),
+    seen_at INTEGER NOT NULL,     -- swarm timestamp of the newest message seen, unix seconds
+    -- The latest expiry among the messages seen, unix seconds.  The group is in the swarm until
+    -- then, as far as fetching can tell: a deletion is not something a fetch reports.
+    expires_at INTEGER NOT NULL
+) STRICT;
+
 -- This table holds current and recent device private keys for *this* device, including the
 -- timestamp then the device keypairs were created, and when they were rotated away from.
 CREATE TABLE device_privkeys (

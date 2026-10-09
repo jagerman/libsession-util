@@ -323,6 +323,10 @@ class Devices final : detail::CoreComponent {
     // for a message from before identifiers.
     std::optional<device::GroupId> _group_of(std::span<const std::byte> message);
 
+    // Notes a group message in `device_groups`, whether or not we can read it.  Throws on a bad
+    // signature.
+    void _record_group(const SwarmMessage& msg);
+
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence
     // a stored flag rather than doing the work there.

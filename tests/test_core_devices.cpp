@@ -1591,6 +1591,50 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - groups seen in the swarm are remembered, with the key to ask them on",
+        "[core][devices][group-id]") {
+    Linking l;
+    auto group = TestHelper::group_id(*l.core);
+    REQUIRE(group);
+    auto key = [&] { return l.core->devices.active_account_keys().front().x25519_pub; };
+
+    // A group the applicant cannot read is still a group it can see, and ask to join.
+    auto first_key = key();
+    auto first = l.core->devices.build_device_group_message().message;
+    auto expiry = in(10min);
+    TestHelper::deliver_device_message(*l.applicant, first, expiry, "G1");
+    auto seen = TestHelper::seen_group(*l.applicant, *group);
+    REQUIRE(seen);
+    CHECK(seen->first == first_key);
+    CHECK(seen->second == epoch_seconds(expiry));
+
+    // The key follows the group's newest message, whichever order they arrive in.
+    l.core->devices.rotate_account_keys();
+    auto second_key = key();
+    REQUIRE(second_key != first_key);
+    auto second = l.core->devices.build_device_group_message().message;
+    {
+        ScopedClockOffset later{1h};
+        TestHelper::deliver_device_message(*l.applicant, second, in(10min), "G2");
+    }
+    CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
+    TestHelper::deliver_device_message(*l.applicant, first, expiry, "G1");
+    CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
+
+    // Not from a message whose signature does not check out: anything else could plant a key of
+    // its own for requests to this group to be encrypted to.
+    auto forged = first;
+    oxenc::bt_dict_consumer outer{forged};
+    auto x_at = outer.require_span<std::byte>("X").data() - forged.data();
+    forged[x_at] ^= std::byte{1};
+    {
+        ScopedClockOffset later{2h};
+        TestHelper::deliver_device_message(*l.applicant, forged, in(10min), "G3");
+    }
+    CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
+}
+
+TEST_CASE(
         "Devices - a group identifier says when its group was created",
         "[core][devices][group-id]") {
     device::GroupId id{};
