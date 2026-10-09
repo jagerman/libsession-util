@@ -164,6 +164,14 @@ if(BUILD_LIVE_TESTS)
         ${CMAKE_SOURCE_DIR}/external/session-router/external/CLI11/include)
 endif()
 
+add_library(shared-link-check MODULE shared_link_check.cpp)
+target_link_libraries(shared-link-check PRIVATE libsession::client libsession::image)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # So that what an application calls is shown to be linked in, not only that what is linked is
+    # position-independent.
+    target_link_options(shared-link-check PRIVATE "LINKER:--no-undefined")
+endif()
+
 add_executable(swarm-auth-test EXCLUDE_FROM_ALL swarm-auth-test.cpp)
 target_link_libraries(swarm-auth-test PRIVATE config)
 
