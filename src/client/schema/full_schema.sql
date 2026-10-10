@@ -284,9 +284,9 @@ END;
 -- look it up.
 --
 -- `size` is bytes on disk, encrypted and padded, because that is what the cache limit is a limit
--- on.  `last_used` is touched on a cache hit as well as on write, which is what makes eviction
--- least-recently-*used* rather than oldest-first: something opened weekly should not lose to
--- something downloaded once and never looked at again.
+-- on.  `last_used` is touched on a cache hit (at most once per `Client::CACHE_TOUCH_INTERVAL`) as
+-- well as on write, which is what makes eviction least-recently-*used* rather than oldest-first:
+-- something opened weekly should not lose to something downloaded once and never looked at again.
 --
 -- Display pictures are not in here at all.  They are never evicted -- a contact you have not spoken
 -- to in years should not lose the last picture you had of them -- and are freed only when superseded,

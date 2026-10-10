@@ -1712,7 +1712,9 @@ TEST_CASE("Client: the cache evicts least recently used", "[client][auto][evict]
     // one of them, leaving every row tied and the eviction order arbitrary.  Real uses are spread
     // out; these have to be spread out by hand.
     ScopedClockOffset clock{0s};
-    auto later = [t = 0s]() mutable { AdjustedClock::set_offset(t += 1s); };
+    auto later = [t = 0s](std::chrono::seconds by = 1s) mutable {
+        AdjustedClock::set_offset(t += by);
+    };
 
     auto seed = random::random(32);
     // Three files, fetched in order, each about the same size on disk.
@@ -1756,8 +1758,9 @@ TEST_CASE("Client: the cache evicts least recently used", "[client][auto][evict]
         REQUIRE(cached(u));
 
     // Reach for the *oldest* one, which makes it the most recently used.  Under oldest-first
-    // eviction it would still be first to go; under least-recently-used it is last.
-    later();
+    // eviction it would still be first to go; under least-recently-used it is last.  Late enough
+    // that the read counts as a use.
+    later(Client::CACHE_TOUCH_INTERVAL);
     c->attachment_data(ids[0], 0, nullptr, [](auto) {});
     sync(*c);
 
@@ -3905,7 +3908,8 @@ TEST_CASE("Client: a cache-only read never fetches", "[client][attachments][cach
     sync(*c);
     CHECK(net->downloads.empty());
 
-    // Cached: the bytes, from disk, and the entry marked used.
+    // Cached: the bytes, from disk, and the entry marked used once its last use is
+    // CACHE_TOUCH_INTERVAL old.
     REQUIRE(c->save_attachment(id, 0, dir.path / "copy", nullptr, nullptr));
     sync(*c);
     REQUIRE(serve_downloads(*net) == 1);
@@ -3919,6 +3923,9 @@ TEST_CASE("Client: a cache-only read never fetches", "[client][attachments][cach
     };
     auto before = used();
     AdjustedClock::set_offset(10s);
+    CHECK(!!(c->attachment_data_cached(id, 0, await) == data));
+    CHECK(used() == before);
+    AdjustedClock::set_offset(Client::CACHE_TOUCH_INTERVAL + 1s);
     CHECK(!!(c->attachment_data_cached(id, 0, await) == data));
     CHECK(used() > before);
 

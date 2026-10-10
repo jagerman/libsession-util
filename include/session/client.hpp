@@ -662,6 +662,10 @@ class Client {
     void attachment_cache_limit(result_function<std::optional<int64_t>> cb);
     std::optional<int64_t> attachment_cache_limit(await_t);
 
+    /// How stale a cache entry's last use must be before a read records a new one.  Eviction only
+    /// needs coarse recency, so an entry read again within this keeps the use it has.
+    static constexpr auto CACHE_TOUCH_INTERVAL = 1h;
+
     /// How much disk the cached attachments occupy at the moment, in bytes.
     ///
     /// The same measure as the limit, and the same total eviction compares against it: bytes on
@@ -1147,7 +1151,8 @@ class Client {
     std::optional<std::pair<int64_t, std::string>> _cached_entry(
             sqlite::Connection& c, std::string_view url);
 
-    // Marks a cache entry as used now, which is what makes eviction least-recently-used.
+    // Marks a cache entry as used now, which is what makes eviction least-recently-used.  Does
+    // nothing within CACHE_TOUCH_INTERVAL of its last use.
     void _touch_cached(int64_t id);
 
     // Removes least-recently-used entries until the cache fits its limit, never touching `keep` --

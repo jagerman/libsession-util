@@ -5777,10 +5777,14 @@ std::vector<int64_t> Client::_forget_thumbnail(sqlite::Connection& c, int64_t id
 }
 
 void Client::_touch_cached(int64_t id) {
+    // Thumbnails are read on every scroll and share their original's entry; a touch within the
+    // interval would change nothing eviction can see, and costs a write on Core's loop per tile.
+    auto now = clock_now_ms();
     core.database().conn().prepared_exec(
-            "UPDATE attachment_cache SET last_used = ?2 WHERE id = ?1",
+            "UPDATE attachment_cache SET last_used = ?2 WHERE id = ?1 AND last_used < ?3",
             id,
-            epoch_ms(clock_now_ms()));
+            epoch_ms(now),
+            epoch_ms(now - CACHE_TOUCH_INTERVAL));
 }
 
 void Client::_queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain) {
