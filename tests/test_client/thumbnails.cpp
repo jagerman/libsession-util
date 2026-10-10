@@ -88,8 +88,9 @@ struct Fixture {
     std::vector<std::byte> seed = random::random(32);
     int sent = 0;
 
+    // Explicit `rec{}`, or Apple clang's -Wuninitialized flags its use in `c`'s initializer.
     template <ClientOption... Opts>
-    explicit Fixture(Opts&&... opts) : c{rec.handlers(), std::forward<Opts>(opts)...} {
+    explicit Fixture(Opts&&... opts) : rec{}, c{rec.handlers(), std::forward<Opts>(opts)...} {
         net = attach_mock_network(c->core);
         c->set_cache_dir(dir.path);
         c->open_dm(convo, await);
