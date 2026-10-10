@@ -3,7 +3,6 @@
 #include <vips/vips.h>
 
 #include <cstddef>
-#include <string_view>
 #include <vector>
 
 namespace session::image::detail {
@@ -15,9 +14,7 @@ enum class Subsampling {
     yuv444,
 };
 
-// Encodes `image` as a progressive JPEG with no metadata.  With SESSION_ENABLE_JPEGLI this goes
-// through jpegli; otherwise through libvips' own (libjpeg-turbo) saver, with optimised Huffman
-// tables.
+// Encodes `image` with jpegli as a progressive JPEG with no metadata.
 //
 // The image is converted to 8-bit sRGB as part of encoding; a single-band image stays greyscale.
 //
@@ -30,8 +27,5 @@ enum class Subsampling {
 // Throws std::runtime_error if conversion or encoding fails.
 std::vector<std::byte> encode_jpeg(
         VipsImage* image, int quality, Subsampling subsampling = Subsampling::yuv420);
-
-// "jpegli" or "libjpeg-turbo", whichever encode_jpeg() uses in this build.
-std::string_view jpeg_encoder_name();
 
 }  // namespace session::image::detail

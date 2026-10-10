@@ -148,13 +148,12 @@ libsession_static_bundle(sessiondep::vips)
 session_dep(libheif 1.19)
 libsession_static_bundle(sessiondep::libheif)
 
-if(SESSION_ENABLE_JPEGLI)
-    # Always our own build, even when everything else comes from the system: distributions do not
-    # package jpegli, and we want every client encoding JPEGs the same way whatever libvips it has.
-    set(BUILD_STATIC_jpegli ON CACHE BOOL "" FORCE)
-    session_dep(jpegli 0)
-    libsession_static_bundle(sessiondep::jpegli)
-endif()
+# Every JPEG we make is encoded by jpegli, ~10-15% smaller than libjpeg-turbo at the same perceived
+# quality; libvips only decodes them, through libjpeg-turbo.  Always our own build, even over system
+# deps: distributions do not package jpegli, and every client must encode JPEGs identically.
+set(BUILD_STATIC_jpegli ON CACHE BOOL "" FORCE)
+session_dep(jpegli 0)
+libsession_static_bundle(sessiondep::jpegli)
 
 
 add_subdirectory(session-sqlite)

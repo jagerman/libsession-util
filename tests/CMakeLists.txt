@@ -102,9 +102,6 @@ target_link_libraries(test_libs INTERFACE
     # The image tests inspect libvips and libheif directly to confirm what libsession::image did.
     sessiondep::vips
     sessiondep::libheif)
-if(SESSION_ENABLE_JPEGLI)
-    target_compile_definitions(test_libs INTERFACE SESSION_ENABLE_JPEGLI)
-endif()
 
 add_executable(testAll main.cpp ${LIB_SESSION_UTESTS_SOURCES})
 target_include_directories(testAll PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

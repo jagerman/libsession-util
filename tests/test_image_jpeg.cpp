@@ -89,7 +89,6 @@ std::string chroma_subsampling(VipsImage* img) {
 }  // namespace
 
 TEST_CASE("JPEG encoding produces a progressive JPEG of the right shape", "[image][jpeg]") {
-    INFO("encoder: " << detail::jpeg_encoder_name());
     auto img = test_image(300, 200, 3, VIPS_INTERPRETATION_sRGB);
 
     auto [subsampling, expected] = GENERATE(
@@ -148,9 +147,7 @@ TEST_CASE("JPEG encoding refuses what JPEG cannot hold", "[image][jpeg]") {
     CHECK_THROWS_AS(detail::encode_jpeg(rgb.get(), 101), std::invalid_argument);
 }
 
-TEST_CASE("JPEG encoding uses the configured encoder", "[image][jpeg]") {
-#ifdef SESSION_ENABLE_JPEGLI
-    CHECK(detail::jpeg_encoder_name() == "jpegli");
+TEST_CASE("JPEG encoding goes through jpegli, not libvips' saver", "[image][jpeg]") {
     // jpegli's output differs from what libvips' own libjpeg-turbo saver makes of the same input.
     auto img = test_image(300, 200, 3, VIPS_INTERPRETATION_sRGB);
     auto ours = detail::encode_jpeg(img.get(), 80);
@@ -159,7 +156,4 @@ TEST_CASE("JPEG encoding uses the configured encoder", "[image][jpeg]") {
     REQUIRE(vips_jpegsave_buffer(img.get(), &buf, &len, "Q", 80, nullptr) == 0);
     std::unique_ptr<void, decltype(&g_free)> theirs{buf, &g_free};
     CHECK((ours.size() != len || std::memcmp(ours.data(), buf, len) != 0));
-#else
-    CHECK(detail::jpeg_encoder_name() == "libjpeg-turbo");
-#endif
 }

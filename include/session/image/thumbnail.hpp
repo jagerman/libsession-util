@@ -30,8 +30,8 @@ inline constexpr int thumbnail_quality = 90;
 /// - Transparency is drawn over a checkerboard of 8px squares, #FFFFFF and #CCCCCC, since JPEG has
 ///   no alpha: on a plain background a transparent image's subject can vanish into it.  The squares
 ///   are 8 thumbnail pixels whatever the image's size, being composited after the scaling.
-/// - The result is 8-bit sRGB at `thumbnail_quality`, encoded with jpegli where the build has it,
-///   and carries no metadata at all.
+/// - The result is 8-bit sRGB at `thumbnail_quality`, encoded with jpegli, and carries no metadata
+///   at all.
 ///
 /// Returns nullopt for anything that is not an image we accept: what `probe` refuses, a format
 /// this build cannot decode (HEIC outside Apple platforms), and an image over `max_frame_pixels`.

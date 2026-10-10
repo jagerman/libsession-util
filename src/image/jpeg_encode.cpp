@@ -10,11 +10,8 @@
 #include <stdexcept>
 #include <string>
 
-#include "vips_internal.hpp"
-
-#ifdef SESSION_ENABLE_JPEGLI
 #include "lib/jpegli/encode.h"
-#endif
+#include "vips_internal.hpp"
 
 namespace session::image::detail {
 
@@ -47,8 +44,6 @@ namespace {
         }
         return img;
     }
-
-#ifdef SESSION_ENABLE_JPEGLI
 
     constexpr int STRIP_ROWS = 64;
 
@@ -129,55 +124,6 @@ namespace {
         return {data, data + job.out_size};
     }
 
-#else
-
-    std::vector<std::byte> encode(VipsImage* img, int quality, Subsampling subsampling) {
-        auto subsample = subsampling == Subsampling::yuv420 ? VIPS_FOREIGN_SUBSAMPLE_ON
-                                                            : VIPS_FOREIGN_SUBSAMPLE_OFF;
-        void* buf = nullptr;
-        size_t len = 0;
-        // `keep` replaced `strip` in 8.15; system libvips is accepted back to 8.13, whose headers
-        // lack VIPS_FOREIGN_KEEP_NONE, hence the literal 0 (which is its value).
-        bool have_keep = vips_version(0) > 8 || (vips_version(0) == 8 && vips_version(1) >= 15);
-        int rc = have_keep ? vips_jpegsave_buffer(
-                                     img,
-                                     &buf,
-                                     &len,
-                                     "Q",
-                                     quality,
-                                     "optimize_coding",
-                                     TRUE,
-                                     "interlace",
-                                     TRUE,
-                                     "subsample_mode",
-                                     subsample,
-                                     "keep",
-                                     0,
-                                     nullptr)
-                           : vips_jpegsave_buffer(
-                                     img,
-                                     &buf,
-                                     &len,
-                                     "Q",
-                                     quality,
-                                     "optimize_coding",
-                                     TRUE,
-                                     "interlace",
-                                     TRUE,
-                                     "subsample_mode",
-                                     subsample,
-                                     "strip",
-                                     TRUE,
-                                     nullptr);
-        if (rc)
-            throw_vips_error("encode_jpeg: libvips JPEG encoding failed");
-        std::unique_ptr<void, decltype(&g_free)> owned{buf, &g_free};
-        auto* data = static_cast<const std::byte*>(buf);
-        return {data, data + len};
-    }
-
-#endif
-
 }  // namespace
 
 std::vector<std::byte> encode_jpeg(VipsImage* image, int quality, Subsampling subsampling) {
@@ -185,14 +131,6 @@ std::vector<std::byte> encode_jpeg(VipsImage* image, int quality, Subsampling su
         throw std::invalid_argument{"encode_jpeg: quality {} is not in [1, 100]"_format(quality)};
     auto img = to_jpeg_colourspace(image);
     return encode(img.get(), quality, subsampling);
-}
-
-std::string_view jpeg_encoder_name() {
-#ifdef SESSION_ENABLE_JPEGLI
-    return "jpegli";
-#else
-    return "libjpeg-turbo";
-#endif
 }
 
 }  // namespace session::image::detail
