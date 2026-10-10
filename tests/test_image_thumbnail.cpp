@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <session/attachments.hpp>
+#include <session/image/probe.hpp>
 #include <session/image/thumbnail.hpp>
 #include <session/image/vips.hpp>
 #include <session/random.hpp>
@@ -17,6 +18,7 @@
 
 #include "../src/image/thumbnail_internal.hpp"
 #include "../src/image/vips_internal.hpp"
+#include "image_fixtures.hpp"
 
 namespace image = session::image;
 using image::detail::image_ptr;
@@ -222,6 +224,21 @@ TEST_CASE("thumbnail of an animation is its first frame", "[image][thumbnail]") 
         CHECK(img->Ysize == 60);
         CHECK(near(pixel(img.get(), 30, 30), RED));
     }
+}
+
+TEST_CASE("thumbnail of an AVIF", "[image][thumbnail]") {
+    image::Source src{image_fixtures::avif_64x48};
+    auto info = image::probe(src);
+    REQUIRE(info);
+    REQUIRE(info->format == image::Format::avif);
+
+    auto out = thumb(image_fixtures::avif_64x48, 128);
+    REQUIRE(out);
+    auto img = decode_jpeg(*out);
+    // Its shorter side, rather than the 128 asked for.
+    CHECK(img->Xsize == 48);
+    CHECK(img->Ysize == 48);
+    CHECK(img->Bands == 3);
 }
 
 TEST_CASE("thumbnail applies EXIF orientation", "[image][thumbnail]") {
