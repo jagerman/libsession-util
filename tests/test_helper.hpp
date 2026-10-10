@@ -474,6 +474,18 @@ class TestHelper {
         return c.core.call_get([&c] { return !c._thumb_running && c._thumb_pending.empty(); });
     }
 
+    /// Makes a Client act as though a thumbnail were being made, so that whatever is queued from
+    /// now on stays queued: what the process ending with thumbnails still to make leaves behind.
+    template <typename Client>
+    static void stall_thumbnails(Client& c) {
+        c.core.call_get([&c] { c._thumb_running = true; });
+    }
+
+    template <typename Client>
+    static size_t thumbnails_queued(Client& c) {
+        return c.core.call_get([&c] { return c._thumb_pending.size(); });
+    }
+
     /// Drives the database-to-config direction directly, which is what makes the round-trip
     /// assertable: applying a config and then deriving one back has to be the identity, and only a
     /// test can ask for the second half in isolation.

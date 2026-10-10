@@ -991,11 +991,10 @@ namespace {
     constexpr auto REQUESTED_MAX_KEY = "client:requested_cache_max_size";
     constexpr auto AUTO_DL_CONCURRENCY_KEY = "client:auto_download_concurrency";
     constexpr auto THUMBNAIL_EDGE_KEY = "client:thumbnail_edge";
-    // The startup thumbnail pass last completed.  Raising the version runs the pass once more, for
-    // a change that leaves entries without a thumbnail that could now have one -- a format
-    // becoming decodable, say.  It never remakes thumbnails that exist.
-    constexpr auto THUMBNAIL_PASS_KEY = "client:thumbnail_pass";
-    constexpr int64_t THUMBNAIL_PASS_VERSION = 1;
+    // Recorded as `thumbnail_failed` against an entry no thumbnail could be made from, which is
+    // retried only once this is raised: raise it with a change that could now make one -- a format
+    // becoming decodable, say.
+    constexpr int64_t THUMBNAILER_VERSION = 1;
     constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
 
@@ -5644,7 +5643,8 @@ bool Client::_record_cached(
         std::optional<std::filesystem::path> plain) {
     // Recorded after the file exists, so a row never describes something that is not there.
     //
-    // A name already recorded is the same url and so the same picture, and keeps its thumbnail.
+    // A name already recorded is the same url and so the same picture, and keeps its thumbnail, or
+    // its record of failing to make one.
 
     auto c = core.database().conn();
     auto name = file.filename().string();
@@ -5797,7 +5797,12 @@ void Client::_pump_thumbnails() {
         auto next = std::move(_thumb_pending.front());
         _thumb_pending.pop_front();
         auto name = c.prepared_maybe_get<std::string>(
-                "SELECT name FROM attachment_cache WHERE id = ? AND thumbnail IS NULL", next.entry);
+                R"(
+            SELECT name FROM attachment_cache
+            WHERE id = ? AND thumbnail IS NULL AND thumbnail_failed IS NOT ?
+        )",
+                next.entry,
+                THUMBNAILER_VERSION);
         if (!name)
             continue;
 
@@ -5830,17 +5835,23 @@ void Client::_pump_thumbnails() {
         });
         return;
     }
-
-    if (_thumb_pass_running) {
-        _thumb_pass_running = false;
-        core.globals.set(THUMBNAIL_PASS_KEY, THUMBNAIL_PASS_VERSION);
-    }
 }
 
 void Client::_thumbnail_made(
         int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg) {
+    auto c = core.database().conn();
+    if (!jpeg)
+        c.prepared_exec(
+                R"(
+            UPDATE attachment_cache SET thumbnail_failed = ?3
+            WHERE id = ?1 AND name = ?2 AND thumbnail IS NULL
+        )",
+                entry,
+                name,
+                THUMBNAILER_VERSION);
+
     // Checked here and again once it is written: an eviction can land on either side of the write.
-    bool wanted = jpeg && core.database().conn().prepared_get<int64_t>(
+    bool wanted = jpeg && c.prepared_get<int64_t>(
                                   R"(
         SELECT EXISTS(
             SELECT 1 FROM attachment_cache WHERE id = ? AND name = ? AND thumbnail IS NULL)
@@ -5879,7 +5890,7 @@ void Client::_record_thumbnail(int64_t entry, const std::string& name, int64_t o
     auto c = core.database().conn();
     if (!c.prepared_exec(
                 R"(
-        UPDATE attachment_cache SET thumbnail = ?3, size = size + ?3
+        UPDATE attachment_cache SET thumbnail = ?3, size = size + ?3, thumbnail_failed = NULL
         WHERE id = ?1 AND name = ?2 AND thumbnail IS NULL
     )",
                 entry,
@@ -5899,20 +5910,20 @@ void Client::_record_thumbnail(int64_t entry, const std::string& name, int64_t o
 }
 
 void Client::_thumbnail_pass() {
-    if (_cache_dir.empty() ||
-        core.globals.get_integer(THUMBNAIL_PASS_KEY).value_or(0) >= THUMBNAIL_PASS_VERSION)
+    if (_cache_dir.empty())
         return;
 
     // Most recently used first: what is likeliest to be on screen next.
     auto c = core.database().conn();
-    for (auto id : c.prepared_results<int64_t>(R"(
+    for (auto id : c.prepared_results<int64_t>(
+                 R"(
         SELECT id FROM attachment_cache c
-        WHERE thumbnail IS NULL
+        WHERE thumbnail IS NULL AND thumbnail_failed IS NOT ?
           AND EXISTS(SELECT 1 FROM message_attachments WHERE cached = c.id AND {})
         ORDER BY last_used DESC
-    )"_format(DISPLAYABLE_IMAGE_SQL)))
+    )"_format(DISPLAYABLE_IMAGE_SQL),
+                 THUMBNAILER_VERSION))
         _thumb_pending.push_back({id});
-    _thumb_pass_running = true;
     _pump_thumbnails();
 }
 

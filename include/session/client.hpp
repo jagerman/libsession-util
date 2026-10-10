@@ -1249,18 +1249,15 @@ class Client {
     std::deque<PendingThumbnail> _thumb_pending;
     bool _thumb_running = false;
 
-    // Whether the startup pass has queued entries that are not all done yet: the pass is recorded
-    // as done only once they are, so one cut short by the process ending runs again next time.
-    bool _thumb_pass_running = false;
-
     void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);
 
     // Starts the next queued thumbnail unless one is being made, skipping entries that have gone
-    // or been given one since they were queued.
+    // since they were queued, or that now have a thumbnail or a recorded failure to make one.
     void _pump_thumbnails();
 
     // Back from the thumbnail thread with what it made, or nullopt if the file is not a picture it
-    // could make one of: writes it beside the entry if the entry still wants it.
+    // could make one of: writes it beside the entry if the entry still wants it, or records the
+    // failure so that the entry is not tried again.
     void _thumbnail_made(
             int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg);
 
@@ -1268,8 +1265,9 @@ class Client {
     // the entry has gone meanwhile, removes the thumbnail again.
     void _record_thumbnail(int64_t entry, const std::string& name, int64_t on_disk);
 
-    // Queues a thumbnail for every cached picture without one, unless this version's pass has
-    // already run: what a cache filled before thumbnails existed needs, once.
+    // Queues a thumbnail for every cached picture with neither a thumbnail nor a recorded failure
+    // to make one.  Run at every start because the queue is not kept: this is what picks up
+    // whatever was still in it when the process ended.
     void _thumbnail_pass();
 
     // `automatic` for an auto-download, which is always kept; anything else is kept only if

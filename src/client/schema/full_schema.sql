@@ -311,7 +311,11 @@ CREATE TABLE attachment_cache (
     -- of the entry rather than an entry of its own: it is made from this file, kept beside it as
     -- `name` + `cache::THUMBNAIL_SUFFIX`, and evicted and deleted with it.  Kept apart from `size`
     -- so that a thumbnail found missing can be taken back out of it.
-    thumbnail INTEGER
+    thumbnail INTEGER,
+    -- The thumbnailer version (`THUMBNAILER_VERSION`) under which making a thumbnail from this file
+    -- last failed, or NULL.  Not tried again until that version changes, so that a picture no
+    -- thumbnail can be made of is not decoded again at every start.
+    thumbnail_failed INTEGER
 ) STRICT;
 
 CREATE INDEX attachment_cache_lru ON attachment_cache(last_used);

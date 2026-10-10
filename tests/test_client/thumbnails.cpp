@@ -97,9 +97,12 @@ struct Fixture {
     }
 
     // Delivers `data` as one attachment of `content_type`, lets it download, and returns the
-    // message's id and the attachment's url.
+    // message's id and the attachment's url.  Waits for its thumbnail too unless `thumbnails` is
+    // false, for a Client whose thumbnails are stalled.
     std::pair<int64_t, std::string> arrive(
-            std::span<const std::byte> data, std::string_view content_type = "image/png") {
+            std::span<const std::byte> data,
+            std::string_view content_type = "image/png",
+            bool thumbnails = true) {
         auto [ct, key] = attachment::encrypt(seed, data, attachment::Domain::ATTACHMENT);
         auto file_id = "f{}"_format(sent);
         net->served[file_id] = ct;
@@ -122,8 +125,32 @@ struct Fixture {
         sent++;
         sync(*c);
         REQUIRE(serve_downloads(*net) == 1);
-        settle(*c);
+        if (thumbnails)
+            settle(*c);
+        else
+            REQUIRE(eventually([&] {
+                auto msgs = c->conversation(convo, await)->messages(await);
+                return msgs[0].attachments.at(0).availability == AttachmentAvailability::cached;
+            }));
         return {c->conversation(convo, await)->messages(await)[0].id, url};
+    }
+
+    void reopen() {
+        c.reopen();
+        c->set_cache_dir(dir.path);
+        settle(*c);
+    }
+
+    // What a cache filled by a version that made no thumbnails looks like: the file, and an entry
+    // with no thumbnail.
+    void strip_thumbnail(const std::string& url) {
+        TestHelper::on_loop(c->core, [&] {
+            c->core.database().conn().prepared_exec(
+                    "UPDATE attachment_cache SET size = size - thumbnail, thumbnail = NULL"
+                    " WHERE name = ? AND thumbnail IS NOT NULL",
+                    file(url).filename().string());
+        });
+        std::filesystem::remove(thumb_file(url));
     }
 
     Attachment attachment(int64_t id) { return c->message(id, await)->attachments.at(0); }
@@ -346,34 +373,68 @@ TEST_CASE("Client: the startup pass fills in what was cached before", "[client][
     Fixture f;
     auto [id, url] = f.arrive(picture(400, 300));
     REQUIRE(f.attachment(id).has_thumbnail);
+    auto size = f.c->attachment_cache_size(await);
 
-    // What a cache filled by a version that made no thumbnails looks like: the file, and an entry
-    // with no thumbnail.
-    auto strip = [&] {
-        TestHelper::on_loop(f.c->core, [&] {
-            f.c->core.database().conn().prepared_exec(
-                    "UPDATE attachment_cache SET size = size - thumbnail, thumbnail = NULL");
-        });
-        std::filesystem::remove(f.thumb_file(url));
-    };
-    strip();
-    TestHelper::on_loop(f.c->core, [&] { f.c->core.globals.erase("client:thumbnail_pass"); });
+    // At every open, not once: the second is the same state reached later.
+    for (int open = 0; open < 2; open++) {
+        INFO("open " << open);
+        f.strip_thumbnail(url);
+        REQUIRE_FALSE(f.attachment(id).has_thumbnail);
+
+        f.reopen();
+        CHECK(f.attachment(id).has_thumbnail);
+        CHECK(std::filesystem::exists(f.thumb_file(url)));
+        CHECK(f.c->attachment_cache_size(await) == size);
+    }
+}
+
+TEST_CASE(
+        "Client: a thumbnail still queued when the Client goes is made at the next open",
+        "[client][thumbnail]") {
+    Fixture f;
+    TestHelper::stall_thumbnails(*f.c);
+    auto [id, url] = f.arrive(picture(400, 300), "image/png", false);
+    REQUIRE(TestHelper::thumbnails_queued(*f.c) == 1);
     REQUIRE_FALSE(f.attachment(id).has_thumbnail);
 
-    auto reopen = [&] {
-        f.c.reopen();
-        f.c->set_cache_dir(f.dir.path);
-        settle(*f.c);
-    };
-    reopen();
+    f.reopen();
     CHECK(f.attachment(id).has_thumbnail);
-    CHECK(std::filesystem::exists(f.thumb_file(url)));
+    CHECK(jpeg_size(f.c->attachment_thumbnail(id, 0, await)) == std::pair{240, 240});
+}
 
-    // Once only: the next open finds the pass done, and leaves an entry without one alone.
-    strip();
-    reopen();
-    CHECK_FALSE(f.attachment(id).has_thumbnail);
-    CHECK_FALSE(std::filesystem::exists(f.thumb_file(url)));
+TEST_CASE(
+        "Client: a picture no thumbnail could be made of is not tried at every open",
+        "[client][thumbnail]") {
+    Fixture f;
+    std::vector<std::byte> junk(3000);
+    random::fill(junk);
+    auto [bad, bad_url] = f.arrive(junk, "image/png");
+    REQUIRE_FALSE(f.attachment(bad).has_thumbnail);
+
+    auto [good, good_url] = f.arrive(picture(400, 300));
+    REQUIRE(f.attachment(good).has_thumbnail);
+
+    // The failed entry's file becomes a picture, so that trying it again would be seen to succeed;
+    // and the good one loses its thumbnail, so that the pass is seen to have run.
+    std::filesystem::copy_file(
+            f.file(good_url), f.file(bad_url), std::filesystem::copy_options::overwrite_existing);
+    f.strip_thumbnail(good_url);
+
+    f.reopen();
+    CHECK(f.attachment(good).has_thumbnail);
+    CHECK_FALSE(f.attachment(bad).has_thumbnail);
+    CHECK_FALSE(std::filesystem::exists(f.thumb_file(bad_url)));
+
+    // Failed under an older thumbnailer, which is what raising the version makes of it.
+    TestHelper::on_loop(f.c->core, [&] {
+        f.c->core.database().conn().prepared_exec(
+                "UPDATE attachment_cache SET thumbnail_failed = thumbnail_failed - 1"
+                " WHERE thumbnail_failed IS NOT NULL");
+    });
+    f.reopen();
+    CHECK(f.attachment(bad).has_thumbnail);
+    CHECK(f.db_get("SELECT count(*) FROM attachment_cache WHERE thumbnail_failed IS NOT NULL") ==
+          0);
 }
 
 TEST_CASE("Client: the sweep reconciles thumbnails", "[client][thumbnail][evict]") {
