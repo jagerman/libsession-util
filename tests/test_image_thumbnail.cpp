@@ -1,3 +1,4 @@
+#include <libheif/heif.h>
 #include <oxenc/hex.h>
 #include <vips/vips.h>
 
@@ -240,6 +241,37 @@ TEST_CASE("thumbnail of an AVIF", "[image][thumbnail]") {
     CHECK(img->Ysize == 48);
     CHECK(img->Bands == 3);
 }
+
+#ifdef __APPLE__
+TEST_CASE("thumbnail of a HEIC decoded by ImageIO", "[image][thumbnail]") {
+    REQUIRE(image::can_decode(image::Format::heic));
+
+    auto out = thumb(image_fixtures::heic_p3_rotated, 128);
+    REQUIRE(out);
+    CHECK_FALSE(has_marker(*out, 0xE1));
+    CHECK_FALSE(has_marker(*out, 0xE2));
+    CHECK_FALSE(has_marker(*out, 0xFE));
+    auto img = decode_jpeg(*out);
+    // Its shorter side, rather than the 128 asked for.
+    CHECK(img->Xsize == 48);
+    CHECK(img->Ysize == 48);
+    CHECK(img->Bands == 3);
+    CHECK(img->BandFmt == VIPS_FORMAT_UCHAR);
+    // Upright, and in sRGB's numbers: left as P3's, the red and green would be off by 50 or more.
+    constexpr rgba WHITE{255, 255, 255, 255};
+    CHECK(near(pixel(img.get(), 12, 12), BLUE));
+    CHECK(near(pixel(img.get(), 36, 12), RED));
+    CHECK(near(pixel(img.get(), 12, 36), WHITE));
+    CHECK(near(pixel(img.get(), 36, 36), GREEN));
+}
+#else
+TEST_CASE("thumbnail refuses HEIC without an HEVC decoder", "[image][thumbnail]") {
+    bool libheif_hevc = heif_have_decoder_for_format(heif_compression_HEVC);
+    CHECK(image::can_decode(image::Format::heic) == libheif_hevc);
+    if (!libheif_hevc)
+        CHECK_FALSE(thumb(image_fixtures::heic_p3_rotated, 128));
+}
+#endif
 
 TEST_CASE("thumbnail applies EXIF orientation", "[image][thumbnail]") {
     // Stored 400x200, red on the left and blue on the right.
