@@ -260,15 +260,6 @@ add_libsession_util_library(image
     image/thumbnail.cpp
     image/vips.cpp
 )
-# libvips' vips/semaphore.h shadows the <semaphore.h> libstdc++'s <semaphore> includes when static-deps/include/vips is on the path.
-foreach(tgt sessiondep_ext_vips sessiondep_ext_vips-cpp)
-    if(TARGET ${tgt})
-        get_target_property(dirs ${tgt} INTERFACE_INCLUDE_DIRECTORIES)
-        list(FILTER dirs EXCLUDE REGEX "/include/vips/?$")
-        set_target_properties(${tgt} PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${dirs}")
-    endif()
-endforeach()
-
 target_link_libraries(image
     PUBLIC
     # Source reads encrypted files with attachment::SeekableDecryptor.
