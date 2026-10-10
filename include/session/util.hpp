@@ -2,6 +2,7 @@
 
 #include <oxenc/common.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -206,12 +207,16 @@ inline const unsigned char* ucdata(std::span<const std::byte, N> sp) {
     return reinterpret_cast<const unsigned char*>(sp.data());
 }
 
-/// Returns true if the first string is equal to the second string, compared case-insensitively.
-inline bool string_iequal(std::string_view s1, std::string_view s2) {
-    return std::equal(s1.begin(), s1.end(), s2.begin(), s2.end(), [](char a, char b) {
-        return std::tolower(static_cast<unsigned char>(a)) ==
-               std::tolower(static_cast<unsigned char>(b));
-    });
+/// Returns true if the first string is equal to the second string, ignoring ASCII case.
+///
+/// Folds A-Z only, never through std::tolower: these are protocol strings (URL schemes, MIME
+/// types), which must not compare differently under whatever C locale the host application sets,
+/// and which SQLite's lower() must be able to match.
+constexpr bool string_iequal(std::string_view s1, std::string_view s2) {
+    constexpr auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+    };
+    return std::ranges::equal(s1, s2, {}, lower, lower);
 }
 
 using b32 = std::array<std::byte, 32>;

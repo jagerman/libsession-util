@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <session/util.hpp>
 #include <string_view>
 
 namespace session::image {
@@ -32,11 +33,8 @@ inline constexpr std::array<std::string_view, 7> displayable_image_types{
 /// attachment is presented, not whether its bytes are safe to decode; decoding enforces the loader
 /// whitelist on the actual content.
 constexpr bool is_displayable_image(std::string_view content_type) {
-    auto lower = [](char c) {
-        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
-    };
     return std::ranges::any_of(displayable_image_types, [&](std::string_view type) {
-        return std::ranges::equal(content_type, type, {}, lower);
+        return string_iequal(content_type, type);
     });
 }
 

@@ -58,3 +58,10 @@ TEST_CASE("from_epoch helpers are the inverse of epoch_seconds/epoch_ms", "[cloc
     static_assert(std::same_as<decltype(tp_generic), sys_seconds>);
     CHECK(epoch_seconds(tp_generic) == unix_s);
 }
+TEST_CASE("string_iequal folds ASCII case and nothing else", "[util]") {
+    static_assert(session::string_iequal("HTTPS", "https"));
+    static_assert(!session::string_iequal("https", "http"));
+    CHECK(session::string_iequal("Image/AVIF", "image/avif"));
+    // Latin-1 É and é: a locale-aware fold would call these equal.
+    CHECK_FALSE(session::string_iequal("\xC9", "\xE9"));
+}
