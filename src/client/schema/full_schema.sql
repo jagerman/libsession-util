@@ -128,7 +128,11 @@ CREATE TABLE conversations (
 CREATE INDEX conversations_order ON conversations(priority DESC, last_activity DESC);
 
 CREATE TABLE messages (
-    id INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT so that no id is ever handed out twice.  Without it, deleting the newest row
+    -- frees its id for the next insert, and the id is held well beyond any one transaction: by the
+    -- application, which acts on messages by id, and by our own sends, uploads and transfers, which
+    -- report back against it.  Anything still holding the old id would then act on the new message.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     -- The sender's Content.msgId: 8 random bytes separating this message from another they sent in
     -- the same millisecond.  Every copy of a message carries the same value -- it is set before the
@@ -280,9 +284,9 @@ END;
 -- look it up.
 --
 -- `size` is bytes on disk, encrypted and padded, because that is what the cache limit is a limit
--- on.  `last_used` is touched on a cache hit as well as on write, which is what makes eviction
--- least-recently-*used* rather than oldest-first: something opened weekly should not lose to
--- something downloaded once and never looked at again.
+-- on.  `last_used` is touched on a cache hit (at most once per `Client::CACHE_TOUCH_INTERVAL`) as
+-- well as on write, which is what makes eviction least-recently-*used* rather than oldest-first:
+-- something opened weekly should not lose to something downloaded once and never looked at again.
 --
 -- Display pictures are not in here at all.  They are never evicted -- a contact you have not spoken
 -- to in years should not lose the last picture you had of them -- and are freed only when superseded,
@@ -291,12 +295,27 @@ CREATE TABLE attachment_cache (
     -- Surrogate, so that an attachment row referencing this stores an integer rather than a second
     -- copy of the name -- and so that the name is free to change shape later without the references
     -- to it meaning anything different.
-    id INTEGER PRIMARY KEY,
+    --
+    -- AUTOINCREMENT because a cache hit holds this across a disk read, to mark the entry used once
+    -- the read is done.  Were an eviction and a new entry to free and retake the id meanwhile, that
+    -- mark would land on the wrong file.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     -- Keyed (`cache::name_for`) so that someone reading the cache directory cannot tell which
     -- files this account has fetched.
     name TEXT NOT NULL UNIQUE,
+    -- Both files when the entry has a thumbnail (see below), so that eviction and the limit see
+    -- what the entry actually costs.
     size INTEGER NOT NULL,
-    last_used INTEGER NOT NULL      -- ms since epoch
+    last_used INTEGER NOT NULL,     -- ms since epoch
+    -- The bytes on disk of the entry's thumbnail, or NULL while it has none.  The thumbnail is part
+    -- of the entry rather than an entry of its own: it is made from this file, kept beside it as
+    -- `name` + `cache::THUMBNAIL_SUFFIX`, and evicted and deleted with it.  Kept apart from `size`
+    -- so that a thumbnail found missing can be taken back out of it.
+    thumbnail INTEGER,
+    -- The thumbnailer version (`THUMBNAILER_VERSION`) under which making a thumbnail from this file
+    -- last failed, or NULL.  Not tried again until that version changes, so that a picture no
+    -- thumbnail can be made of is not decoded again at every start.
+    thumbnail_failed INTEGER
 ) STRICT;
 
 CREATE INDEX attachment_cache_lru ON attachment_cache(last_used);

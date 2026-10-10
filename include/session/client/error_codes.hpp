@@ -19,9 +19,17 @@ inline constexpr std::string_view message_not_found = "message.not_found";
 /// The message exists but has no attachment at the index asked about.
 inline constexpr std::string_view attachment_not_found = "attachment.not_found";
 
+/// The attachment has no thumbnail to serve: it is not an image Session displays, its file is not
+/// in the cache, or its thumbnail has not been made yet.  `Attachment::has_thumbnail` says in
+/// advance which answer to expect.
+inline constexpr std::string_view no_thumbnail = "attachment.no_thumbnail";
+
 /// The local file an outgoing attachment was made from is no longer there, so the message cannot
 /// be sent.
 inline constexpr std::string_view attachment_file_missing = "attachment.file_missing";
+
+/// The file is not in the cache, which is all that `Client::attachment_data_cached` reads.
+inline constexpr std::string_view not_cached = "file.not_cached";
 
 /// The file server does not have the file: it has expired, or was never there.  Only the sender
 /// sending it again fixes this.  Matches `AttachmentAvailability::not_found`.

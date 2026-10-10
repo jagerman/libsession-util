@@ -52,7 +52,7 @@ util     ← file, logging, util (uses zstd, simdutf)
 crypto   ← util + libsodium (blinding, ed25519, session_encrypt, etc.)
 config   ← crypto + libsodium + protos (all config types)
 core     ← crypto + SQLite + mlkem768 (PQC key encapsulation)
-image    ← crypto + libvips + libheif (+ jpegli) (thumbhash, image sources, probing, encoding)
+image    ← crypto + libvips + libheif + jpegli (thumbhash, image sources, probing, encoding)
 onionreq ← crypto + quic + nettle (optional)
 ```
 

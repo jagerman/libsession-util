@@ -221,6 +221,18 @@ struct Attachment {
     int64_t fetch_done = 0;
     int64_t fetch_total = 0;
 
+    /// Whether `Client::attachment_thumbnail` has a thumbnail to serve: a small square JPEG of the
+    /// picture, for drawing it in a grid or a list without decoding the whole file.
+    ///
+    /// Only ever true while the file itself is in the cache, because the thumbnail is part of the
+    /// cached copy: made from it once it is here, and evicted or deleted with it.  So it turns
+    /// true a little after the file arrives -- reported through `messages_updated` like any other
+    /// change to the message -- and false again when the file leaves the cache.
+    ///
+    /// Never true for anything but a picture Session displays (see
+    /// `image::displayable_image_types`) that libsession could decode.  Videos have none.
+    bool has_thumbnail = false;
+
     /// When the *recipient* of this message last saved this attachment -- us, on an incoming one,
     /// and the other party on one we sent.  The same fact from either end, so it does not have to
     /// be read differently depending on `Message::outgoing`.

@@ -6,6 +6,7 @@
 #include <charconv>
 #include <debug_print.hpp>
 #include <fstream>
+#include <future>
 #include <oxen/log.hpp>
 #include <oxen/quic/loop.hpp>
 #include <session/attachments.hpp>
@@ -14,10 +15,13 @@
 #include <session/config/contacts.hpp>
 #include <session/config/convo_info_volatile.hpp>
 #include <session/config/expiring.hpp>
+#include <session/config/local.hpp>
+#include <session/config/user_groups.hpp>
 #include <session/config/user_profile.hpp>
 #include <session/format.hpp>
 #include <session/hash.hpp>
 #include <session/image/content_types.hpp>
+#include <session/image/thumbnail.hpp>
 #include <session/network/backends/session_file_server.hpp>
 #include <session/network/session_network.hpp>
 #include <session/placeholders.hpp>
@@ -404,6 +408,8 @@ core::callbacks Client::_core_callbacks() {
 void Client::_init() {
     _disk_loop = core.disk_loop();
     _disk_jq.emplace(*_disk_loop);
+    _thumb_loop = std::make_shared<oxen::quic::Loop>();
+    _thumb_jq.emplace(*_thumb_loop);
 
     // Core's send queue is in-memory, so anything still mid-flight when the last run ended is not
     // resumed and its outcome is unknowable.  Say so rather than guessing either way.
@@ -730,20 +736,30 @@ bool Client::delete_message(int64_t message_id, await_t) {
 void Client::set_cache_dir(std::filesystem::path dir) {
     _cache_dir = std::move(dir);
     _sweep_cache();
+    call([this] { _thumbnail_pass(); });
 }
 
 Client::~Client() {
-    // First, while everything a disk job reaches is still here.  On the disk loop, so that a job
-    // already running there finishes before the queue stops rather than alongside it.
+    // First, while everything a disk or thumbnail job reaches is still here.  On their own loops,
+    // so that a job already running finishes before its queue stops rather than alongside it.
+    _thumb_loop->call_get([this] { _thumb_jq->stop(); });
     _disk_loop->call_get([this] { _disk_jq->stop(); });
 }
 
-void Client::_post_disk(std::function<void()> job) {
+static void post_unless_stopped(oxen::quic::JobQueue& jq, std::function<void()> job) {
     try {
-        _disk_jq->call_soon(std::move(job));
+        jq.call_soon(std::move(job));
     } catch (const std::exception&) {
         // Stopped: this Client is going away.
     }
+}
+
+void Client::_post_disk(std::function<void()> job) {
+    post_unless_stopped(*_disk_jq, std::move(job));
+}
+
+void Client::_post_thumbnail(std::function<void()> job) {
+    post_unless_stopped(*_thumb_jq, std::move(job));
 }
 
 void Client::_sweep_cache() {
@@ -776,11 +792,22 @@ void Client::_reconcile_cache(
 
     // An attachment file without a row cannot be found by a lookup or counted by eviction, so it is
     // not a cache entry at all -- it is a file taking up room under a name nobody can resolve.
+    //
+    // A thumbnail belongs to the row named by the rest of its name, and is as orphaned as any other
+    // file if that row does not say it has one.
     std::vector<std::string> orphans;
-    for (auto& name : attachments)
+    for (auto& name : attachments) {
+        bool thumb = name.ends_with(cache::THUMBNAIL_SUFFIX);
+        auto entry = thumb ? std::string_view{name}.substr(
+                                     0, name.size() - cache::THUMBNAIL_SUFFIX.size())
+                           : std::string_view{name};
         if (!c.prepared_get<int64_t>(
-                    "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)", name))
+                    thumb ? "SELECT EXISTS(SELECT 1 FROM attachment_cache"
+                            " WHERE name = ? AND thumbnail IS NOT NULL)"
+                          : "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE name = ?)",
+                    entry))
             orphans.push_back(std::move(name));
+    }
 
     // The other direction, which is not cosmetic: eviction totals `size` over the rows, so a row
     // naming a file that is gone makes the cache look fuller than it is and evicts live files to
@@ -789,12 +816,19 @@ void Client::_reconcile_cache(
     // Rows the listing covers are fine by definition.  The rest are checked against the disk rather
     // than assumed missing, because a row inserted after the listing was taken is legitimately
     // absent from it and dropping it would strand the file it names.
+    //
+    // A missing thumbnail is the same mistake on a smaller scale -- its bytes are counted in `size`
+    // -- and is simply made again: the file it was made from is still good.
     std::set<std::string> listed{attachments.begin(), attachments.end()};
-    std::vector<std::pair<int64_t, std::string>> unlisted;
-    for (auto&& [id, name] :
-         c.prepared_results<int64_t, std::string>("SELECT id, name FROM attachment_cache"))
+    std::vector<std::pair<int64_t, std::string>> unlisted, unlisted_thumbs;
+    for (auto&& [id, name, thumb] :
+         c.prepared_results<int64_t, std::string, std::optional<int64_t>>(
+                 "SELECT id, name, thumbnail FROM attachment_cache")) {
         if (!listed.contains(name))
             unlisted.emplace_back(id, std::move(name));
+        else if (thumb && !listed.contains(cache::thumbnail_name(name)))
+            unlisted_thumbs.emplace_back(id, std::move(name));
+    }
 
     // A picture is referenced by an account naming its url and by nothing else, so the referenced
     // set is that column.  Recomputed here rather than passed in, so that an account that appeared
@@ -814,6 +848,7 @@ void Client::_reconcile_cache(
                 dir = _cache_dir,
                 orphans = std::move(orphans),
                 unlisted = std::move(unlisted),
+                unlisted_thumbs = std::move(unlisted_thumbs),
                 unreferenced = std::move(unreferenced)]() mutable {
         size_t dropped_files = 0, dropped_pictures = 0;
         for (const auto& name : orphans)
@@ -827,8 +862,19 @@ void Client::_reconcile_cache(
             if (!std::filesystem::exists(dir / cache::ATTACHMENT_DIR / name, ec))
                 gone.emplace_back(id, std::move(name));
         }
+        std::vector<int64_t> thumbs_gone;
+        for (auto& [id, name] : unlisted_thumbs) {
+            std::error_code ec;
+            if (!std::filesystem::exists(
+                        dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(name), ec))
+                thumbs_gone.push_back(id);
+        }
 
-        call([this, gone = std::move(gone), dropped_files, dropped_pictures] {
+        call([this,
+              gone = std::move(gone),
+              thumbs_gone = std::move(thumbs_gone),
+              dropped_files,
+              dropped_pictures] {
             // Through the same path an eviction takes, so a file that went missing behind our back
             // is reported to the messages drawing it exactly as one we deleted on purpose would be
             // -- and as one report for the sweep, not one per file.
@@ -838,15 +884,21 @@ void Client::_reconcile_cache(
                 auto showing = _drop_cached(c, id, name);
                 affected.insert(affected.end(), showing.begin(), showing.end());
             }
+            for (auto id : thumbs_gone) {
+                auto showing = _forget_thumbnail(c, id);
+                affected.insert(affected.end(), showing.begin(), showing.end());
+                _queue_thumbnail(id);
+            }
             _emit_messages_showing(c, affected);
 
-            if (dropped_files || !gone.empty() || dropped_pictures)
+            if (dropped_files || !gone.empty() || !thumbs_gone.empty() || dropped_pictures)
                 log::info(
                         cat,
                         "Cache sweep: dropped {} untracked attachment(s), {} row(s) for missing "
-                        "files, {} unreferenced picture(s)",
+                        "files, {} missing thumbnail(s), {} unreferenced picture(s)",
                         dropped_files,
                         gone.size(),
+                        thumbs_gone.size(),
                         dropped_pictures);
         });
     });
@@ -938,6 +990,11 @@ namespace {
     constexpr auto AUTO_DL_MAX_KEY = "client:auto_download_max_size";
     constexpr auto REQUESTED_MAX_KEY = "client:requested_cache_max_size";
     constexpr auto AUTO_DL_CONCURRENCY_KEY = "client:auto_download_concurrency";
+    constexpr auto THUMBNAIL_EDGE_KEY = "client:thumbnail_edge";
+    // Recorded as `thumbnail_failed` against an entry no thumbnail could be made from, which is
+    // retried only once this is raised: raise it with a change that could now make one -- a format
+    // becoming decodable, say.
+    constexpr int64_t THUMBNAILER_VERSION = 1;
     constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
 
@@ -992,6 +1049,27 @@ void Client::attachment_cache_size(result_function<int64_t> cb) {
 }
 int64_t Client::attachment_cache_size(await_t) {
     return call_get([this] { return _attachment_cache_size(); });
+}
+
+std::unordered_map<std::string, int> Client::_config_sizes() {
+    if (!core.globals.have_account())
+        return {};
+    auto& configs = core.configs;
+    auto size = [](config::ConfigBase& conf) { return static_cast<int>(conf.make_dump().size()); };
+    return {
+            {"user_profile", size(configs.user_profile())},
+            {"contacts", size(configs.contacts())},
+            {"convo_info_volatile", size(configs.convo_info_volatile())},
+            {"user_groups", size(configs.user_groups())},
+            {"local", size(configs.local())},
+    };
+}
+
+void Client::config_sizes(result_function<std::unordered_map<std::string, int>> cb) {
+    _async([this] { return _config_sizes(); }, std::move(cb));
+}
+std::unordered_map<std::string, int> Client::config_sizes(await_t) {
+    return call_get([this] { return _config_sizes(); });
 }
 
 void Client::set_auto_download_max_size(std::optional<int64_t> bytes, result_function<> cb) {
@@ -1065,6 +1143,33 @@ void Client::auto_download_concurrency(result_function<std::optional<int>> cb) {
 }
 std::optional<int> Client::auto_download_concurrency(await_t) {
     return call_get([this] { return get_concurrency(core.globals); });
+}
+
+static uint32_t clamped_edge(int64_t px) {
+    return static_cast<uint32_t>(
+            std::clamp<int64_t>(px, image::min_thumbnail_edge, image::max_thumbnail_edge));
+}
+
+uint32_t Client::_thumbnail_edge() {
+    return clamped_edge(
+            core.globals.get_integer(THUMBNAIL_EDGE_KEY).value_or(_default_thumbnail_edge));
+}
+
+static void set_thumbnail_edge_in(core::Globals& g, std::optional<uint32_t> px) {
+    set_limit(g, THUMBNAIL_EDGE_KEY, px ? std::optional{int64_t{clamped_edge(*px)}} : std::nullopt);
+}
+
+void Client::set_thumbnail_edge(std::optional<uint32_t> px, result_function<> cb) {
+    _async([this, px] { set_thumbnail_edge_in(core.globals, px); }, std::move(cb));
+}
+void Client::set_thumbnail_edge(std::optional<uint32_t> px, await_t) {
+    call_get([this, px] { set_thumbnail_edge_in(core.globals, px); });
+}
+void Client::thumbnail_edge(result_function<uint32_t> cb) {
+    _async([this] { return _thumbnail_edge(); }, std::move(cb));
+}
+uint32_t Client::thumbnail_edge(await_t) {
+    return call_get([this] { return _thumbnail_edge(); });
 }
 
 bool Client::_caches_requested(std::optional<int64_t> size) {
@@ -1159,6 +1264,173 @@ void Client::_attachment_data(
              _attachment_progress(message_id, index, token, std::move(on_progress)),
              std::move(cb),
              std::move(ended)});
+}
+
+// What a request for an attachment that is not there is owed: whether it was the message or only
+// the attachment that was missing.
+[[noreturn]] static void throw_missing_attachment(
+        sqlite::Connection& c, int64_t message_id, size_t index) {
+    if (!c.prepared_get<int64_t>("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?)", message_id))
+        throw session::error{err::message_not_found, "There is no message {}"_format(message_id)};
+    throw session::error{
+            err::attachment_not_found, "Message {} has no attachment {}"_format(message_id, index)};
+}
+
+void Client::_answer_bytes(bytes_read start, result_function<std::vector<std::byte>> cb) {
+    call([this, start = std::move(start), cb = std::move(cb)]() mutable {
+        try {
+            start([this, cb](auto answer) mutable { _report(cb, std::move(answer)); }, false);
+        } catch (const std::exception& e) {
+            _fail<std::vector<std::byte>>(cb, error_from(e));
+        }
+    });
+}
+
+std::vector<std::byte> Client::_await_bytes(bytes_read start) {
+    // Answered straight from Core's loop rather than through the dispatcher, which may be the
+    // very thread blocked here.
+    auto answer = std::make_shared<std::promise<Expected<std::vector<std::byte>>>>();
+    auto future = answer->get_future();
+    bool on_loop = _jq.inside();
+    call([start = std::move(start), answer, on_loop] {
+        try {
+            start([answer](auto r) { answer->set_value(std::move(r)); }, on_loop);
+        } catch (const std::exception& e) {
+            answer->set_value(unexpected{error_from(e)});
+        }
+    });
+    auto r = future.get();
+    if (!r)
+        throw session::error{std::move(r).error()};
+    return *std::move(r);
+}
+
+void Client::attachment_thumbnail(
+        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
+    _answer_bytes(
+            [this, message_id, index](bytes_answer done, bool wait) {
+                _attachment_thumbnail(message_id, index, std::move(done), wait);
+            },
+            std::move(cb));
+}
+std::vector<std::byte> Client::attachment_thumbnail(int64_t message_id, size_t index, await_t) {
+    return _await_bytes([this, message_id, index](bytes_answer done, bool wait) {
+        _attachment_thumbnail(message_id, index, std::move(done), wait);
+    });
+}
+
+void Client::attachment_data_cached(
+        int64_t message_id, size_t index, result_function<std::vector<std::byte>> cb) {
+    _answer_bytes(
+            [this, message_id, index](bytes_answer done, bool wait) {
+                _attachment_data_cached(message_id, index, std::move(done), wait);
+            },
+            std::move(cb));
+}
+std::vector<std::byte> Client::attachment_data_cached(int64_t message_id, size_t index, await_t) {
+    return _await_bytes([this, message_id, index](bytes_answer done, bool wait) {
+        _attachment_data_cached(message_id, index, std::move(done), wait);
+    });
+}
+
+static session::error not_cached(int64_t message_id, size_t index) {
+    return session::error{
+            err::not_cached,
+            "Attachment {} of message {} is not in the cache"_format(index, message_id)};
+}
+
+void Client::_read_cache_file(
+        std::filesystem::path file,
+        bool wait,
+        std::function<void(std::optional<std::vector<std::byte>>)> then) {
+    auto read = [file = std::move(file), key = _cache_encryption_key()] {
+        return cache::read(file, key);
+    };
+    if (wait)
+        return then(_disk_jq->call_get(std::move(read)));
+    _post_disk([this, read = std::move(read), then = std::move(then)]() mutable {
+        call([then = std::move(then), bytes = read()]() mutable { then(std::move(bytes)); });
+    });
+}
+
+void Client::_attachment_data_cached(
+        int64_t message_id, size_t index, bytes_answer done, bool wait) {
+    auto c = core.database().conn();
+    auto url = c.prepared_maybe_get<std::optional<std::string>>(
+            "SELECT url FROM message_attachments WHERE message = ? AND idx = ?",
+            message_id,
+            static_cast<int64_t>(index));
+    if (!url)
+        throw_missing_attachment(c, message_id, index);
+    auto entry = *url && !_cache_dir.empty() ? _cached_entry(c, **url) : std::nullopt;
+    if (!entry)
+        throw not_cached(message_id, index);
+
+    // Before the call, whose capture moves `entry` in an unspecified order with its arguments.
+    auto file = _cache_dir / cache::ATTACHMENT_DIR / entry->second;
+    _read_cache_file(
+            std::move(file),
+            wait,
+            [this, entry = std::move(*entry), message_id, index, done = std::move(done)](
+                    auto bytes) {
+                if (bytes) {
+                    _touch_cached(entry.first);
+                    return done(std::move(*bytes));
+                }
+                // Missing, or unreadable and so removed by the read: the entry indexes nothing
+                // now.  Only while it is still this entry, since an eviction and a new download
+                // meanwhile would have put a different file under the same name.
+                auto c = core.database().conn();
+                if (c.prepared_get<int64_t>(
+                            "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE id = ?)",
+                            entry.first))
+                    _emit_messages_showing(c, _drop_cached(c, entry.first, entry.second));
+                done(unexpected{not_cached(message_id, index).err()});
+            });
+}
+
+static session::error no_thumbnail(int64_t message_id, size_t index) {
+    return session::error{
+            err::no_thumbnail,
+            "Attachment {} of message {} has no thumbnail"_format(index, message_id)};
+}
+
+void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answer done, bool wait) {
+    auto c = core.database().conn();
+    // One-shot, leaving no statement open: with `wait`, the answer below writes before this
+    // returns.
+    auto row = c.prepared_maybe_get<
+            std::optional<int64_t>,
+            std::optional<std::string>,
+            std::optional<int64_t>>(
+            R"(
+        SELECT c.id, c.name, c.thumbnail
+        FROM message_attachments a LEFT JOIN attachment_cache c ON c.id = a.cached
+        WHERE a.message = ? AND a.idx = ?
+    )",
+            message_id,
+            static_cast<int64_t>(index));
+    if (!row)
+        throw_missing_attachment(c, message_id, index);
+    auto& [entry, name, thumbnail] = *row;
+    if (!thumbnail || _cache_dir.empty())
+        throw no_thumbnail(message_id, index);
+
+    _read_cache_file(
+            _cache_dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(*name),
+            wait,
+            [this, entry = *entry, message_id, index, done = std::move(done)](auto bytes) {
+                if (bytes) {
+                    _touch_cached(entry);
+                    return done(std::move(*bytes));
+                }
+                // Gone from under us, or unreadable and so removed by the read.  The file it was
+                // made from may well be fine, so it is made again.
+                auto c = core.database().conn();
+                _emit_messages_showing(c, _forget_thumbnail(c, entry));
+                _queue_thumbnail(entry);
+                done(unexpected{no_thumbnail(message_id, index).err()});
+            });
 }
 
 void Client::cancel_attachment_transfer(uint64_t token) {
@@ -3753,9 +4025,11 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
 
     auto st = c.prepared_st(
             R"(
-        SELECT message, idx, content_type, filename, flags, width, height, thumbhash,
-               size, url, unavailable, cached, saved_at
-        FROM message_attachments WHERE message IN ({}) ORDER BY message, idx
+        SELECT a.message, a.idx, a.content_type, a.filename, a.flags, a.width, a.height,
+               a.thumbhash, a.size, a.url, a.unavailable, a.cached, a.saved_at,
+               c.thumbnail IS NOT NULL
+        FROM message_attachments a LEFT JOIN attachment_cache c ON c.id = a.cached
+        WHERE a.message IN ({}) ORDER BY a.message, a.idx
     )"_format(sqlite::placeholders(msgs.size())));
 
     int n = 1;
@@ -3774,7 +4048,8 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                  url,
                  unavailable,
                  cached,
-                 saved_at] :
+                 saved_at,
+                 thumbnail] :
          sqlite::IterableStatementWrapper<
                  int64_t,
                  int64_t,
@@ -3790,7 +4065,8 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                  std::optional<std::string>,
                  std::optional<Unavailable>,
                  std::optional<int64_t>,
-                 std::optional<int64_t>>{std::move(st)}) {
+                 std::optional<int64_t>,
+                 int>{std::move(st)}) {
         auto found = by_id.find(message);
         if (found == by_id.end())
             continue;
@@ -3817,6 +4093,7 @@ void Client::_load_attachments(sqlite::Connection& c, std::vector<Message>& msgs
                 .availability = status.availability,
                 .fetch_done = status.done,
                 .fetch_total = status.total,
+                .has_thumbnail = thumbnail != 0,
                 .saved_at = saved_at ? std::optional{from_epoch_ms(*saved_at)} : std::nullopt});
     }
 }
@@ -5210,15 +5487,8 @@ Client::RemoteFile Client::_remote_file(int64_t message_id, size_t index) {
                 " WHERE a.message = ? AND a.idx = ?",
                 message_id,
                 static_cast<int64_t>(index));
-        if (!st->executeStep()) {
-            if (!c.prepared_get<int64_t>(
-                        "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?)", message_id))
-                throw session::error{
-                        err::message_not_found, "There is no message {}"_format(message_id)};
-            throw session::error{
-                    err::attachment_not_found,
-                    "Message {} has no attachment {}"_format(message_id, index)};
-        }
+        if (!st->executeStep())
+            throw_missing_attachment(c, message_id, index);
 
         auto [u, k, d, sz, verdict, outgoing] = sqlite::get<
                 std::optional<std::string>,
@@ -5362,20 +5632,26 @@ void Client::_cache_outgoing_attachment(int64_t client_id, size_t index, const s
             return;
         }
 
-        call([this, url, file, on_disk] { _record_cached(url, file, on_disk); });
+        call([this, url, file, on_disk, source] { _record_cached(url, file, on_disk, source); });
     });
 }
 
 bool Client::_record_cached(
-        const std::string& url, const std::filesystem::path& file, int64_t on_disk) {
+        const std::string& url,
+        const std::filesystem::path& file,
+        int64_t on_disk,
+        std::optional<std::filesystem::path> plain) {
     // Recorded after the file exists, so a row never describes something that is not there.
+    //
+    // A name already recorded is the same url and so the same picture, and keeps its thumbnail, or
+    // its record of failing to make one.
 
     auto c = core.database().conn();
     auto name = file.filename().string();
     c.prepared_exec(
             R"(
         INSERT INTO attachment_cache (name, size, last_used) VALUES (?1, ?2, ?3)
-        ON CONFLICT (name) DO UPDATE SET size = ?2, last_used = ?3
+        ON CONFLICT (name) DO UPDATE SET size = ?2 + coalesce(thumbnail, 0), last_used = ?3
     )",
             name,
             on_disk,
@@ -5409,6 +5685,12 @@ bool Client::_record_cached(
     // out is reported as gone.  Checked when something is added, which is the only moment the total
     // can grow.
     _evict_cache(id);
+
+    if (c.prepared_get<int64_t>(
+                "SELECT EXISTS(SELECT 1 FROM message_attachments WHERE url = ? AND {})"_format(
+                        DISPLAYABLE_IMAGE_SQL),
+                url))
+        _queue_thumbnail(id, std::move(plain));
     return true;
 }
 
@@ -5466,9 +5748,10 @@ std::vector<int64_t> Client::_drop_cached(
     // The file goes after the row, on the disk loop.  In order there, so a read of it posted while
     // the row still stood finishes first, and a download of the same file started after this
     // commits after it.
-    _post_disk([file = _cache_dir / cache::ATTACHMENT_DIR / name] {
+    _post_disk([dir = _cache_dir / cache::ATTACHMENT_DIR, name] {
         std::error_code ec;
-        std::filesystem::remove(file, ec);
+        std::filesystem::remove(dir / name, ec);
+        std::filesystem::remove(dir / cache::thumbnail_name(name), ec);
     });
 
     return showing;
@@ -5482,11 +5765,170 @@ std::vector<int64_t> Client::_messages_cached_as(sqlite::Connection& c, int64_t 
     return found;
 }
 
+std::vector<int64_t> Client::_forget_thumbnail(sqlite::Connection& c, int64_t id) {
+    if (!c.prepared_exec(
+                R"(
+        UPDATE attachment_cache SET size = size - thumbnail, thumbnail = NULL
+        WHERE id = ? AND thumbnail IS NOT NULL
+    )",
+                id))
+        return {};
+    return _messages_cached_as(c, id);
+}
+
 void Client::_touch_cached(int64_t id) {
+    // Thumbnails are read on every scroll and share their original's entry; a touch within the
+    // interval would change nothing eviction can see, and costs a write on Core's loop per tile.
+    auto now = clock_now_ms();
     core.database().conn().prepared_exec(
-            "UPDATE attachment_cache SET last_used = ?2 WHERE id = ?1",
+            "UPDATE attachment_cache SET last_used = ?2 WHERE id = ?1 AND last_used < ?3",
             id,
-            epoch_ms(clock_now_ms()));
+            epoch_ms(now),
+            epoch_ms(now - CACHE_TOUCH_INTERVAL));
+}
+
+void Client::_queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain) {
+    _thumb_pending.push_back({entry, std::move(plain)});
+    _pump_thumbnails();
+}
+
+void Client::_pump_thumbnails() {
+    if (_thumb_running || _cache_dir.empty())
+        return;
+
+    auto c = core.database().conn();
+    while (!_thumb_pending.empty()) {
+        auto next = std::move(_thumb_pending.front());
+        _thumb_pending.pop_front();
+        auto name = c.prepared_maybe_get<std::string>(
+                R"(
+            SELECT name FROM attachment_cache
+            WHERE id = ? AND thumbnail IS NULL AND thumbnail_failed IS NOT ?
+        )",
+                next.entry,
+                THUMBNAILER_VERSION);
+        if (!name)
+            continue;
+
+        _thumb_running = true;
+        auto file = _cache_dir / cache::ATTACHMENT_DIR / *name;
+        _post_thumbnail([this,
+                         entry = next.entry,
+                         name = std::move(*name),
+                         file = std::move(file),
+                         plain = std::move(next.plain),
+                         key = _cache_encryption_key(),
+                         edge = _thumbnail_edge()]() mutable {
+            std::optional<std::vector<std::byte>> jpeg;
+            try {
+                image::Source cached{file, key};
+                // Only while it is still the file that was copied: a file we sent is the user's,
+                // and may have been changed or replaced since.
+                std::optional<image::Source> local;
+                std::error_code ec;
+                if (plain && std::filesystem::file_size(*plain, ec) == cached.size() && !ec)
+                    local.emplace(*plain);
+                jpeg = image::thumbnail(local ? *local : cached, edge);
+            } catch (const std::exception& e) {
+                log::warning(
+                        cat, "Could not make a thumbnail for cache entry {}: {}", entry, e.what());
+            }
+            call([this, entry, name = std::move(name), jpeg = std::move(jpeg)]() mutable {
+                _thumbnail_made(entry, std::move(name), std::move(jpeg));
+            });
+        });
+        return;
+    }
+}
+
+void Client::_thumbnail_made(
+        int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg) {
+    auto c = core.database().conn();
+    if (!jpeg)
+        c.prepared_exec(
+                R"(
+            UPDATE attachment_cache SET thumbnail_failed = ?3
+            WHERE id = ?1 AND name = ?2 AND thumbnail IS NULL
+        )",
+                entry,
+                name,
+                THUMBNAILER_VERSION);
+
+    // Checked here and again once it is written: an eviction can land on either side of the write.
+    bool wanted = jpeg && c.prepared_get<int64_t>(
+                                  R"(
+        SELECT EXISTS(
+            SELECT 1 FROM attachment_cache WHERE id = ? AND name = ? AND thumbnail IS NULL)
+    )",
+                                  entry,
+                                  name);
+    if (!wanted) {
+        _thumb_running = false;
+        return _pump_thumbnails();
+    }
+
+    auto file = _cache_dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(name);
+    _post_disk([this,
+                entry,
+                name = std::move(name),
+                file = std::move(file),
+                key = _cache_encryption_key(),
+                jpeg = std::move(*jpeg)] {
+        std::optional<int64_t> on_disk;
+        try {
+            cache::write(file, key, jpeg);
+            on_disk = static_cast<int64_t>(std::filesystem::file_size(file));
+        } catch (const std::exception& e) {
+            log::warning(cat, "Could not cache a thumbnail for entry {}: {}", entry, e.what());
+        }
+        call([this, entry, name, on_disk] {
+            if (on_disk)
+                _record_thumbnail(entry, name, *on_disk);
+            _thumb_running = false;
+            _pump_thumbnails();
+        });
+    });
+}
+
+void Client::_record_thumbnail(int64_t entry, const std::string& name, int64_t on_disk) {
+    auto c = core.database().conn();
+    if (!c.prepared_exec(
+                R"(
+        UPDATE attachment_cache SET thumbnail = ?3, size = size + ?3, thumbnail_failed = NULL
+        WHERE id = ?1 AND name = ?2 AND thumbnail IS NULL
+    )",
+                entry,
+                name,
+                on_disk)) {
+        // Dropped while it was being written, after `_drop_cached` removed whatever was there.
+        _post_disk([file = _cache_dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(name)] {
+            std::error_code ec;
+            std::filesystem::remove(file, ec);
+        });
+        return;
+    }
+
+    _emit_messages_showing(c, _messages_cached_as(c, entry));
+    // The entry has grown, which is the other moment the total can.
+    _evict_cache(entry);
+}
+
+void Client::_thumbnail_pass() {
+    if (_cache_dir.empty())
+        return;
+
+    // Most recently used first: what is likeliest to be on screen next.
+    auto c = core.database().conn();
+    for (auto id : c.prepared_results<int64_t>(
+                 R"(
+        SELECT id FROM attachment_cache c
+        WHERE thumbnail IS NULL AND thumbnail_failed IS NOT ?
+          AND EXISTS(SELECT 1 FROM message_attachments WHERE cached = c.id AND {})
+        ORDER BY last_used DESC
+    )"_format(DISPLAYABLE_IMAGE_SQL),
+                 THUMBNAILER_VERSION))
+        _thumb_pending.push_back({id});
+    _pump_thumbnails();
 }
 
 void Client::_save_attachment(

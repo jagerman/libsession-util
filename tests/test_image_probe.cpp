@@ -25,6 +25,7 @@ using image::Format;
 using image::detail::image_ptr;
 using image_fixtures::avif_64x48;
 using image_fixtures::heic_64x48;
+using image_fixtures::heic_p3_rotated;
 
 namespace {
 
@@ -154,6 +155,14 @@ TEST_CASE("probe reads each accepted format's header", "[image][probe]") {
 #else
         CHECK(info->decodable == (heif_have_decoder_for_format(heif_compression_HEVC) != 0));
 #endif
+    }
+
+    SECTION("HEIC's rotation is applied to its dimensions once, not again for its EXIF") {
+        auto info = probe_bytes(heic_p3_rotated);
+        REQUIRE(info);
+        CHECK(info->format == Format::heic);
+        CHECK(info->width == 48);
+        CHECK(info->height == 64);
     }
 }
 
