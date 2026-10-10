@@ -53,3 +53,24 @@ a80ea641  attachment-availability, mid-branch
 b075fa2e  attachment-availability, mid-branch
 c2ee7a45  attachment-availability, mid-branch
 9dfba1c6  attachment-availability, mid-branch
+
+# The attachment-thumbnails branch (#5): every commit from the one that introduced client
+# 007_attachment_thumbnails up to bafd676e, which added thumbnail_failed as 007's first addendum.
+#
+# That addendum was folded back into 007 before merging, so a database made at any of these commits
+# has 007 recorded without thumbnail_failed, and nothing left to add it.  None exists outside the
+# branch.
+0996f505  attachment-thumbnails, mid-branch
+280e2d39  attachment-thumbnails, mid-branch
+c0b52acd  attachment-thumbnails, mid-branch
+629786a5  attachment-thumbnails, mid-branch
+3958dcd4  attachment-thumbnails, mid-branch
+645ca417  attachment-thumbnails, mid-branch
+a602871f  attachment-thumbnails, mid-branch
+d0cb7f95  attachment-thumbnails, mid-branch
+77d000f2  attachment-thumbnails, mid-branch
+40822c41  attachment-thumbnails, mid-branch
+24905850  attachment-thumbnails, mid-branch
+894f418c  attachment-thumbnails, mid-branch
+babed74f  attachment-thumbnails, mid-branch
+6f6db12a  attachment-thumbnails, mid-branch
