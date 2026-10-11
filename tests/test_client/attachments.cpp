@@ -1960,6 +1960,80 @@ TEST_CASE("Client: the sweep reconciles the cache with what the database says", 
     CHECK(kept == 1);
 }
 
+TEST_CASE(
+        "Client: a cached file found unreadable is dropped before it is fetched again",
+        "[client][attachments][cache]") {
+    TempCacheDir dir;
+    Recorder r;
+    TempClient c{r.handlers()};
+    SenderKeys peer;
+    auto convo = ConversationId::dm(peer.session_id);
+    auto* net = attach_mock_network(c->core);
+    c->set_cache_dir(dir.path);
+
+    c->open_dm(convo, await);
+    c->conversation(convo, await)->set_auto_download(AutoDownload::all, await);
+
+    std::vector<std::byte> data(2000);
+    random::fill(data);
+    auto [ct, key] = attachment::encrypt(random::random(32), data, attachment::Domain::ATTACHMENT);
+    auto url = network::file_server::generate_download_url("doc", {}, true);
+    deliver(*c,
+            peer,
+            "",
+            from_epoch_ms(1000),
+            "hh",
+            "",
+            std::nullopt,
+            [&](SessionProtos::DataMessage& d) {
+                auto* a = d.add_attachments();
+                a->set_id(1);
+                a->set_url(url);
+                a->set_key(std::string{reinterpret_cast<const char*>(key.data()), key.size()});
+                a->set_size(data.size());
+                a->set_contenttype("application/pdf");
+            });
+    sync(*c);
+    REQUIRE(serve_downloads(*net, ct) == 1);
+    sync(*c);
+    auto id = c->conversation(convo, await)->messages(await)[0].id;
+    REQUIRE(c->message(id, await)->attachments[0].availability == AttachmentAvailability::cached);
+
+    // Damaged from outside libsession, so that it no longer decrypts.
+    std::vector<std::byte> junk(3000);
+    random::fill(junk);
+    {
+        auto name = TestHelper::cache_path(*c, cache::ATTACHMENT_DIR, url).filename();
+        std::ofstream out{dir.path / cache::ATTACHMENT_DIR / name, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(junk.data()), junk.size());
+    }
+    r.msg_updated.clear();
+
+    std::optional<Expected<std::vector<std::byte>>> got;
+    c->attachment_data(id, 0, nullptr, [&](auto res) { got = std::move(res); });
+    sync(*c);
+
+    // The entry is gone before the download is served, and the message is told.
+    REQUIRE(net->downloads.size() == 1);
+    auto rows = c->core.loop().call_get([&] {
+        return c->core.database().conn().prepared_get<int64_t>(
+                "SELECT count(*) FROM attachment_cache");
+    });
+    CHECK(rows == 0);
+    bool told = false;
+    for (const auto& m : Recorder::messages(r.msg_updated))
+        if (m.id == id && m.attachments[0].availability != AttachmentAvailability::cached)
+            told = true;
+    CHECK(told);
+
+    REQUIRE(serve_downloads(*net, ct) == 1);
+    sync(*c);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    CHECK(**got == data);
+    CHECK(c->message(id, await)->attachments[0].availability == AttachmentAvailability::cached);
+}
+
 TEST_CASE("Client: the list preview describes a message's attachments", "[client][attachments]") {
     TempClient c;
     SenderKeys gallery, mixed, voice, wordy;

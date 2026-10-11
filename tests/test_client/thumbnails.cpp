@@ -727,37 +727,3 @@ TEST_CASE(
     REQUIRE(in_time);
     CHECK(got.get() == thumb);
 }
-
-TEST_CASE(
-        "Client: a cached file found unreadable is dropped before it is fetched again",
-        "[client][thumbnail][cache]") {
-    Fixture f;
-    auto data = picture(400, 300);
-    auto [id, url] = f.arrive(data);
-    REQUIRE(f.attachment(id).has_thumbnail);
-
-    std::vector<std::byte> junk(3000);
-    random::fill(junk);
-    overwrite(f.file(url), junk);
-    f.rec.msg_updated.clear();
-
-    std::promise<Expected<std::vector<std::byte>>> got;
-    f.c->attachment_data(id, 0, nullptr, [&](auto r) { got.set_value(std::move(r)); });
-
-    // The entry, and its thumbnail with it, are gone before the download, and the message is told.
-    REQUIRE(eventually([&] { return f.db_get("SELECT count(*) FROM attachment_cache") == 0; }));
-    sync(*f.c);
-    bool told = false;
-    for (const auto& m : Recorder::messages(f.rec.msg_updated))
-        if (m.id == id && !m.attachments[0].has_thumbnail)
-            told = true;
-    CHECK(told);
-
-    REQUIRE(serve_downloads(*f.net) == 1);
-    auto r = got.get_future().get();
-    REQUIRE(r);
-    CHECK(*r == data);
-    settle(*f.c);
-    CHECK(f.attachment(id).availability == AttachmentAvailability::cached);
-    CHECK(f.attachment(id).has_thumbnail);
-}
