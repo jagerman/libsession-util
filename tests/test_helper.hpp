@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <session/attachments.hpp>
@@ -484,6 +485,21 @@ class TestHelper {
     template <typename Client>
     static size_t thumbnails_queued(Client& c) {
         return c.core.call_get([&c] { return c._thumb_pending.size(); });
+    }
+
+    /// Occupies a Client's thumbnail thread, or its disk loop, until the returned promise is set:
+    /// whatever is posted there meanwhile waits behind it.
+    template <typename Client>
+    static std::shared_ptr<std::promise<void>> hold_thumbnail_thread(Client& c) {
+        auto release = std::make_shared<std::promise<void>>();
+        c._post_thumbnail([f = release->get_future().share()] { f.wait(); });
+        return release;
+    }
+    template <typename Client>
+    static std::shared_ptr<std::promise<void>> hold_disk_loop(Client& c) {
+        auto release = std::make_shared<std::promise<void>>();
+        c._post_disk([f = release->get_future().share()] { f.wait(); });
+        return release;
     }
 
     /// Drives the database-to-config direction directly, which is what makes the round-trip

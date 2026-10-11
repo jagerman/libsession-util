@@ -1320,8 +1320,8 @@ class Client {
     std::vector<std::byte> _await_bytes(bytes_read start);
 
     // Reads `file` on the disk loop, behind whatever is queued there, and hands it to `then` on
-    // Core's loop.  `wait` blocks Core's loop for it instead, for a caller on that loop that must
-    // answer before returning; safe, as nothing on the disk loop ever waits for Core's.
+    // Core's loop.  `wait` reads it right here instead, for a caller on Core's loop that must
+    // answer before returning.  Only for a file whose row the caller has just found.
     void _read_cache_file(
             std::filesystem::path file,
             bool wait,

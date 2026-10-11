@@ -1346,8 +1346,10 @@ void Client::_read_cache_file(
     auto read = [file = std::move(file), key = _cache_encryption_key()] {
         return cache::read(file, key);
     };
+    // Nothing for the disk loop to order: the caller checked the row on this loop, which is where
+    // every row is dropped, and a cache file is only ever replaced by an atomic rename.
     if (wait)
-        return then(_disk_jq->call_get(std::move(read)));
+        return then(read());
     _post_disk([this, read = std::move(read), then = std::move(then)]() mutable {
         call([then = std::move(then), bytes = read()]() mutable { then(std::move(bytes)); });
     });

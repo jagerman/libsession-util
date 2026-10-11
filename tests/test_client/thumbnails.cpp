@@ -172,6 +172,18 @@ struct Fixture {
     }
 };
 
+// A TestHelper hold, let go at the latest when this goes out of scope: declared after the Client
+// it holds, so that a failing test does not leave the Client's teardown waiting on it.
+struct Hold {
+    std::shared_ptr<std::promise<void>> promise;
+    bool released = false;
+    void release() {
+        if (!std::exchange(released, true))
+            promise->set_value();
+    }
+    ~Hold() { release(); }
+};
+
 }  // namespace
 
 TEST_CASE("Client: a downloaded picture gets a thumbnail", "[client][thumbnail]") {
@@ -519,4 +531,29 @@ TEST_CASE("Client: the waiting cache reads answer on Core's loop", "[client][thu
     CHECK(missing == err::no_thumbnail);
     settle(*f->c);
     CHECK(f->attachment(id).has_thumbnail);
+}
+
+TEST_CASE(
+        "Client: a waiting cache read on Core's loop does not wait for the disk loop",
+        "[client][thumbnail]") {
+    Fixture f;
+    auto [id, url] = f.arrive(picture(400, 300));
+    auto thumb = f.c->attachment_thumbnail(id, 0, await);
+
+    Hold hold{TestHelper::hold_disk_loop(*f.c)};
+    auto answered = std::make_shared<std::promise<std::vector<std::byte>>>();
+    std::thread reader{[c = &*f.c, id, answered] {
+        try {
+            answered->set_value(TestHelper::on_loop(
+                    c->core, [&] { return c->attachment_thumbnail(id, 0, await); }));
+        } catch (...) {
+            answered->set_exception(std::current_exception());
+        }
+    }};
+    auto got = answered->get_future();
+    bool in_time = got.wait_for(5s) == std::future_status::ready;
+    hold.release();
+    reader.join();
+    REQUIRE(in_time);
+    CHECK(got.get() == thumb);
 }
