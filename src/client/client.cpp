@@ -1419,23 +1419,21 @@ void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answe
     auto row = c.prepared_maybe_get<
             std::optional<int64_t>,
             std::optional<std::string>,
-            std::optional<int64_t>,
             std::optional<int64_t>>(
             R"(
-        SELECT c.id, c.name, c.thumbnail, c.thumbnail_failed IS NOT ?3 AND {}
+        SELECT c.id, c.name, c.thumbnail
         FROM message_attachments a LEFT JOIN attachment_cache c ON c.id = a.cached
-        WHERE a.message = ?1 AND a.idx = ?2
-    )"_format(DISPLAYABLE_IMAGE_SQL),
+        WHERE a.message = ? AND a.idx = ?
+    )",
             message_id,
-            static_cast<int64_t>(index),
-            image::thumbnailer_version);
+            static_cast<int64_t>(index));
     if (!row)
         throw_missing_attachment(c, message_id, index);
-    auto& [entry, name, thumbnail, makeable] = *row;
+    auto& [entry, name, thumbnail] = *row;
     if (_cache_dir.empty())
         throw no_thumbnail(message_id, index);
     if (!thumbnail) {
-        if (entry && makeable.value_or(0))
+        if (entry)
             _hurry_thumbnail(*entry);
         throw no_thumbnail(message_id, index);
     }
@@ -1452,6 +1450,7 @@ void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answe
                 // made from may well be fine, so it is made again.
                 auto c = core.database().conn();
                 _emit_messages_showing(c, _forget_thumbnail(c, entry));
+                _queue_thumbnail(entry);
                 _hurry_thumbnail(entry);
                 done(unexpected{no_thumbnail(message_id, index).err()});
             });
@@ -5802,8 +5801,12 @@ void Client::_queue_thumbnail(int64_t entry, std::optional<std::filesystem::path
 }
 
 void Client::_hurry_thumbnail(int64_t entry) {
-    _thumb_pending.push_front({entry});
-    _pump_thumbnails();
+    auto it = std::ranges::find(_thumb_pending, entry, &PendingThumbnail::entry);
+    if (it == _thumb_pending.end())
+        return;
+    auto pending = std::move(*it);
+    _thumb_pending.erase(it);
+    _thumb_pending.push_front(std::move(pending));
 }
 
 void Client::_unmark_thumbnail_attempt(int64_t entry) {

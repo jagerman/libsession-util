@@ -613,6 +613,14 @@ TEST_CASE(
     CHECK_FALSE(f.attachment(id).has_thumbnail);
     CHECK(f.refused_under(url) == 0);
 
+    // Not at every ask meanwhile, which would decode it again each time a tile is bound.
+    {
+        Hold hold{TestHelper::hold_thumbnail_thread(*f.c)};
+        CHECK(error_code([&] { f.c->attachment_thumbnail(id, 0, await); }) == err::no_thumbnail);
+        CHECK(f.refused_under(url) == 0);
+        CHECK(TestHelper::thumbnails_queued(*f.c) == 0);
+    }
+
     overwrite(f.file(url), good);
     f.reopen();
     CHECK(f.attachment(id).has_thumbnail);
@@ -631,8 +639,11 @@ TEST_CASE("Client: a thumbnail asked for before it is made is made next", "[clie
     REQUIRE(TestHelper::thumbnails_pending(*f.c) ==
             std::vector{f.entry(arrived[1].second), f.entry(last_url)});
 
-    CHECK(error_code([&] { f.c->attachment_thumbnail(last, 0, await); }) == err::no_thumbnail);
-    CHECK(TestHelper::thumbnails_pending(*f.c).front() == f.entry(last_url));
+    // Asked for twice, as a tile bound again would: moved, not queued again.
+    for (int i = 0; i < 2; i++)
+        CHECK(error_code([&] { f.c->attachment_thumbnail(last, 0, await); }) == err::no_thumbnail);
+    CHECK(TestHelper::thumbnails_pending(*f.c) ==
+          std::vector{f.entry(last_url), f.entry(arrived[1].second)});
 
     hold.release();
     settle(*f.c);

@@ -449,7 +449,7 @@ class Client {
     ///
     /// Reading one marks the cached file as used, as reading the file itself does: a picture being
     /// shown as its thumbnail is a picture in use, and should not be first to go.  Asking for one
-    /// that is not made yet moves it to the front of the queue.
+    /// that is waiting to be made moves it to the front of the queue.
     ///
     /// Fails with:
     ///
@@ -1261,7 +1261,8 @@ class Client {
 
     void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);
 
-    // Queues it ahead of the rest: a display is waiting for it.
+    // Moves it to the front of the queue, if it is queued: a display is waiting for it.  One that
+    // is not has been tried already, or is not to be.
     void _hurry_thumbnail(int64_t entry);
 
     void _unmark_thumbnail_attempt(int64_t entry);
