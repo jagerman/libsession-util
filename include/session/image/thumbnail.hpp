@@ -24,7 +24,7 @@ inline constexpr int thumbnail_quality = 90;
 
 /// Raised with any change to `thumbnail`, or to the decoders it uses, that could make a thumbnail
 /// of an image it refused before.  A caller that remembers refusals retries them once it changes.
-inline constexpr int thumbnailer_version = 1;
+inline constexpr int thumbnailer_version = 2;
 
 /// API: image/thumbnail
 ///

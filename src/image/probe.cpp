@@ -173,8 +173,8 @@ std::optional<Info> probe(Source& source) {
         case Format::jpeg:
         case Format::png: info.decoded_whole = interlaced != 0; break;
         case Format::webp: info.decoded_whole = info.animated(); break;
+        case Format::heic: info.decoded_whole = !detail::platform_decodes(Format::heic); break;
         case Format::gif:
-        case Format::heic:
         case Format::avif: info.decoded_whole = true; break;
     }
     info.decodable = can_decode(info.format);

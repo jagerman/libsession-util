@@ -301,4 +301,11 @@ TEST_CASE("probe says which images are decoded whole", "[image][probe]") {
     CHECK(whole(save(make_image(64, 48, 3, 2).get(), ".webp")));
     CHECK(whole(save(img.get(), ".gif")));
     CHECK(whole(avif_64x48));
+    // ImageIO decodes HEIC at the size asked for.
+#ifdef __APPLE__
+    CHECK_FALSE(whole(heic_64x48));
+#else
+    if (image::can_decode(Format::heic))
+        CHECK(whole(heic_64x48));
+#endif
 }
