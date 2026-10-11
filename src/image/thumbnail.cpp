@@ -139,7 +139,8 @@ namespace detail {
             Source& source, uint32_t edge, Backdrop backdrop) {
         auto info = probe(source);
         if (!info || !info->decodable || !info->within_pixel_limits(false) || !info->width ||
-            !info->height)
+            !info->height ||
+            (info->decoded_whole && uint64_t{info->width} * info->height > max_whole_decode_pixels))
             return std::nullopt;
 
         edge = std::clamp(edge, min_thumbnail_edge, max_thumbnail_edge);

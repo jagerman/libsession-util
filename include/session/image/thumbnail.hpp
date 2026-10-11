@@ -14,6 +14,11 @@ namespace session::image {
 inline constexpr uint32_t min_thumbnail_edge = 64;
 inline constexpr uint32_t max_thumbnail_edge = 1024;
 
+/// The most pixels `thumbnail` decodes from an image that is decoded whole (`Info::decoded_whole`).
+/// Those cost about 3 to 21 bytes a pixel depending on the format, so `max_frame_pixels` would let
+/// a file of a few hundred bytes take over a gigabyte.  At this limit: tens of MB, AVIF about 350.
+inline constexpr uint64_t max_whole_decode_pixels = 4096 * 4096;
+
 /// The JPEG quality thumbnails are encoded at.
 inline constexpr int thumbnail_quality = 90;
 
@@ -34,7 +39,8 @@ inline constexpr int thumbnail_quality = 90;
 ///   at all.
 ///
 /// Returns nullopt for anything that is not an image we accept: what `probe` refuses, a format
-/// this build cannot decode (HEIC outside Apple platforms), and an image over `max_frame_pixels`.
+/// this build cannot decode (HEIC outside Apple platforms), an image over `max_frame_pixels`, and
+/// one decoded whole that is over `max_whole_decode_pixels`.
 ///
 /// Throws std::runtime_error if the source cannot be read -- an encrypted source that turns out to
 /// be corrupt, say -- or an image that probed as acceptable fails to decode.

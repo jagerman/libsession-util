@@ -285,3 +285,20 @@ TEST_CASE("probe throws a decryption error rather than calling it not an image",
             std::runtime_error,
             Message("Attachment decryption failed: invalid key or corrupted data"));
 }
+
+TEST_CASE("probe says which images are decoded whole", "[image][probe]") {
+    auto whole = [](std::span<const std::byte> data) {
+        auto info = probe_bytes(data);
+        REQUIRE(info);
+        return info->decoded_whole;
+    };
+    auto img = make_image(64, 48);
+    CHECK_FALSE(whole(save(img.get(), ".jpg")));
+    CHECK(whole(save(img.get(), ".jpg[interlace]")));
+    CHECK_FALSE(whole(save(img.get(), ".png")));
+    CHECK(whole(save(img.get(), ".png[interlace]")));
+    CHECK_FALSE(whole(save(img.get(), ".webp")));
+    CHECK(whole(save(make_image(64, 48, 3, 2).get(), ".webp")));
+    CHECK(whole(save(img.get(), ".gif")));
+    CHECK(whole(avif_64x48));
+}

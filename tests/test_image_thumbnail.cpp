@@ -392,3 +392,25 @@ TEST_CASE("thumbnail backdrop benchmark", "[.][thumbnail-bench]") {
                         ms[0]);
             }
 }
+
+TEST_CASE(
+        "thumbnail refuses an image decoded whole over max_whole_decode_pixels",
+        "[image][thumbnail]") {
+    static_assert(image::max_whole_decode_pixels == 4096 * 4096);
+    // Solid, so that something this size encodes quickly.
+    auto solid = [](int w, int h) {
+        image::init();
+        VipsImage* black;
+        REQUIRE(vips_black(&black, w, h, "bands", 3, nullptr) == 0);
+        image_ptr b{black};
+        VipsImage* srgb;
+        REQUIRE(vips_copy(black, &srgb, "interpretation", VIPS_INTERPRETATION_sRGB, nullptr) == 0);
+        return image_ptr{srgb};
+    };
+    auto at_limit = solid(4096, 4096), over = solid(4097, 4096);
+
+    CHECK(thumb(save(at_limit.get(), ".jpg[interlace]"), 64));
+    CHECK_FALSE(thumb(save(over.get(), ".jpg[interlace]"), 64));
+    // A baseline JPEG shrinks as it decodes, so its size is no reason to refuse it.
+    CHECK(thumb(save(over.get(), ".jpg"), 64));
+}
