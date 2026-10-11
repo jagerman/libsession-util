@@ -1379,16 +1379,17 @@ void Client::_attachment_data_cached(
                     _touch_cached(entry.first);
                     return done(std::move(*bytes));
                 }
-                // Missing, or unreadable and so removed by the read: the entry indexes nothing
-                // now.  Only while it is still this entry, since an eviction and a new download
-                // meanwhile would have put a different file under the same name.
-                auto c = core.database().conn();
-                if (c.prepared_get<int64_t>(
-                            "SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE id = ?)",
-                            entry.first))
-                    _emit_messages_showing(c, _drop_cached(c, entry.first, entry.second));
+                _drop_unreadable(entry.first, entry.second);
                 done(unexpected{not_cached(message_id, index).err()});
             });
+}
+
+void Client::_drop_unreadable(int64_t id, const std::string& name) {
+    // Only while the entry is still there: evicted and fetched again meanwhile, the name holds a
+    // good file under a new id.
+    auto c = core.database().conn();
+    if (c.prepared_get<int64_t>("SELECT EXISTS(SELECT 1 FROM attachment_cache WHERE id = ?)", id))
+        _emit_messages_showing(c, _drop_cached(c, id, name));
 }
 
 static session::error no_thumbnail(int64_t message_id, size_t index) {
@@ -1531,44 +1532,39 @@ void Client::_fetch_cached(FetchTarget target, bool caching, Waiter w) {
         // entry was written with; a picture has no row, so the only way to it is to work the name
         // out again.
         std::filesystem::path file;
-        std::optional<int64_t> entry_id;
+        std::optional<std::pair<int64_t, std::string>> entry;
         if (target.dir == cache::ATTACHMENT_DIR) {
             auto c = core.database().conn();
-            if (auto entry = _cached_entry(c, target.remote.url)) {
-                entry_id = entry->first;
+            entry = _cached_entry(c, target.remote.url);
+            if (entry)
                 file = _cache_dir / target.dir / entry->second;
-            }
         } else
             file = _cache_path(target.dir, target.remote.url);
 
         // Read on the disk loop and decided back here, since what a miss goes on to do -- join a
         // transfer or start one -- is this loop's registry to touch.
         if (!file.empty()) {
-            _post_disk([this,
-                        file = std::move(file),
-                        key = _cache_encryption_key(),
-                        entry_id,
-                        target = std::move(target),
-                        caching,
-                        w = std::move(w)]() mutable {
-                auto cached = cache::read(file, key);
-                call([this,
-                      cached = std::move(cached),
-                      entry_id,
-                      target = std::move(target),
-                      caching,
-                      w = std::move(w)]() mutable {
-                    if (!cached)
-                        return _fetch_uncached(std::move(target), caching, std::move(w));
-                    // Nothing to report: there is no transfer, and a progress bar for a local read
-                    // is a flicker that means nothing.  The caller gets the bytes.
-                    if (entry_id)
-                        _touch_cached(*entry_id);
-                    _report(w.cb, Expected<std::vector<std::byte>>{std::move(*cached)});
-                    if (w.ended)
-                        w.ended();
-                });
-            });
+            _read_cache_file(
+                    std::move(file),
+                    false,
+                    [this,
+                     entry = std::move(entry),
+                     target = std::move(target),
+                     caching,
+                     w = std::move(w)](auto cached) mutable {
+                        if (!cached) {
+                            if (entry)
+                                _drop_unreadable(entry->first, entry->second);
+                            return _fetch_uncached(std::move(target), caching, std::move(w));
+                        }
+                        // Nothing to report: there is no transfer, and a progress bar for a local
+                        // read is a flicker that means nothing.  The caller gets the bytes.
+                        if (entry)
+                            _touch_cached(entry->first);
+                        _report(w.cb, Expected<std::vector<std::byte>>{std::move(*cached)});
+                        if (w.ended)
+                            w.ended();
+                    });
             return;
         }
     }
