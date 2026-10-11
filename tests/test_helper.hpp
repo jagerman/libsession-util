@@ -482,6 +482,12 @@ class TestHelper {
         c.core.call_get([&c] { c._thumb_running = true; });
     }
 
+    /// Queues what a Client queues at open.
+    template <typename Client>
+    static void thumbnail_pass(Client& c) {
+        c.core.call_get([&c] { c._thumbnail_pass(); });
+    }
+
     /// Makes a Client act as though it were decoding `entry`'s thumbnail, with no answer to come.
     template <typename Client>
     static void pretend_thumbnail_attempt(Client& c, int64_t entry) {

@@ -626,6 +626,30 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Client: a thumbnail left by an attempt that did not settle is queued after the rest",
+        "[client][thumbnail]") {
+    // So that a picture whose decode ends the process does not do so before the backlog is made.
+    Fixture f;
+    auto [a, a_url] = f.arrive(picture(400, 300));
+    auto [b, b_url] = f.arrive(picture(300, 400));
+    f.strip_thumbnail(a_url);
+    f.strip_thumbnail(b_url);
+    auto ea = f.entry(a_url), eb = f.entry(b_url);
+    TestHelper::on_loop(f.c->core, [&] {
+        auto conn = f.c->core.database().conn();
+        conn.prepared_exec("UPDATE attachment_cache SET last_used = 1000 WHERE id = ?", ea);
+        conn.prepared_exec(
+                "UPDATE attachment_cache SET last_used = 2000, thumbnail_failed = ? WHERE id = ?",
+                -image::thumbnailer_version,
+                eb);
+    });
+
+    TestHelper::stall_thumbnails(*f.c);
+    TestHelper::thumbnail_pass(*f.c);
+    CHECK(TestHelper::thumbnails_pending(*f.c) == std::vector{ea, eb});
+}
+
+TEST_CASE(
         "Client: a thumbnail that fails to be made is tried again at the next open",
         "[client][thumbnail]") {
     Fixture f;
