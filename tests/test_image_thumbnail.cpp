@@ -406,11 +406,30 @@ TEST_CASE(
         REQUIRE(vips_copy(black, &srgb, "interpretation", VIPS_INTERPRETATION_sRGB, nullptr) == 0);
         return image_ptr{srgb};
     };
-    // A progressive JPEG is budgeted at 9 bytes a pixel, about 39 MP; AVIF at 21, 4096x4096.
+    // A progressive JPEG is budgeted at 10 bytes a pixel, about 35 MP.
     auto under = solid(4097, 4096), over = solid(6400, 6400);
 
     CHECK(thumb(save(under.get(), ".jpg[interlace]"), 64));
     CHECK_FALSE(thumb(save(over.get(), ".jpg[interlace]"), 64));
     // A baseline JPEG shrinks as it decodes, so its size is no reason to refuse it.
     CHECK(thumb(save(over.get(), ".jpg"), 64));
+
+    // 16 bits a sample cost 10 bytes a pixel against 8 bits' 6: 36 MP is over one, not the other.
+    VipsImage *black, *deep, *grey;
+    REQUIRE(vips_black(&black, 6000, 6000, nullptr) == 0);
+    image_ptr b{black};
+    REQUIRE(vips_cast_ushort(black, &deep, nullptr) == 0);
+    image_ptr d{deep};
+    REQUIRE(vips_copy(deep, &grey, "interpretation", VIPS_INTERPRETATION_GREY16, nullptr) == 0);
+    image_ptr g{grey};
+    CHECK_FALSE(thumb(save(grey, ".png[interlace]"), 64));
+
+    // AVIF at 15 bytes a pixel, about 23 MP, and at 27 over 8 bits.
+    REQUIRE(image::can_decode(image::Format::avif));
+    CHECK_FALSE(thumb(image_fixtures::avif8_4900x4900, 64));
+    image::Source src{image_fixtures::avif10_3700x3700};
+    auto info = image::probe(src);
+    REQUIRE(info);
+    CHECK(info->bits_per_sample == 16);
+    CHECK_FALSE(thumb(image_fixtures::avif10_3700x3700, 64));
 }

@@ -49,6 +49,9 @@ struct Info {
     /// The others stream or shrink as they decode, at a fraction of the memory.
     bool decoded_whole;
 
+    /// Bits a sample takes once decoded: 8, or 16 for a 16-bit PNG and a HEIF of over 8 bits.
+    uint8_t bits_per_sample;
+
     /// Whether this build can decode the image: `can_decode(format)`.
     bool decodable;
 

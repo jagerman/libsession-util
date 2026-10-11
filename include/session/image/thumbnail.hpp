@@ -15,9 +15,9 @@ inline constexpr uint32_t min_thumbnail_edge = 64;
 inline constexpr uint32_t max_thumbnail_edge = 1024;
 
 /// The most memory `thumbnail` lets an image decoded whole (`Info::decoded_whole`) take, estimated
-/// from its size at 5 to 21 bytes a pixel by format: an AVIF of 4096x4096, a progressive JPEG of
-/// about 39 MP.  Under `max_frame_pixels` alone, a file of a few hundred bytes could take
-/// gigabytes.
+/// from its size at 6 to 27 bytes a pixel by format and bit depth: an 8-bit AVIF of about 23 MP, a
+/// progressive JPEG of about 35 MP.  Under `max_frame_pixels` alone, a file of a few hundred bytes
+/// could take gigabytes.
 inline constexpr uint64_t max_whole_decode_bytes = uint64_t{336} << 20;
 
 /// The JPEG quality thumbnails are encoded at.

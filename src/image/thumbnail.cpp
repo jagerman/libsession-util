@@ -21,18 +21,19 @@ namespace detail {
         constexpr int CHECKER_SQUARE = 8;
         constexpr unsigned CHECKER_LIGHT = 0xFF, CHECKER_DARK = 0xCC;
 
-        // Peaks measured with libvips 8.18, rounded up: AVIF 21, progressive 4:4:4 JPEG and
-        // animated WebP 9, GIF 5, interlaced PNG 4.  HEIC goes through libheif as AVIF does.
-        uint64_t whole_decode_bytes_per_pixel(Format format) {
-            switch (format) {
+        // Peak bytes over pixels measured with this build's libvips 8.18, rounded up, at 8 bits a
+        // sample and over.  HEIC goes through libheif as AVIF does.
+        uint64_t whole_decode_bytes_per_pixel(const Info& info) {
+            bool deep = info.bits_per_sample > 8;
+            switch (info.format) {
                 case Format::jpeg:
-                case Format::webp: return 9;
-                case Format::gif:
-                case Format::png: return 5;
+                case Format::webp: return 10;
+                case Format::gif: return 6;
+                case Format::png: return deep ? 10 : 6;
                 case Format::heic:
-                case Format::avif: return 21;
+                case Format::avif: return deep ? 27 : 15;
             }
-            return 21;
+            return 27;
         }
 
         image_ptr to_srgb8(VipsImage* img) {
@@ -155,7 +156,7 @@ namespace detail {
         if (!info || !info->decodable || !info->within_pixel_limits(false) || !info->width ||
             !info->height ||
             (info->decoded_whole &&
-             uint64_t{info->width} * info->height * whole_decode_bytes_per_pixel(info->format) >
+             uint64_t{info->width} * info->height * whole_decode_bytes_per_pixel(*info) >
                      max_whole_decode_bytes))
             return std::nullopt;
 

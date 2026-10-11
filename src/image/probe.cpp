@@ -166,6 +166,7 @@ std::optional<Info> probe(Source& source) {
     if (info.orientation >= 5)
         std::swap(info.width, info.height);
     info.has_alpha = vips_image_hasalpha(img.get());
+    info.bits_per_sample = static_cast<uint8_t>(8 * vips_format_sizeof_unsafe(img->BandFmt));
     int interlaced = 0;
     if (vips_image_get_typeof(img.get(), "interlaced"))
         vips_image_get_int(img.get(), "interlaced", &interlaced);
