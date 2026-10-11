@@ -49,20 +49,23 @@ struct SenderKeys {
 /// RAII Client over a unique temporary database, mirroring TempCore.  Unlike TempCore this can
 /// close and reopen the same file, which is how the restart behaviour is exercised.
 struct TempClient {
-    std::filesystem::path path;
+    std::filesystem::path path{
+            std::filesystem::temp_directory_path() /
+            fmt::format("{}.db", random::unique_id("test_client", 7))};
     std::unique_ptr<Client> client;
 
     template <ClientOption... Opts>
     explicit TempClient(Opts&&... opts) :
-            path{std::filesystem::temp_directory_path() /
-                 fmt::format("{}.db", random::unique_id("test_client", 7))},
             client{std::make_unique<Client>(path, std::forward<Opts>(opts)...)} {}
 
     template <ClientOption... Opts>
     explicit TempClient(callbacks cbs, Opts&&... opts) :
-            path{std::filesystem::temp_directory_path() /
-                 fmt::format("{}.db", random::unique_id("test_client", 7))},
             client{std::make_unique<Client>(path, std::move(cbs), std::forward<Opts>(opts)...)} {}
+
+    /// Leaves the file for the test to create; the first reopen() opens it.
+    struct unopened_t {};
+    static constexpr unopened_t unopened{};
+    explicit TempClient(unopened_t) {}
 
     template <ClientOption... Opts>
     void reopen(Opts&&... opts) {
@@ -79,6 +82,28 @@ struct TempClient {
     Client* operator->() { return client.get(); }
     Client& operator*() { return *client; }
 };
+
+/// Opens `path` as a release from before client migration `first_missing` would have created it:
+/// the client schema built from `old_full_schema`, that release's client full_schema.sql, and only
+/// the migrations ahead of `first_missing` recorded.  A Client opened on it afterwards upgrades it.
+///
+/// The old schema has to be supplied: a database without a client schema is built from today's
+/// full_schema.sql, never by replaying migrations, so no stopping point alone yields an older one.
+inline core::Core open_client_schema_before(
+        const std::filesystem::path& path,
+        std::string_view first_missing,
+        std::string_view old_full_schema) {
+    auto stop = std::ranges::find(
+            client::schema::MIGRATIONS, first_missing, &core::schema::Migration::name);
+    if (stop == client::schema::MIGRATIONS.end())
+        throw std::invalid_argument{fmt::format("no client migration named {}", first_missing)};
+    return core::Core{
+            path,
+            core::schema_extension{
+                    "client",
+                    client::schema::MIGRATIONS.first(stop - client::schema::MIGRATIONS.begin()),
+                    old_full_schema}};
+}
 
 /// A cache directory that removes itself, so a failing assertion cannot leave one behind.
 struct TempCacheDir {
