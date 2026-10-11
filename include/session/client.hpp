@@ -1242,7 +1242,8 @@ class Client {
     // Placed, emplaced and stopped as the disk loop is, for the same reasons.
     std::shared_ptr<oxen::quic::Loop> _thumb_loop;
     std::optional<oxen::quic::JobQueue> _thumb_jq;
-    void _post_thumbnail(std::function<void()> job);
+    // False once the queue has stopped.
+    bool _post_thumbnail(std::function<void()> job);
 
     // Cache entries waiting for a thumbnail, oldest first, and whether one is being made.  Core's
     // loop's.  One at a time end to end -- made, written on the disk loop, recorded -- which is
@@ -1254,17 +1255,26 @@ class Client {
     std::deque<PendingThumbnail> _thumb_pending;
     bool _thumb_running = false;
 
+    // The entry being decoded, whose row is marked as refused until `_thumbnail_made` settles it.
+    std::optional<int64_t> _thumb_attempt;
+
     void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);
+
+    void _unmark_thumbnail_attempt(int64_t entry);
 
     // Starts the next queued thumbnail unless one is being made, skipping entries that have gone
     // since they were queued, or that now have a thumbnail or a recorded failure to make one.
     void _pump_thumbnails();
 
-    // Back from the thumbnail thread with what it made, or nullopt if the file is not a picture it
-    // could make one of: writes it beside the entry if the entry still wants it, or records the
-    // failure so that the entry is not tried again.
+    // Back from the thumbnail thread with what it made: writes it beside the entry if the entry
+    // still wants it.  Nullopt is a refusal, which stays recorded until
+    // `image::thumbnailer_version` changes; `failed`, an exception, which may not happen again and
+    // so is retried at next start.
     void _thumbnail_made(
-            int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg);
+            int64_t entry,
+            std::string name,
+            std::optional<std::vector<std::byte>> jpeg,
+            bool failed);
 
     // Records a thumbnail written beside entry `entry`, and tells the messages showing it; or, if
     // the entry has gone meanwhile, removes the thumbnail again.

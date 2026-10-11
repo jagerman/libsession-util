@@ -22,6 +22,10 @@ inline constexpr uint64_t max_whole_decode_pixels = 4096 * 4096;
 /// The JPEG quality thumbnails are encoded at.
 inline constexpr int thumbnail_quality = 90;
 
+/// Raised with any change to `thumbnail`, or to the decoders it uses, that could make a thumbnail
+/// of an image it refused before.  A caller that remembers refusals retries them once it changes.
+inline constexpr int thumbnailer_version = 1;
+
 /// API: image/thumbnail
 ///
 /// A square JPEG of the image in `source`, for drawing it small: the image scaled to cover a
@@ -40,10 +44,12 @@ inline constexpr int thumbnail_quality = 90;
 ///
 /// Returns nullopt for anything that is not an image we accept: what `probe` refuses, a format
 /// this build cannot decode (HEIC outside Apple platforms), an image over `max_frame_pixels`, and
-/// one decoded whole that is over `max_whole_decode_pixels`.
+/// one decoded whole that is over `max_whole_decode_pixels`.  The same image always gets the same
+/// answer from the same `thumbnailer_version`.
 ///
 /// Throws std::runtime_error if the source cannot be read -- an encrypted source that turns out to
-/// be corrupt, say -- or an image that probed as acceptable fails to decode.
+/// be corrupt, say -- or an image that probed as acceptable fails to decode, which may not happen
+/// again: memory running short is one way.
 std::optional<std::vector<std::byte>> thumbnail(Source& source, uint32_t edge);
 
 }  // namespace session::image

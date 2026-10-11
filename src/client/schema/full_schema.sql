@@ -312,9 +312,10 @@ CREATE TABLE attachment_cache (
     -- `name` + `cache::THUMBNAIL_SUFFIX`, and evicted and deleted with it.  Kept apart from `size`
     -- so that a thumbnail found missing can be taken back out of it.
     thumbnail INTEGER,
-    -- The thumbnailer version (`THUMBNAILER_VERSION`) under which making a thumbnail from this file
-    -- last failed, or NULL.  Not tried again until that version changes, so that a picture no
-    -- thumbnail can be made of is not decoded again at every start.
+    -- The thumbnailer version (`image::thumbnailer_version`) under which this file was refused a
+    -- thumbnail, or NULL.  Set before each attempt and cleared unless it is refused, so that a
+    -- decode that ends the process counts as a refusal.  Not tried again until that version
+    -- changes, so that neither is decoded again at every start.
     thumbnail_failed INTEGER
 ) STRICT;
 

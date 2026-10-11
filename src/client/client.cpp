@@ -743,14 +743,22 @@ Client::~Client() {
     // First, while everything a disk or thumbnail job reaches is still here.  On their own loops,
     // so that a job already running finishes before its queue stops rather than alongside it.
     _thumb_loop->call_get([this] { _thumb_jq->stop(); });
+    // No decode is running now, so one still marked as attempted did not end the process.  Through
+    // the loop rather than `_jq`, which would first run the reports queued on it.
+    core.loop().call_get([this] {
+        if (_thumb_attempt)
+            _unmark_thumbnail_attempt(*_thumb_attempt);
+    });
     _disk_loop->call_get([this] { _disk_jq->stop(); });
 }
 
-static void post_unless_stopped(oxen::quic::JobQueue& jq, std::function<void()> job) {
+static bool post_unless_stopped(oxen::quic::JobQueue& jq, std::function<void()> job) {
     try {
         jq.call_soon(std::move(job));
+        return true;
     } catch (const std::exception&) {
         // Stopped: this Client is going away.
+        return false;
     }
 }
 
@@ -758,8 +766,8 @@ void Client::_post_disk(std::function<void()> job) {
     post_unless_stopped(*_disk_jq, std::move(job));
 }
 
-void Client::_post_thumbnail(std::function<void()> job) {
-    post_unless_stopped(*_thumb_jq, std::move(job));
+bool Client::_post_thumbnail(std::function<void()> job) {
+    return post_unless_stopped(*_thumb_jq, std::move(job));
 }
 
 void Client::_sweep_cache() {
@@ -991,10 +999,6 @@ namespace {
     constexpr auto REQUESTED_MAX_KEY = "client:requested_cache_max_size";
     constexpr auto AUTO_DL_CONCURRENCY_KEY = "client:auto_download_concurrency";
     constexpr auto THUMBNAIL_EDGE_KEY = "client:thumbnail_edge";
-    // Recorded as `thumbnail_failed` against an entry no thumbnail could be made from, which is
-    // retried only once this is raised: raise it with a change that could now make one -- a format
-    // becoming decodable, say.
-    constexpr int64_t THUMBNAILER_VERSION = 1;
     constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
 
@@ -5790,6 +5794,11 @@ void Client::_queue_thumbnail(int64_t entry, std::optional<std::filesystem::path
     _pump_thumbnails();
 }
 
+void Client::_unmark_thumbnail_attempt(int64_t entry) {
+    core.database().conn().prepared_exec(
+            "UPDATE attachment_cache SET thumbnail_failed = NULL WHERE id = ?", entry);
+}
+
 void Client::_pump_thumbnails() {
     if (_thumb_running || _cache_dir.empty())
         return;
@@ -5804,20 +5813,28 @@ void Client::_pump_thumbnails() {
             WHERE id = ? AND thumbnail IS NULL AND thumbnail_failed IS NOT ?
         )",
                 next.entry,
-                THUMBNAILER_VERSION);
+                image::thumbnailer_version);
         if (!name)
             continue;
 
+        // Marked as refused before the decode, so that one that takes the process down with it is
+        // not tried again at every start.  `_thumbnail_made` settles it.
+        c.prepared_exec(
+                "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
+                image::thumbnailer_version,
+                next.entry);
         _thumb_running = true;
+        _thumb_attempt = next.entry;
         auto file = _cache_dir / cache::ATTACHMENT_DIR / *name;
-        _post_thumbnail([this,
-                         entry = next.entry,
-                         name = std::move(*name),
-                         file = std::move(file),
-                         plain = std::move(next.plain),
-                         key = _cache_encryption_key(),
-                         edge = _thumbnail_edge()]() mutable {
+        bool posted = _post_thumbnail([this,
+                                       entry = next.entry,
+                                       name = std::move(*name),
+                                       file = std::move(file),
+                                       plain = std::move(next.plain),
+                                       key = _cache_encryption_key(),
+                                       edge = _thumbnail_edge()]() mutable {
             std::optional<std::vector<std::byte>> jpeg;
+            bool failed = false;
             try {
                 image::Source cached{file, key};
                 // Only while it is still the file that was copied: a file we sent is the user's,
@@ -5828,29 +5845,29 @@ void Client::_pump_thumbnails() {
                     local.emplace(*plain);
                 jpeg = image::thumbnail(local ? *local : cached, edge);
             } catch (const std::exception& e) {
+                failed = true;
                 log::warning(
                         cat, "Could not make a thumbnail for cache entry {}: {}", entry, e.what());
             }
-            call([this, entry, name = std::move(name), jpeg = std::move(jpeg)]() mutable {
-                _thumbnail_made(entry, std::move(name), std::move(jpeg));
+            call([this, entry, name = std::move(name), jpeg = std::move(jpeg), failed]() mutable {
+                _thumbnail_made(entry, std::move(name), std::move(jpeg), failed);
             });
         });
+        if (!posted) {
+            _unmark_thumbnail_attempt(next.entry);
+            _thumb_attempt.reset();
+            _thumb_running = false;
+        }
         return;
     }
 }
 
 void Client::_thumbnail_made(
-        int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg) {
+        int64_t entry, std::string name, std::optional<std::vector<std::byte>> jpeg, bool failed) {
+    _thumb_attempt.reset();
     auto c = core.database().conn();
-    if (!jpeg)
-        c.prepared_exec(
-                R"(
-            UPDATE attachment_cache SET thumbnail_failed = ?3
-            WHERE id = ?1 AND name = ?2 AND thumbnail IS NULL
-        )",
-                entry,
-                name,
-                THUMBNAILER_VERSION);
+    if (jpeg || failed)
+        _unmark_thumbnail_attempt(entry);
 
     // Checked here and again once it is written: an eviction can land on either side of the write.
     bool wanted = jpeg && c.prepared_get<int64_t>(
@@ -5924,7 +5941,7 @@ void Client::_thumbnail_pass() {
           AND EXISTS(SELECT 1 FROM message_attachments WHERE cached = c.id AND {})
         ORDER BY last_used DESC
     )"_format(DISPLAYABLE_IMAGE_SQL),
-                 THUMBNAILER_VERSION))
+                 image::thumbnailer_version))
         _thumb_pending.push_back({id});
     _pump_thumbnails();
 }

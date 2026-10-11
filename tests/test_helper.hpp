@@ -482,6 +482,15 @@ class TestHelper {
         c.core.call_get([&c] { c._thumb_running = true; });
     }
 
+    /// Makes a Client act as though it were decoding `entry`'s thumbnail, with no answer to come.
+    template <typename Client>
+    static void pretend_thumbnail_attempt(Client& c, int64_t entry) {
+        c.core.call_get([&c, entry] {
+            c._thumb_running = true;
+            c._thumb_attempt = entry;
+        });
+    }
+
     template <typename Client>
     static size_t thumbnails_queued(Client& c) {
         return c.core.call_get([&c] { return c._thumb_pending.size(); });

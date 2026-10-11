@@ -170,6 +170,18 @@ struct Fixture {
         return TestHelper::on_loop(
                 c->core, [&] { return c->core.database().conn().prepared_get<T>(query, bind...); });
     }
+
+    int64_t entry(const std::string& url) {
+        return db_get(
+                "SELECT id FROM attachment_cache WHERE name = ?", file(url).filename().string());
+    }
+
+    // The thumbnailer version the entry is recorded as refused under, or 0.
+    int64_t refused_under(const std::string& url) {
+        return db_get(
+                "SELECT coalesce(thumbnail_failed, 0) FROM attachment_cache WHERE name = ?",
+                file(url).filename().string());
+    }
 };
 
 // Replaces a file's contents, as something outside libsession going wrong would.
@@ -544,6 +556,62 @@ TEST_CASE("Client: the waiting cache reads answer on Core's loop", "[client][thu
     CHECK(missing == err::no_thumbnail);
     settle(*f->c);
     CHECK(f->attachment(id).has_thumbnail);
+}
+
+TEST_CASE("Client: a thumbnail is recorded as refused until it is made", "[client][thumbnail]") {
+    // So that a decode that takes the process down with it is not tried again at every start.
+    Fixture f;
+    Hold hold{TestHelper::hold_thumbnail_thread(*f.c)};
+    auto [id, url] = f.arrive(picture(400, 300), "image/png", false);
+    CHECK(f.refused_under(url) == image::thumbnailer_version);
+
+    hold.release();
+    settle(*f.c);
+    CHECK(f.attachment(id).has_thumbnail);
+    CHECK(f.refused_under(url) == 0);
+}
+
+TEST_CASE(
+        "Client: closing while a thumbnail is being made leaves it to be made at the next open",
+        "[client][thumbnail]") {
+    Fixture f;
+    TestHelper::stall_thumbnails(*f.c);
+    auto [id, url] = f.arrive(picture(400, 300), "image/png", false);
+
+    // The row marked and the decode's answer never delivered: what closing mid-decode leaves.
+    auto entry = f.entry(url);
+    TestHelper::on_loop(f.c->core, [&] {
+        f.c->core.database().conn().prepared_exec(
+                "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
+                image::thumbnailer_version,
+                entry);
+    });
+    TestHelper::pretend_thumbnail_attempt(*f.c, entry);
+
+    f.reopen();
+    CHECK(f.attachment(id).has_thumbnail);
+    CHECK(f.refused_under(url) == 0);
+}
+
+TEST_CASE(
+        "Client: a thumbnail that fails to be made is tried again at the next open",
+        "[client][thumbnail]") {
+    Fixture f;
+    auto [id, url] = f.arrive(picture(400, 300));
+    auto good = contents(f.file(url));
+    f.strip_thumbnail(url);
+
+    // Not an encrypted file at all, so making a thumbnail throws rather than refusing.
+    std::vector<std::byte> junk(3000);
+    random::fill(junk);
+    overwrite(f.file(url), junk);
+    f.reopen();
+    CHECK_FALSE(f.attachment(id).has_thumbnail);
+    CHECK(f.refused_under(url) == 0);
+
+    overwrite(f.file(url), good);
+    f.reopen();
+    CHECK(f.attachment(id).has_thumbnail);
 }
 
 TEST_CASE(
