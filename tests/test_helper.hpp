@@ -496,6 +496,16 @@ class TestHelper {
         return c.core.call_get([&c] { return c._thumb_pending.size(); });
     }
 
+    template <typename Client>
+    static std::vector<int64_t> thumbnails_pending(Client& c) {
+        return c.core.call_get([&c] {
+            std::vector<int64_t> entries;
+            for (const auto& p : c._thumb_pending)
+                entries.push_back(p.entry);
+            return entries;
+        });
+    }
+
     /// Occupies a Client's thumbnail thread, or its disk loop, until the returned promise is set:
     /// whatever is posted there meanwhile waits behind it.
     template <typename Client>

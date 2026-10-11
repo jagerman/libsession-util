@@ -1002,6 +1002,16 @@ namespace {
     constexpr int DEFAULT_AUTO_DL_CONCURRENCY = 4;
 }  // namespace
 
+// The SQL counterpart of image::is_displayable_image(), built from the same list so the two cannot
+// drift apart.  SQLite's lower() folds only ASCII, which is also all the C++ side folds.
+static const std::string DISPLAYABLE_IMAGE_SQL = [] {
+    std::string sql = "lower(content_type) IN (";
+    for (auto type : image::displayable_image_types)
+        sql += "'{}',"_format(type);
+    sql.back() = ')';
+    return sql;
+}();
+
 // Checked on the calling thread, so that a caller's mistake surfaces where they made it rather than
 // in a callback.
 static std::optional<int64_t> checked_limit(std::string_view setter, std::optional<int64_t> bytes) {
@@ -1409,19 +1419,26 @@ void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answe
     auto row = c.prepared_maybe_get<
             std::optional<int64_t>,
             std::optional<std::string>,
+            std::optional<int64_t>,
             std::optional<int64_t>>(
             R"(
-        SELECT c.id, c.name, c.thumbnail
+        SELECT c.id, c.name, c.thumbnail, c.thumbnail_failed IS NOT ?3 AND {}
         FROM message_attachments a LEFT JOIN attachment_cache c ON c.id = a.cached
-        WHERE a.message = ? AND a.idx = ?
-    )",
+        WHERE a.message = ?1 AND a.idx = ?2
+    )"_format(DISPLAYABLE_IMAGE_SQL),
             message_id,
-            static_cast<int64_t>(index));
+            static_cast<int64_t>(index),
+            image::thumbnailer_version);
     if (!row)
         throw_missing_attachment(c, message_id, index);
-    auto& [entry, name, thumbnail] = *row;
-    if (!thumbnail || _cache_dir.empty())
+    auto& [entry, name, thumbnail, makeable] = *row;
+    if (_cache_dir.empty())
         throw no_thumbnail(message_id, index);
+    if (!thumbnail) {
+        if (entry && makeable.value_or(0))
+            _hurry_thumbnail(*entry);
+        throw no_thumbnail(message_id, index);
+    }
 
     _read_cache_file(
             _cache_dir / cache::ATTACHMENT_DIR / cache::thumbnail_name(*name),
@@ -1435,7 +1452,7 @@ void Client::_attachment_thumbnail(int64_t message_id, size_t index, bytes_answe
                 // made from may well be fine, so it is made again.
                 auto c = core.database().conn();
                 _emit_messages_showing(c, _forget_thumbnail(c, entry));
-                _queue_thumbnail(entry);
+                _hurry_thumbnail(entry);
                 done(unexpected{no_thumbnail(message_id, index).err()});
             });
 }
@@ -2179,16 +2196,6 @@ static constexpr auto IS_REQUEST =
 //
 // Messages with no attachments simply do not come back, and need not: a default-constructed
 // preview already says a message has none.
-// The SQL counterpart of image::is_displayable_image(), built from the same list so the two cannot
-// drift apart.  SQLite's lower() folds only ASCII, which is also all the C++ side folds.
-static const std::string DISPLAYABLE_IMAGE_SQL = [] {
-    std::string sql = "lower(content_type) IN (";
-    for (auto type : image::displayable_image_types)
-        sql += "'{}',"_format(type);
-    sql.back() = ')';
-    return sql;
-}();
-
 static void load_preview_attachments(
         sqlite::Connection& c,
         std::vector<AnyConversation>& convos,
@@ -5791,6 +5798,11 @@ void Client::_touch_cached(int64_t id) {
 
 void Client::_queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain) {
     _thumb_pending.push_back({entry, std::move(plain)});
+    _pump_thumbnails();
+}
+
+void Client::_hurry_thumbnail(int64_t entry) {
+    _thumb_pending.push_front({entry});
     _pump_thumbnails();
 }
 

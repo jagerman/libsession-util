@@ -448,7 +448,8 @@ class Client {
     /// is evicted or deleted and counts towards `attachment_cache_limit` with it.
     ///
     /// Reading one marks the cached file as used, as reading the file itself does: a picture being
-    /// shown as its thumbnail is a picture in use, and should not be first to go.
+    /// shown as its thumbnail is a picture in use, and should not be first to go.  Asking for one
+    /// that is not made yet moves it to the front of the queue.
     ///
     /// Fails with:
     ///
@@ -1245,7 +1246,7 @@ class Client {
     // False once the queue has stopped.
     bool _post_thumbnail(std::function<void()> job);
 
-    // Cache entries waiting for a thumbnail, oldest first, and whether one is being made.  Core's
+    // Cache entries waiting for a thumbnail, next first, and whether one is being made.  Core's
     // loop's.  One at a time end to end -- made, written on the disk loop, recorded -- which is
     // what keeps a thumbnail written for an entry evicted meanwhile from racing the eviction.
     struct PendingThumbnail {
@@ -1259,6 +1260,9 @@ class Client {
     std::optional<int64_t> _thumb_attempt;
 
     void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);
+
+    // Queues it ahead of the rest: a display is waiting for it.
+    void _hurry_thumbnail(int64_t entry);
 
     void _unmark_thumbnail_attempt(int64_t entry);
 

@@ -463,6 +463,10 @@ TEST_CASE(
     CHECK_FALSE(f.attachment(bad).has_thumbnail);
     CHECK_FALSE(std::filesystem::exists(f.thumb_file(bad_url)));
 
+    // Nor when it is asked for.
+    CHECK(error_code([&] { f.c->attachment_thumbnail(bad, 0, await); }) == err::no_thumbnail);
+    CHECK(TestHelper::thumbnails_queued(*f.c) == 0);
+
     // Failed under an older thumbnailer, which is what raising the version makes of it.
     TestHelper::on_loop(f.c->core, [&] {
         f.c->core.database().conn().prepared_exec(
@@ -612,6 +616,28 @@ TEST_CASE(
     overwrite(f.file(url), good);
     f.reopen();
     CHECK(f.attachment(id).has_thumbnail);
+}
+
+TEST_CASE("Client: a thumbnail asked for before it is made is made next", "[client][thumbnail]") {
+    Fixture f;
+    Hold hold{TestHelper::hold_thumbnail_thread(*f.c)};
+    std::vector<std::pair<int64_t, std::string>> arrived;
+    for (auto [w, h] : {std::pair{400, 300}, std::pair{300, 400}, std::pair{200, 300}})
+        arrived.push_back(f.arrive(picture(w, h), "image/png", false));
+    auto [first, first_url] = arrived[0];
+    auto [last, last_url] = arrived[2];
+
+    // The first is being made; the others wait in the order they came.
+    REQUIRE(TestHelper::thumbnails_pending(*f.c) ==
+            std::vector{f.entry(arrived[1].second), f.entry(last_url)});
+
+    CHECK(error_code([&] { f.c->attachment_thumbnail(last, 0, await); }) == err::no_thumbnail);
+    CHECK(TestHelper::thumbnails_pending(*f.c).front() == f.entry(last_url));
+
+    hold.release();
+    settle(*f.c);
+    for (const auto& [id, url] : arrived)
+        CHECK(f.attachment(id).has_thumbnail);
 }
 
 TEST_CASE(
