@@ -1256,7 +1256,7 @@ class Client {
     std::deque<PendingThumbnail> _thumb_pending;
     bool _thumb_running = false;
 
-    // The entry being decoded, whose row is marked as refused until `_thumbnail_made` settles it.
+    // The entry being decoded, whose row is marked until `_thumbnail_made` settles it.
     std::optional<int64_t> _thumb_attempt;
 
     void _queue_thumbnail(int64_t entry, std::optional<std::filesystem::path> plain = std::nullopt);

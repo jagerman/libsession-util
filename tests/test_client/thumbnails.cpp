@@ -562,12 +562,12 @@ TEST_CASE("Client: the waiting cache reads answer on Core's loop", "[client][thu
     CHECK(f->attachment(id).has_thumbnail);
 }
 
-TEST_CASE("Client: a thumbnail is recorded as refused until it is made", "[client][thumbnail]") {
+TEST_CASE("Client: a thumbnail is marked as attempted until it is made", "[client][thumbnail]") {
     // So that a decode that takes the process down with it is not tried again at every start.
     Fixture f;
     Hold hold{TestHelper::hold_thumbnail_thread(*f.c)};
     auto [id, url] = f.arrive(picture(400, 300), "image/png", false);
-    CHECK(f.refused_under(url) == image::thumbnailer_version);
+    CHECK(f.refused_under(url) == -image::thumbnailer_version);
 
     hold.release();
     settle(*f.c);
@@ -587,7 +587,7 @@ TEST_CASE(
     TestHelper::on_loop(f.c->core, [&] {
         f.c->core.database().conn().prepared_exec(
                 "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
-                image::thumbnailer_version,
+                -image::thumbnailer_version,
                 entry);
     });
     TestHelper::pretend_thumbnail_attempt(*f.c, entry);
@@ -595,6 +595,34 @@ TEST_CASE(
     f.reopen();
     CHECK(f.attachment(id).has_thumbnail);
     CHECK(f.refused_under(url) == 0);
+}
+
+TEST_CASE(
+        "Client: a decode that ended the process is tried once more, and then refused",
+        "[client][thumbnail]") {
+    Fixture f;
+    Hold first{TestHelper::hold_thumbnail_thread(*f.c)};
+    auto [a, a_url] = f.arrive(picture(400, 300), "image/png", false);
+    auto [b, b_url] = f.arrive(picture(300, 400), "image/png", false);
+    Hold second{TestHelper::hold_thumbnail_thread(*f.c)};
+
+    // `b` as an earlier run left it, killed while decoding it.
+    auto entry = f.entry(b_url);
+    TestHelper::on_loop(f.c->core, [&] {
+        f.c->core.database().conn().prepared_exec(
+                "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
+                -image::thumbnailer_version,
+                entry);
+    });
+    first.release();
+    REQUIRE(eventually([&] { return f.refused_under(b_url) == image::thumbnailer_version; }));
+
+    // Settled as any other attempt is, should this one finish.
+    second.release();
+    settle(*f.c);
+    CHECK(f.attachment(a).has_thumbnail);
+    CHECK(f.attachment(b).has_thumbnail);
+    CHECK(f.refused_under(b_url) == 0);
 }
 
 TEST_CASE(

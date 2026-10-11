@@ -313,9 +313,8 @@ CREATE TABLE attachment_cache (
     -- so that a thumbnail found missing can be taken back out of it.
     thumbnail INTEGER,
     -- The thumbnailer version (`image::thumbnailer_version`) under which this file was refused a
-    -- thumbnail, or NULL.  Set before each attempt and cleared unless it is refused, so that a
-    -- decode that ends the process counts as a refusal.  Not tried again until that version
-    -- changes, so that neither is decoded again at every start.
+    -- thumbnail, or NULL; while one is being made, minus that version, or the version itself if
+    -- the attempt before ended the process too.  A refusal is not tried again until it changes.
     thumbnail_failed INTEGER
 ) STRICT;
 

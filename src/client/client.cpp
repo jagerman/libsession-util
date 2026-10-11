@@ -5832,10 +5832,15 @@ void Client::_pump_thumbnails() {
         if (!name)
             continue;
 
-        // Marked as refused before the decode, so that one that takes the process down with it is
-        // not tried again at every start.  `_thumbnail_made` settles it.
+        // Marked before the decode so that one that takes the process down is not tried at every
+        // start: -version on the first attempt, a refusal on the second.  `_thumbnail_made` settles
+        // it.
         c.prepared_exec(
-                "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
+                R"(
+            UPDATE attachment_cache
+            SET thumbnail_failed = CASE thumbnail_failed WHEN -?1 THEN ?1 ELSE -?1 END
+            WHERE id = ?2
+        )",
                 image::thumbnailer_version,
                 next.entry);
         _thumb_running = true;
@@ -5883,6 +5888,11 @@ void Client::_thumbnail_made(
     auto c = core.database().conn();
     if (jpeg || failed)
         _unmark_thumbnail_attempt(entry);
+    else
+        c.prepared_exec(
+                "UPDATE attachment_cache SET thumbnail_failed = ? WHERE id = ?",
+                image::thumbnailer_version,
+                entry);
 
     // Checked here and again once it is written: an eviction can land on either side of the write.
     bool wanted = jpeg && c.prepared_get<int64_t>(
@@ -5947,14 +5957,15 @@ void Client::_thumbnail_pass() {
     if (_cache_dir.empty())
         return;
 
-    // Most recently used first: what is likeliest to be on screen next.
+    // Most recently used first: what is likeliest to be on screen next.  Last, those once caught
+    // in a decode that did not finish, or refused under an older thumbnailer.
     auto c = core.database().conn();
     for (auto id : c.prepared_results<int64_t>(
                  R"(
         SELECT id FROM attachment_cache c
         WHERE thumbnail IS NULL AND thumbnail_failed IS NOT ?
           AND EXISTS(SELECT 1 FROM message_attachments WHERE cached = c.id AND {})
-        ORDER BY last_used DESC
+        ORDER BY thumbnail_failed IS NOT NULL, last_used DESC
     )"_format(DISPLAYABLE_IMAGE_SQL),
                  image::thumbnailer_version))
         _thumb_pending.push_back({id});
