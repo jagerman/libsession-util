@@ -305,7 +305,6 @@ TEST_CASE("probe says which images are decoded whole", "[image][probe]") {
 #ifdef __APPLE__
     CHECK_FALSE(whole(heic_64x48));
 #else
-    if (image::can_decode(Format::heic))
-        CHECK(whole(heic_64x48));
+    CHECK(whole(heic_64x48));
 #endif
 }
