@@ -82,13 +82,14 @@ namespace device {
         Left = 3,  ///< Left the group of its own accord, to join another.  As permanent as Kicked:
                    ///< the id can never rejoin this group.  Outranks Registered for the same
                    ///< reason Kicked does, and is outranked by it, so that a device that left and
-                   ///< was then removed reads as removed everywhere.  Always accompanied by
-                   ///< `kicked`.
+                   ///< was then removed reads as removed everywhere.  A record in this state
+                   ///< always has `Info::kicked` set to the time the device left.
         Kicked = 4,  ///< Removed from the group by another device, and permanently: a kicked device
                      ///< id can never rejoin, only be replaced by a fresh one.  Outranks
                      ///< everything, so the tombstone that carries a removal cannot be undone by a
-                     ///< stale record replaying an earlier state.  Always accompanied by `kicked`,
-                     ///< which the schema enforces.
+                     ///< stale record replaying an earlier state.  A record in this state always
+                     ///< has `Info::kicked` set to the time the device was removed; the schema
+                     ///< enforces it.
     };
 
     /// What became of a link request this device saw.
