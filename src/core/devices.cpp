@@ -3578,12 +3578,10 @@ void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string 
 
     // Our own group, seen as it now is in the swarm -- its link key included -- without waiting for
     // the next fetch to bring the message back.
-    auto now = clock_now_ms();
     _record_group(
             {.data = push.message,
              .hash = hash,
-             .timestamp = now,
-             .expiry = now +
+             .expiry = clock_now_ms() +
                        std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
 
     // Gone from the swarm, so stop naming them.  Scoped to what this message carried: one merged
