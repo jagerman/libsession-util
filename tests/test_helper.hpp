@@ -680,8 +680,7 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
-    static std::optional<core::device::GroupId> group_of(
-            core::Core& core, std::span<const std::byte> message) {
+    static core::device::GroupId group_of(core::Core& core, std::span<const std::byte> message) {
         return on_loop(core, [&] { return core.devices._group_of(message); });
     }
 

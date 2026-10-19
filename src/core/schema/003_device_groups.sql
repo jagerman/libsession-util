@@ -74,6 +74,20 @@ ALTER TABLE device_link_requests_new RENAME TO device_link_requests;
 
 CREATE INDEX device_link_requests_device ON device_link_requests(device);
 
+-- A group from before identifiers -- this device registered (state 2) in one -- gets one now, made
+-- as a group created now would make it: the creation minute as a little-endian 32-bit integer, then
+-- 4 random bytes.  Its device is its only member -- nothing before device groups pushed a group
+-- message -- so no other copy of the group can have been given a different one, and the device
+-- publishes this one with its next push.
+INSERT INTO globals (key, value)
+    SELECT 'devices_group_id',
+           unhex(substr(m, 7, 2) || substr(m, 5, 2) || substr(m, 3, 2) || substr(m, 1, 2))
+               || randomblob(4)
+    FROM (SELECT printf('%08X', unixepoch() / 60) AS m)
+    WHERE EXISTS (
+        SELECT 1 FROM devices JOIN globals ON globals.value = devices.unique_id
+        WHERE globals.key = 'device_unique_id' AND devices.state = 2);
+
 -- AUTOINCREMENT, which can only be had by recreating the table: leaving a group now deletes every
 -- account key, and a push in flight names the rows it distributes.
 CREATE TABLE device_account_keys_new (
@@ -109,8 +123,6 @@ BEGIN
     WHERE device_account_keys.rotated IS NULL AND device_account_keys.id != winner.id;
 END;
 
--- An existing group has no identifier yet.  It gets one from whichever of its devices pushes first,
--- and its other devices adopt it from that message.
 CREATE TABLE device_group_merged (
     hash TEXT PRIMARY KEY NOT NULL
 ) STRICT;

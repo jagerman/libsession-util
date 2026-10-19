@@ -1838,24 +1838,6 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - a group from before identifiers gets one from its first push",
-        "[core][devices][group-id]") {
-    Linking l;
-    l.admit();
-    for (auto* c : {&l.core, &l.applicant})
-        (*c)->database().conn().prepared_exec("DELETE FROM globals WHERE key = 'devices_group_id'");
-
-    auto message = l.core->devices.build_device_group_message().message;
-    auto minted = TestHelper::group_id(*l.core);
-    REQUIRE(minted);
-    CHECK(TestHelper::group_of(*l.core, message) == minted);
-
-    // And the rest of the group adopts it, rather than minting a different one of its own.
-    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G2");
-    CHECK(TestHelper::group_id(*l.applicant) == minted);
-}
-
-TEST_CASE(
         "Devices - a readable message from another group is not merged",
         "[core][devices][group-id]") {
     Linking l;

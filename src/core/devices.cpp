@@ -1075,12 +1075,10 @@ void Devices::_set_group_id(const device::GroupId& id) {
     core.globals.set(group_id_key, std::span<const std::byte>{id.value});
 }
 
-std::optional<device::GroupId> Devices::_group_of(std::span<const std::byte> message) {
+device::GroupId Devices::_group_of(std::span<const std::byte> message) {
     oxenc::bt_dict_consumer in{message};
     in.require<std::string_view>("");
-    if (!in.skip_until("@"))
-        return std::nullopt;
-    auto encrypted = in.consume_span<std::byte, 8>();
+    auto encrypted = in.require_span<std::byte, 8>("@");
     auto A = in.require_span<std::byte, 32>("A");
     auto seed = core.globals.account_seed();
     return device::GroupId{crypt_group_id(encrypted, A, seed.seed())};
@@ -1103,14 +1101,9 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
         if (info->state == device::State::Registered)
             recipients.push_back(info);
 
-    // A group established before groups had identifiers gets one from whichever of its devices
-    // pushes first, and the rest adopt it from that message.
     auto group_id = _group_id();
-    if (!group_id) {
-        group_id = new_group_id();
-        _set_group_id(*group_id);
-        log::info(cat, "Gave this device group an identifier");
-    }
+    if (!group_id)
+        throw std::logic_error{"Cannot build a device group message outside a group"};
     std::array<std::byte, 8> group_id_enc;
 
     // Removals among the tombstones carried, announced to the devices removed, which have no key to
@@ -1421,9 +1414,8 @@ void Devices::receive_device_group_message(
         // Every message from our group is encrypted to us while we are in it, so a newer one we
         // cannot read means another device holds our place.  Older ones say nothing: they are from
         // before we joined, or snapshots overtaken since -- see DISPLACEMENT_GRACE.
-        auto group = _group_of(data);
         auto read_at = core.globals.get_integer(read_at_key);
-        if (group && group == _group_id() && read_at &&
+        if (_group_of(data) == _group_id() && read_at &&
             t > from_epoch_ms(*read_at) + DISPLACEMENT_GRACE && _member()) {
             core.globals.set(displaced_key, epoch_ms(t));
             log::warning(cat, "Another device has taken this device's place in its device group");
@@ -1436,13 +1428,12 @@ void Devices::receive_device_group_message(
     auto theirs = _group_of(data);
     auto ours = _group_id();
 
-    // A member of the group, or of one that predates identifiers -- which adopts this one's, or
-    // hears from a device yet to give it one -- merges whatever it can read of it.
-    bool member = conn().prepared_maybe_get<int>(
-                          "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                          self_id,
-                          static_cast<int>(device::State::Registered)) &&
-                  (!ours || !theirs || *theirs == *ours);
+    // A member of the group merges whatever it can read of it.
+    bool member =
+            ours == theirs && conn().prepared_maybe_get<int>(
+                                      "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                      self_id,
+                                      static_cast<int>(device::State::Registered));
 
     // Anything else is ours only as an admission on one of our own requests: from outside any
     // group, or from inside one, switching.  Being able to read it shows only that some holder of
@@ -1451,9 +1442,8 @@ void Devices::receive_device_group_message(
     std::optional<OwnRequest> accepted;
     if (!member) {
         auto self = payload.devices.find(self_id);
-        if (theirs && self != payload.devices.end() &&
-            self->second.state == device::State::Registered)
-            accepted = _own_request_admitted(*theirs, self->second);
+        if (self != payload.devices.end() && self->second.state == device::State::Registered)
+            accepted = _own_request_admitted(theirs, self->second);
         if (!accepted) {
             log::warning(cat, "Not merging a readable device group message from another group");
             return;
@@ -1476,19 +1466,16 @@ void Devices::receive_device_group_message(
         }
     }
     bool admitting = accepted.has_value();
-    bool switching = admitting && ours && *ours != *theirs;
+    bool switching = admitting && ours && *ours != theirs;
 
-    if (switching) {
+    if (switching)
         _leave_group();
-        ours.reset();
-    }
 
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    // Admitted, or in a group that predates identifiers: either way this is the group's.
-    if (theirs && !ours)
-        _set_group_id(*theirs);
+    if (admitting)
+        _set_group_id(theirs);
 
     // Merge incoming account keys.  New seeds are inserted and the rotation trigger applies
     // tie-breaking: latest created wins (smallest seed as tiebreaker), so concurrent rotations
@@ -1589,8 +1576,7 @@ void Devices::receive_device_group_message(
         rotate_account_keys();
     }
 
-    if (theirs && theirs == _group_id())
-        _note_read(t);
+    _note_read(t);
 
     // Recorded whether or not the merge changed anything: a message that told us only what we
     // already knew is just as redundant as one that told us something new, and our next push
@@ -1656,9 +1642,7 @@ void Devices::_leave_group() {
 void Devices::_record_group(const SwarmMessage& msg) {
     oxenc::bt_dict_consumer in{msg.data};
     in.require<std::string_view>("");
-    if (!in.skip_until("@"))
-        return;
-    auto encrypted_id = in.consume_span<std::byte, 8>();
+    auto encrypted_id = in.require_span<std::byte, 8>("@");
     auto A = in.require_span<std::byte, 32>("A");
     auto X = in.require_span<std::byte, 32>("X");
     auto t = from_epoch_ms(in.require<int64_t>("t"));

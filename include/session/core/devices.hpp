@@ -373,14 +373,12 @@ class Devices final : detail::CoreComponent {
     // has, since having an id is what having seen it means.
     std::vector<std::pair<int64_t, device::LinkRequest>> _read_link_requests(bool pending_only);
 
-    // This device's group's identifier: nullopt outside a group, and also inside one established
-    // before groups had identifiers, until a group message gives it one.
+    // This device's group's identifier: nullopt outside a group.
     std::optional<device::GroupId> _group_id();
     void _set_group_id(const device::GroupId& id);
 
-    // The identifier a group message carries, which needs only the account seed to read; nullopt
-    // for a message from before identifiers.
-    std::optional<device::GroupId> _group_of(std::span<const std::byte> message);
+    // The identifier a group message carries, which needs only the account seed to read.
+    device::GroupId _group_of(std::span<const std::byte> message);
 
     // Notes a group message in `device_groups`, whether or not we can read it.  Throws on a bad
     // signature, and on a signed time further ahead of our clock than GROUP_MESSAGE_MAX_AHEAD: the

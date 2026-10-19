@@ -465,6 +465,9 @@ seed can copy a group's identifier outright, so there is nothing for Argon2 to p
 identifier tells groups apart for honest devices and for the user's eye; it does not authenticate
 one, and its creation time is whatever the creating device's clock said.
 
+Every group message carries it, and one without is invalid: a device in a group always has its
+identifier, from when the group was created or from the message that admitted it.
+
 It is carried in the outer structure, encrypted so that any device holding the account seed can
 read it -- including one not yet in any group -- while to anyone else it differs from message to
 message:
