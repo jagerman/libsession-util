@@ -377,6 +377,11 @@ class Devices final : detail::CoreComponent {
     // could be an application-chosen interval away, or never while the network is down.
     quic::TimerID _expiry_timer;
 
+    // Fetches the group when a key rotation falls due, so that a device whose swarm is quiet -- one
+    // subscribed for pushes, which stops polling -- still rotates on time.  The rotation itself is
+    // the fetch's to make, as after any other (see `_rotate_due_keys`).
+    quic::TimerID _rotation_timer;
+
     // Lapses our own request if its deadline has passed, reports what changed through
     // `callbacks::devices`, and re-arms the expiry timer.  Run once a fetch has been merged and at
     // the end of each call here that changes something, never partway through, so a handler never
@@ -865,6 +870,16 @@ class Devices final : detail::CoreComponent {
     // Points the expiry timer at `deadline`, or stops it.
     void _arm_expiry(std::optional<std::chrono::sys_seconds> deadline);
 
+    // Rotates whichever of the account key and our device keys is due, for a member in good
+    // standing; the push that follows a fetch then carries both.
+    void _rotate_due_keys();
+
+    // Points the rotation timer at the earlier of the two next rotations, or stops it.
+    void _arm_rotation();
+
+    // Picks when the device keys made at `created` are to be rotated, and records it.
+    sys_ms _schedule_device_rotation(std::chrono::sys_seconds created);
+
     bool _accept_request(int reqid);
 
     // Puts the record link request `row` asks for in place of the one its device holds in the
@@ -924,12 +939,17 @@ class Devices final : detail::CoreComponent {
     // the current device's public keys.  If the current device is registered, calling this will
     // dirty the config data and require another push.
     //
+    // Keeps only the key it replaces besides the new one: a sender fetches before it pushes, and so
+    // encrypts to our newest published key, or to the one before if our rotation landed between its
+    // fetch and its push.  What only an older key could read is a superseded snapshot or a forgery.
+    // Schedules the next rotation (see `next_device_rotation`).
+    //
     // This returns the newly created keys.  (It can be safely discarded as it will already be
     // stored in the database).
     DeviceKeys rotate_device_keys();
 
-    // Returns current and recent local device private keys.  This will be sorted with most recent
-    // key first.  If there is no current key at all, this generates one.
+    // Returns current and previous local device private keys, most recent first.  If there is no
+    // current key at all, this generates one.
     std::vector<DeviceKeys> active_device_keys();
 
     struct AccountKeys : XWingKeys {
@@ -941,11 +961,12 @@ class Devices final : detail::CoreComponent {
     // TTL, plus 24h for sender key update lag, plus 24h safety margin.
     static constexpr auto ACCOUNT_KEY_RETENTION = 16 * 24h;
 
-    // Base rotation period and jitter window for account key rotation.  The formula is designed so
-    // that the minimum rotation time across all N devices in the group is Unif[PERIOD-WINDOW/2,
-    // PERIOD+WINDOW/2], regardless of N, masking the number of devices in the group.
-    static constexpr auto ACCOUNT_KEY_ROTATION_PERIOD = 12h;
-    static constexpr auto ACCOUNT_KEY_ROTATION_WINDOW = 2h;
+    // How often account and device keys rotate, and the window each rotation is spread over.  An
+    // account key's offset within the window is skewed so that the earliest of N devices' is
+    // Unif[PERIOD-JITTER/2, PERIOD+JITTER/2] whatever N is, masking the number of devices in the
+    // group; a device key's is uniform, being this device's alone.
+    static constexpr auto KEY_ROTATION_PERIOD = 12h;
+    static constexpr auto KEY_ROTATION_JITTER = 2h;
 
     // How long the swarm holds a device group message.  The maximum a private namespace allows: the
     // group is what a device that has been away comes back to, and an account whose devices are all
@@ -977,9 +998,9 @@ class Devices final : detail::CoreComponent {
     static constexpr auto GROUP_MESSAGE_MAX_AHEAD = 10min;
 
     // Rotates the shared account keys used for PFS+PQ message encryption.  Generates a new random
-    // seed, stores it in the database, marks the previous active key as rotated, and prunes keys
-    // older than ACCOUNT_KEY_RETENTION.  Should be called when account_rotation_due() is true and
-    // when a device first joins the device group with no existing account keys.
+    // seed, stores it in the database, and marks the previous active key as rotated.  Done by Core
+    // itself when `account_rotation_due()` (see `next_account_rotation`), and when the group's
+    // membership calls for it.
     void rotate_account_keys();
 
     // Returns the current active account keys after pruning obsolete ones: that is, the current key
@@ -993,8 +1014,13 @@ class Devices final : detail::CoreComponent {
     std::vector<AccountKeys> active_account_keys(
             std::optional<std::span<const std::byte, 2>> key_indicator = std::nullopt);
 
-    // Returns the time when this device's unique device key is due to be rotated.  Returns nullopt
-    // if this device is not currently part of the device group.
+    // When this device's own device keys are due to be rotated: KEY_ROTATION_PERIOD after the
+    // current ones were made, give or take half of KEY_ROTATION_JITTER, picked when they were.
+    // Nullopt for a device that is not a member of a group in good standing, which never rotates on
+    // schedule: the keys a link request of its names stay valid until it is admitted.
+    //
+    // Core rotates both kinds of key by itself, after a fetch: rotating before one would leave
+    // what waits in the swarm encrypted to keys the device had just let go of.
     std::optional<std::chrono::system_clock::time_point> next_device_rotation();
 
     bool device_rotation_due() {
@@ -1002,8 +1028,9 @@ class Devices final : detail::CoreComponent {
         return t && *t <= clock_now();
     }
 
-    // Return true if the account key is due to be rotated by this device.  Returns nullopt if this
-    // device is not currently part of the device group.
+    // When this device is due to rotate the account key, KEY_ROTATION_PERIOD after the current one
+    // was made, offset within KEY_ROTATION_JITTER as the spec's "Account Key Rotation timer" says.
+    // Nullopt for a device that is not a member of a group in good standing.
     std::optional<std::chrono::system_clock::time_point> next_account_rotation();
 
     bool account_rotation_due() {

@@ -251,15 +251,17 @@ TEST_CASE("Devices - device keys", "[core][devices]") {
         CHECK(keys.back().rotated.has_value());
     }
 
-    SECTION("after two rotations active_device_keys has three entries") {
-        c->devices.active_device_keys();  // ensure initial key exists
-        c->devices.rotate_device_keys();
-        c->devices.rotate_device_keys();
+    SECTION("after two rotations only the current key and the one before it are kept") {
+        auto first = c->devices.active_device_keys().front().x25519_pub;
+        auto second = c->devices.rotate_device_keys().x25519_pub;
+        auto third = c->devices.rotate_device_keys().x25519_pub;
         auto keys = c->devices.active_device_keys();
-        CHECK(keys.size() == 3);
+        REQUIRE(keys.size() == 2);
+        CHECK(keys[0].x25519_pub == third);
         CHECK_FALSE(keys[0].rotated.has_value());
+        CHECK(keys[1].x25519_pub == second);
         CHECK(keys[1].rotated.has_value());
-        CHECK(keys[2].rotated.has_value());
+        CHECK(first != second);
     }
 }
 
@@ -267,8 +269,8 @@ TEST_CASE("Devices - device group payload padding", "[core][devices]") {
     TempCore c;
 
     // Real keys, not random bytes: ML-KEM encapsulation is performed against each device's pubkey.
-    // Rotating produces distinct valid keypairs, and all of them stay in this device's active key
-    // set, so this Core can also decrypt whatever it encrypts below.
+    // Rotating produces distinct valid keypairs, and the last of them stays this device's own, so
+    // this Core can also decrypt whatever it encrypts below to that one.
     std::vector<device::Info> infos;
     for (int i = 0; i < 5; i++) {
         auto k = c->devices.rotate_device_keys();
@@ -317,7 +319,7 @@ TEST_CASE("Devices - device group payload padding", "[core][devices]") {
 
     SECTION("padding round-trips off again") {
         device::map m;
-        for (size_t i = 0; i < 3; i++)
+        for (size_t i = 2; i < 5; i++)
             m.emplace(infos[i].id, infos[i]);
 
         auto enc = TestHelper::encrypt_device_data(c->devices, m);
@@ -2414,14 +2416,13 @@ TEST_CASE(
                 in(1min) + Devices::DEVICE_GROUP_TTL + 1h,
                 "C1");
     ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1h};
-    TestHelper::finish_fetch(*l.core);
     auto expected = dropped ? device::Membership::Dropped : device::Membership::InGroup;
     REQUIRE(l.core->devices.membership(await).membership == expected);
-    // The rotation that much time away has made due, which gives it something to push.
-    l.core->devices.rotate_account_keys();
 
-    // The dissolved group's device, back too and never told.  Telling it again decides nothing, so
-    // even a dropped device does it; the third group it leaves alone.
+    // The dissolved group's device, back too and never told, in the first fetch since.  Telling it
+    // again decides nothing, so even a dropped device does it; the third group it leaves alone.
+    // Before anything else, too: the rotation all that time away has made due, and the push
+    // carrying it, come after the fetch.
     auto before = pushes(*net).size();
     auto back = other->devices.build_device_group_message().message;
     TestHelper::deliver_device_message(*l.core, back, in(10min), "B2");
@@ -3872,6 +3873,15 @@ TEST_CASE(
             *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G3");
     REQUIRE(l.applicant->devices.devices().size() == 3);
     CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+
+    // Nor for a removal, nor the account key the removing device minted with it.
+    REQUIRE(l.core->devices.remove_device(Linking::id_of(third), await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G4");
+    REQUIRE(l.applicant->devices.devices().size() == 2);
+    REQUIRE(l.applicant->devices.active_account_keys().front().x25519_pub ==
+            l.core->devices.active_account_keys().front().x25519_pub);
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
 }
 
 TEST_CASE(
@@ -3890,4 +3900,109 @@ TEST_CASE(
     TestHelper::deliver_device_message(*l.core, revived, in(10min), "G2");
     l.core->devices.mark_device_group_pushed(push, "G3");
     CHECK(carries_transition(l.core->devices.build_device_group_message(), l.applicant_id()));
+}
+
+TEST_CASE(
+        "Devices - an account key merged from another device is not ours to distribute",
+        "[core][devices][push][rotation]") {
+    Linking l;
+    l.admit();
+    settle(l);
+
+    l.core->devices.rotate_account_keys();
+    auto push = l.core->devices.build_device_group_message();
+    l.core->devices.mark_device_group_pushed(push, "G3");
+    TestHelper::deliver_device_message(*l.applicant, push.message, in(10min), "G3");
+    REQUIRE(l.applicant->devices.active_account_keys().front().x25519_pub ==
+            l.core->devices.active_account_keys().front().x25519_pub);
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+}
+
+namespace {
+auto account_key(TempCore& c) {
+    return c->devices.active_account_keys().front().x25519_pub;
+}
+auto device_key(TempCore& c) {
+    return c->devices.active_device_keys().front().x25519_pub;
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a member rotates both its keys when due, after a fetch, in one push",
+        "[core][devices][rotation]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    answer_upload(l.core, *net, true);
+    REQUIRE_FALSE(l.core->devices.needs_push().device_group);
+    auto account = account_key(l.core);
+    auto device = device_key(l.core);
+
+    // Long away: both overdue, but nothing rotated until a fetch has brought what waited for it,
+    // encrypted to the keys it had.
+    ScopedClockOffset later{Devices::KEY_ROTATION_PERIOD + Devices::KEY_ROTATION_JITTER};
+    REQUIRE(l.core->devices.account_rotation_due());
+    REQUIRE(l.core->devices.device_rotation_due());
+    CHECK(account_key(l.core) == account);
+    CHECK(device_key(l.core) == device);
+
+    auto before = pushes(*net).size();
+    TestHelper::finish_fetch(*l.core);
+    CHECK(account_key(l.core) != account);
+    CHECK(device_key(l.core) != device);
+    REQUIRE(pushes(*net).size() == before + 1);
+    answer_upload(l.core, *net, true);
+    CHECK_FALSE(l.core->devices.needs_push().device_group);
+
+    // Once: the next fetch finds neither due.
+    account = account_key(l.core);
+    device = device_key(l.core);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(account_key(l.core) == account);
+    CHECK(device_key(l.core) == device);
+    CHECK(pushes(*net).empty());
+}
+
+TEST_CASE(
+        "Devices - a device outside a group keeps the keys its request names",
+        "[core][devices][rotation][linking]") {
+    Linking l;
+    l.ask();
+    TestHelper::finish_fetch(*l.applicant);
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
+    CHECK_FALSE(l.applicant->devices.next_device_rotation());
+    CHECK_FALSE(l.applicant->devices.next_account_rotation());
+
+    auto device = device_key(l.applicant);
+    ScopedClockOffset later{Devices::KEY_ROTATION_PERIOD + Devices::KEY_ROTATION_JITTER};
+    TestHelper::finish_fetch(*l.applicant);
+    CHECK(device_key(l.applicant) == device);
+}
+
+TEST_CASE(
+        "Devices - a device with a quiet swarm still rotates on time",
+        "[core][devices][rotation]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    answer_upload(l.core, *net, true);
+    auto account = account_key(l.core);
+    auto device = device_key(l.core);
+
+    // To within a second of the earlier rotation, and the timer re-armed from there by a fetch, so
+    // that it is the timer that notices rather than anything this test does.
+    auto next = std::min(
+            *l.core->devices.next_account_rotation(), *l.core->devices.next_device_rotation());
+    ScopedClockOffset later{
+            std::chrono::duration_cast<std::chrono::seconds>(next - clock_now()) - 1s};
+    TestHelper::finish_fetch(*l.core);
+    REQUIRE(account_key(l.core) == account);
+    REQUIRE(device_key(l.core) == device);
+
+    // It fetches the group, and rotates after that fetch, as after any other.
+    REQUIRE(eventually(
+            *l.core, [&] { return std::ranges::any_of(net->sent_requests, is_device_fetch); }));
+    later.advance(2s);
+    REQUIRE(answer_fetch(l.core, *net) == 1);
+    CHECK((account_key(l.core) != account || device_key(l.core) != device));
 }

@@ -1110,10 +1110,20 @@ constructed as follows:
 
 ## Account Key Rotation
 
-Clients rotate the account keys, shared by all devices, after 12h+ε.  ε here is a random delay
-between -1h and 1h that is calculated differently for each device, to reduce the possibility of
-collisions and to obscure the exact device timings of key publishing.  Details of ε selection are
-discussed below.
+Clients rotate the account keys, shared by all devices, 12h+ε after the current one was created.  ε
+here is a delay within a 2h window (the rotation jitter, shared with device keys: see "Device key
+rotation"), between -1h and 1h, calculated differently for each device, to reduce the possibility
+of collisions and to obscure the exact device timings of key publishing.  Details of ε selection
+are discussed below.
+
+Only a member of a device group in good standing rotates, and only once a fetch of namespace 21 has
+been merged: a device checks what is due after each fetch.  A device back from a long absence
+therefore finds its rotation overdue and rotates once, after its first fetch -- not before, since
+what waited for it in the swarm was encrypted to the keys it had.  A device whose swarm is quiet,
+and so might not fetch for a while, fetches when its next rotation falls due.  A device outside a
+group, or removed, displaced, dropped or dissolved from one, rotates nothing on schedule.  A device
+due both an account key and a device key rotation makes both before the one push that carries
+them.
 
 An account key itself is a single 32-byte seed value that is expanded into 96 bytes using
 SHAKE256("SessionAccountKeys" || seed) to produce:
@@ -1160,7 +1170,9 @@ This construction is specifically designed to statistically mask the number of d
 account: with N active devices, the distribution of the *smallest* ε value (which is when the
 effective account key rotation occurs, assuming all devices are online) over the N devices works out
 to `Unif[11h, 13h]`, which is exactly the same as the uniform distribution of a single active
-device.
+device.  That masks the count from the timing of rotations only: the swarm can still estimate it
+from how often the account's devices push and poll, and roughly from the `keys` bucket each group
+message carries.
 
 This distribution is also designed to break up the rotation times to reduce the occurences of
 conflicting updates (which then have to be resolved) versus having all devices try rotating at the
@@ -1184,6 +1196,26 @@ One idea that is possible but not currently implemented is to allow earlier rota
 messages are being received.  One possible downside would be the metadata leakage: an outside
 observing watching the public account keys for an account could infer that the account is receiving
 lots of messages because of a higher rotation frequency.
+
+## Device key rotation
+
+Each device's own device keys (`device_pubkey_x25519` and `_mlkem768`, see "Inner device data")
+rotate on the account keys' 12h period: at `created + 12h + δ`, `δ` uniform in [-1h, +1h] -- the
+same 2h jitter, without the skew, since a device's keys are its own -- picked when the keys are
+made.  As for account keys, only a member in good standing rotates, and only after a fetch, both in
+one push when both are due; a device asking to join keeps the keys its request names until it is
+admitted.
+
+A device keeps only its current device keys and the ones before them.  That is enough: a device
+pushing a group message fetches first, and so encrypts to each member's newest published keys,
+while the previous ones cover a rotation that lands between another device's fetch and its push.
+What only an older key could decrypt is a superseded snapshot or a forgery.
+
+Rotation is also what makes a former member's knowledge of the group go stale.  A removed device
+keeps the device pubkeys it saw, and holding the seed, could encrypt a forged group message --
+adding a device of its own, say -- to them; once those devices have rotated, nothing it encrypts
+is readable by any of them.  Devices offline throughout stay exposed until they come back and
+rotate.
 
 
 # Non-PFS fallback (post transition)

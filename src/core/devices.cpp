@@ -98,6 +98,13 @@ static constexpr auto dropped_key = "devices_group_dropped_at"sv;
 // Set when a tombstone named the group this device was in, until it joins or starts another.
 static constexpr auto dissolved_key = "devices_group_dissolved"sv;
 
+// When our current device keys are due to be rotated, in unix milliseconds: picked, jitter and
+// all, when they were made, and kept so that the jitter is the same however often it is asked.
+static constexpr auto device_rotation_key = "devices_device_rotation_at"sv;
+
+// How long the rotation timer waits to try again after its fetch failed.
+static constexpr auto ROTATION_RETRY = 1min;
+
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
         log::info(cat, "Loaded existing unique device id: {}", self_id);
@@ -113,6 +120,19 @@ void Devices::init() {
     establish_group();
 
     _expiry_timer = jq().add_wakeable([this] { _flush_events(); });
+    _rotation_timer = jq().add_wakeable([this] {
+        jq().stop(_rotation_timer);
+        if (!core.network())
+            return;
+        // A successful fetch re-arms the timer from what it then finds due; a failed one tries
+        // again shortly rather than at once, which with the rotation still overdue would spin.
+        core._fetch(
+                {config::Namespace::Devices},
+                [this, alive = std::weak_ptr<int>{_alive}](bool fetched) {
+                    if (!alive.expired() && !fetched)
+                        jq().repeat(_rotation_timer, ROTATION_RETRY);
+                });
+    });
 
     // A request of ours from the last run carries on if the swarm still holds it, or if an
     // admission on it waits for the user.  Otherwise it is withdrawn: lapsed, or never confirmed
@@ -235,14 +255,29 @@ Devices::DeviceKeys Devices::rotate_device_keys() {
 
     // Nothing else to update: our record is built from the current keys when next it is published
     // (see `_own_record`).
-    conn().prepared_exec(
+    auto created = clock_now_s();
+    auto c = conn();
+    c.prepared_exec(
             "INSERT INTO device_privkeys (created, seed) VALUES (?, ?)",
-            epoch_seconds(clock_now_s()),
+            epoch_seconds(created),
             seed);
+    c.prepared_exec(
+            "DELETE FROM device_privkeys WHERE id NOT IN"
+            " (SELECT id FROM device_privkeys ORDER BY created DESC, id DESC LIMIT 2)");
+    _schedule_device_rotation(created);
 
     log::info(cat, "New rotating device keys generated: {}", keys);
 
     return keys;
+}
+
+sys_ms Devices::_schedule_device_rotation(std::chrono::sys_seconds created) {
+    auto half = std::chrono::duration_cast<std::chrono::milliseconds>(KEY_ROTATION_JITTER / 2);
+    auto due = created + KEY_ROTATION_PERIOD +
+               std::chrono::milliseconds{
+                       random::get_uniform_distribution(-half.count(), half.count())};
+    core.globals.set(device_rotation_key, epoch_ms(due));
+    return due;
 }
 
 void Devices::rotate_account_keys() {
@@ -1553,15 +1588,20 @@ void Devices::receive_device_group_message(
     // from multiple devices converge deterministically.  For seeds we already have, we reconcile
     // the `rotated` column: if both sides have rotated at different times, take the minimum; if
     // only one side has rotated, adopt that rotation.
+    //
+    // Distributed, whoever minted it: the message it came in is in the swarm, carrying it to every
+    // member, so it is owed by no push of ours -- not even one we minted ourselves, since a
+    // message carrying it back means our push of it got there.
     std::vector<int64_t> carried_keys;
     for (const auto& k : payload.account_keys) {
         auto keys = keys_from_seed<AccountKeys>(k.seed);
         carried_keys.push_back(c.prepared_get<int64_t>(
                 "INSERT INTO device_account_keys"
-                " (created, rotated, seed, pubkey_mlkem768, pubkey_x25519)"
-                " VALUES (?, ?, ?, ?, ?)"
+                " (created, rotated, seed, pubkey_mlkem768, pubkey_x25519, distributed)"
+                " VALUES (?, ?, ?, ?, ?, 1)"
                 " ON CONFLICT (seed) DO UPDATE SET"
-                "   rotated = COALESCE(MIN(excluded.rotated, rotated), excluded.rotated, rotated)"
+                "   rotated = COALESCE(MIN(excluded.rotated, rotated), excluded.rotated, rotated),"
+                "   distributed = 1"
                 " RETURNING id",
                 k.created,
                 k.rotated,
@@ -3450,6 +3490,11 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     _fetched = true;
     _flush_events();
 
+    // Rotated here, after the fetch, and not before it: what waited for us in the swarm was
+    // encrypted to the keys we had, and a device back from a long absence rotates once, now.
+    _rotate_due_keys();
+    _arm_rotation();
+
     // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
     // on top of everything this fetch merged.  A local change made between fetches waits for the
     // next one, which is what stops two devices answering the same update with duelling pushes.
@@ -3645,17 +3690,52 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotat
     double u = oxenc::load_little_to_host<uint64_t>(hash_out.data()) / 0x1p64;
 
     // With N registered devices, the minimum of their N individual offsets is uniformly
-    // distributed in [PERIOD - WINDOW/2, PERIOD + WINDOW/2].
+    // distributed in [PERIOD - JITTER/2, PERIOD + JITTER/2].
     auto offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
-            (ACCOUNT_KEY_ROTATION_PERIOD - ACCOUNT_KEY_ROTATION_WINDOW / 2) +
-            ACCOUNT_KEY_ROTATION_WINDOW * (1.0 - std::pow(u, static_cast<double>(N))));
+            (KEY_ROTATION_PERIOD - KEY_ROTATION_JITTER / 2) +
+            KEY_ROTATION_JITTER * (1.0 - std::pow(u, static_cast<double>(N))));
 
     return std::chrono::sys_seconds{std::chrono::seconds{t_created}} + offset;
 }
 
 std::optional<std::chrono::system_clock::time_point> Devices::next_device_rotation() {
-    // TODO: implement device key rotation scheduling
-    return std::nullopt;
+    if (!_member())
+        return std::nullopt;
+    if (auto due = core.globals.get_integer(device_rotation_key))
+        return from_epoch_ms(*due);
+
+    // Keys made before their rotation was scheduled with them.
+    auto created = conn().prepared_maybe_get<int64_t>(
+            "SELECT created FROM device_privkeys WHERE rotated IS NULL");
+    if (!created)
+        return std::nullopt;
+    return _schedule_device_rotation(from_epoch_s(*created));
+}
+
+void Devices::_rotate_due_keys() {
+    assert(on_loop());
+    if (!_member())
+        return;
+    if (account_rotation_due()) {
+        log::info(cat, "Account key rotation is due");
+        rotate_account_keys();
+    }
+    if (device_rotation_due()) {
+        log::info(cat, "Device key rotation is due");
+        rotate_device_keys();
+    }
+}
+
+void Devices::_arm_rotation() {
+    auto account = next_account_rotation();
+    auto device = next_device_rotation();
+    if (!account && !device) {
+        jq().stop(_rotation_timer);
+        return;
+    }
+    auto next = account && device ? std::min(*account, *device) : account ? *account : *device;
+    auto delay = std::chrono::ceil<std::chrono::microseconds>(next - clock_now());
+    jq().repeat(_rotation_timer, std::max<std::chrono::microseconds>(delay, 1ms));
 }
 
 Devices::DeviceGroupPush Devices::build_device_group_message() {

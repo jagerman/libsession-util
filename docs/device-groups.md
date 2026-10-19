@@ -311,5 +311,7 @@ there is no group to leave. A device cannot ask to join a group while it is in o
 - Start a group for a restored account without the user choosing to, unless that is a deliberate
   policy of your application -- and never with groups in view, which it would dissolve.
 - Dissolve a group (`dissolve_group`) without the user choosing to.
+- Rotate keys yourself (`rotate_account_keys`, `rotate_device_keys`): Core rotates both on its own
+  schedule, after a fetch, and fetches by itself when a rotation falls due.
 - Hardcode the numeric values of `device::State` or `device::Membership`.
 - Block or throw in a `DeviceEvents` handler.
