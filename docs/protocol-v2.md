@@ -244,6 +244,7 @@ as:
         "kicked": "[k123...][k456...][k789...][kabc...]",
         "link_x25519": "...the group's current account X25519 pubkey...",
         "payload": "...encrypted payload...",
+        "time": 1777777777123,  // when the author wrote it, unix milliseconds
         "signature": "...above data signed with long-term account key...",
     }
 ```
@@ -262,6 +263,17 @@ where:
   published here: it would add over a kilobyte to every group message, to protect a short-lived
   request whose contents -- a device's public keys and description -- are of little use to anyone
   recording it for a future quantum attack.
+- `time` is when the message was written, by its author's clock, in unix milliseconds.  It is
+  covered by the signature, so unlike the timestamp the swarm reports for a stored message -- which
+  nothing binds to the message, and which a storage server can set to anything -- it cannot be
+  changed by anyone without the account seed.  Wherever a device needs a group message's age, it
+  uses this and never the swarm's timestamp: to tell whether it has been displaced (see "Displaced
+  devices"), for when a group was last active, and for which of a group's messages carries its
+  current `link_x25519`.  A message without `time` is invalid, and one whose `time` is more than 10
+  minutes ahead of the reader's clock is ignored: that is a broken clock or a forgery rather than
+  clock skew, and believed, it would outrank every honest message from the group until the
+  reader's clock caught up.  The swarm's expiry, by contrast, is still what says how long a group's
+  message stays stored.
 - `ciphertexts` is a packed binary value of N×4×1088 bytes where each 1088 byte segment contains an
   ML-KEM768 ciphertext for one of the accounts devices.  When the number of devices is not a
   multiple of 4, the unused slots are filled with random data.
@@ -403,8 +415,11 @@ point; if the copy does, the real device must notice and say so.
 
 It can: while it is in the group, every message from the group is encrypted to it, so one carrying
 its group's identifier that it cannot decrypt, and that does not name it in `kicked`, means the
-group has moved on without it.  Such a message counts only if its swarm timestamp is more than 5
-minutes past the newest message from the group the device *could* read.  Just after a device joins,
+group has moved on without it.  Such a message counts only if its `time` is more than 5 minutes past
+that of the newest message from the group the device *could* read.  The signed `time`, not the
+swarm's timestamp: otherwise a storage server could keep an old message the device was never able to
+read -- from before it joined, say -- and replay it under a later date to raise a false alert, or
+re-date a readable one far ahead to hide a real displacement.  Just after a device joins,
 a member may push a snapshot it built before fetching the admission, which leaves the new device
 out for no reason but timing, and the margin also absorbs the difference between the two devices'
 clocks.  It costs nothing in detection: every later message is unreadable too, and account key

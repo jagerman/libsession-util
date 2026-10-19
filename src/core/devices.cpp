@@ -82,8 +82,8 @@ static device::GroupId new_group_id() {
     return id;
 }
 
-// The swarm timestamp of the newest message from our group that we could read, and of the one we
-// could not that displaced us from it, in unix milliseconds.
+// The signed time of the newest message from our group that we could read, and of the one we could
+// not that displaced us from it, in unix milliseconds.
 static constexpr auto read_at_key = "devices_group_read_at"sv;
 static constexpr auto displaced_key = "devices_group_displaced_at"sv;
 
@@ -1029,6 +1029,28 @@ namespace {
     static_assert(bt_bytes_encoded(99) == 102);   // "99:…"
     static_assert(bt_bytes_encoded(100) == 104);  // "100:…"
 
+    // The encoded size of a non-negative integer.
+    constexpr int bt_int_encoded(int64_t x) {
+        int sz = 2;
+
+        do {
+            ++sz;
+        } while (x /= 10);
+
+        return sz;
+    }
+
+    static_assert(bt_int_encoded(0) == 3);               // "i0e"
+    static_assert(bt_int_encoded(1777777777123) == 15);  // "i1777777777123e"
+
+    // When a group message's author wrote it, by its own clock: the outer "t", which the account
+    // signature covers, as it does not the swarm's timestamp.
+    sys_ms group_message_time(std::span<const std::byte> message) {
+        oxenc::bt_dict_consumer in{message};
+        in.require<std::string_view>("");
+        return from_epoch_ms(in.require<int64_t>("t"));
+    }
+
 }  // namespace
 
 std::chrono::sys_time<std::chrono::minutes> device::GroupId::created() const {
@@ -1256,6 +1278,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     }
 
     // We're done: now we just need to encode everything together:
+    auto t = epoch_ms(clock_now_ms());
     std::vector<std::byte> out;
     out.resize(
             2                                              // Outer "d" ... "e" delimiters
@@ -1268,6 +1291,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
             + 3 + bt_bytes_encoded(enc_devices.size())     // "1:d" + "MMMM:...(enc device info)..."
             +
             (kicked_raw.empty() ? 0 : 3 + bt_bytes_encoded(kicked_raw.size()))  // "1:k" + "NN:..."
+            + 3 + bt_int_encoded(t)     // "1:t" + "i...(author's time)...e"
             + 3 + bt_bytes_encoded(64)  // "1:~" + "64:...(Ed25519 signature)..."
     );
 
@@ -1282,6 +1306,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     o.append("d", enc_devices);
     if (!kicked_raw.empty())
         o.append("k", kicked_raw);
+    o.append("t", t);
     o.append_signature("~", [seed = core.globals.account_seed()](std::span<const std::byte> body) {
         return ed25519::sign(seed.ed25519_secret(), body);
     });
@@ -1369,7 +1394,8 @@ static const std::string REASSERT_TOMBSTONE_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
 void Devices::receive_device_group_message(
-        std::span<const std::byte> data, const std::string& hash, sys_ms timestamp) {
+        std::span<const std::byte> data, const std::string& hash) {
+    auto t = group_message_time(data);
     GroupPayload payload;
     try {
         auto raw = decrypt_device_data(std::as_bytes(data));
@@ -1398,10 +1424,8 @@ void Devices::receive_device_group_message(
         auto group = _group_of(data);
         auto read_at = core.globals.get_integer(read_at_key);
         if (group && group == _group_id() && read_at &&
-            timestamp.time_since_epoch() >
-                    std::chrono::milliseconds{*read_at} + DISPLACEMENT_GRACE &&
-            _member()) {
-            core.globals.set(displaced_key, int64_t{timestamp.time_since_epoch().count()});
+            t > from_epoch_ms(*read_at) + DISPLACEMENT_GRACE && _member()) {
+            core.globals.set(displaced_key, epoch_ms(t));
             log::warning(cat, "Another device has taken this device's place in its device group");
             return;
         }
@@ -1442,11 +1466,9 @@ void Devices::receive_device_group_message(
                 return;
             }
             conn().prepared_exec(
-                    "UPDATE device_own_requests SET admission = ?, admission_hash = ?,"
-                    " admission_at = ? WHERE id = ?",
+                    "UPDATE device_own_requests SET admission = ?, admission_hash = ? WHERE id = ?",
                     data,
                     hash,
-                    timestamp.time_since_epoch().count(),
                     accepted->row);
             log::info(
                     cat, "Admitted to a device group; holding it until the user confirms the SAS");
@@ -1568,7 +1590,7 @@ void Devices::receive_device_group_message(
     }
 
     if (theirs && theirs == _group_id())
-        _note_read(timestamp);
+        _note_read(t);
 
     // Recorded whether or not the merge changed anything: a message that told us only what we
     // already knew is just as redundant as one that told us something new, and our next push
@@ -1639,6 +1661,7 @@ void Devices::_record_group(const SwarmMessage& msg) {
     auto encrypted_id = in.consume_span<std::byte, 8>();
     auto A = in.require_span<std::byte, 32>("A");
     auto X = in.require_span<std::byte, 32>("X");
+    auto t = from_epoch_ms(in.require<int64_t>("t"));
 
     // Checked even though only a seed holder could have encrypted the identifier: without the
     // signature a storage server could still replay one group's identifier with a link key of its
@@ -1649,6 +1672,11 @@ void Devices::_record_group(const SwarmMessage& msg) {
                     !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
                     throw std::runtime_error{"Invalid device group message signature"};
             });
+
+    if (auto ahead = t - clock_now_ms(); ahead > GROUP_MESSAGE_MAX_AHEAD)
+        throw std::runtime_error{
+                "Device group message is dated {}s ahead of this device's clock"_format(
+                        std::chrono::floor<std::chrono::seconds>(ahead).count())};
 
     auto seed = core.globals.account_seed();
     auto group = crypt_group_id(encrypted_id, A, seed.seed());
@@ -1662,7 +1690,7 @@ void Devices::_record_group(const SwarmMessage& msg) {
             "   expires_at = MAX(expires_at, excluded.expires_at)",
             std::span<const std::byte>{group},
             X,
-            epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.timestamp)),
+            epoch_seconds(std::chrono::floor<std::chrono::seconds>(t)),
             epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.expiry)));
 }
 
@@ -1792,7 +1820,7 @@ std::optional<Devices::OwnRequest> Devices::_select_own_request(
             int,
             int>(
             "SELECT id, group_id, sas_seed, timestamp, expires_at, confirmed,"
-            "       admission_at IS NOT NULL"
+            "       admission IS NOT NULL"
             "  FROM device_own_requests {} ORDER BY id DESC LIMIT 1"_format(where),
             bind...);
     if (!found)
@@ -1889,16 +1917,13 @@ bool Devices::_confirm_link() {
 
     std::vector<std::byte> admission;
     std::string hash;
-    int64_t at = 0;
-    for (auto [data, h, t] : c.prepared_results<sqlite::blob, std::string, int64_t>(
-                 "SELECT admission, IFNULL(admission_hash, ''), admission_at"
-                 "  FROM device_own_requests WHERE id = ?",
+    for (auto [data, h] : c.prepared_results<sqlite::blob, std::string>(
+                 "SELECT admission, admission_hash FROM device_own_requests WHERE id = ?",
                  newest->row)) {
         admission.assign(data.begin(), data.end());
         hash = std::move(h);
-        at = t;
     }
-    receive_device_group_message(admission, hash, sys_ms{std::chrono::milliseconds{at}});
+    receive_device_group_message(admission, hash);
     _flush_events();
     return true;
 }
@@ -1984,7 +2009,7 @@ Devices::LinkRequestResult Devices::_build_link_request(
     // swarm go too.
     c.prepared_exec(
             "UPDATE device_own_requests"
-            " SET admission = NULL, admission_hash = NULL, admission_at = NULL");
+            " SET admission = NULL, admission_hash = NULL");
     c.prepared_exec(
             "DELETE FROM device_own_requests WHERE timestamp < ?",
             epoch_seconds(clock_now_s() - LINK_REQUEST_TTL - DEVICE_GROUP_TTL));
@@ -2658,8 +2683,8 @@ bool Devices::_member() {
                                     static_cast<int>(device::State::Registered));
 }
 
-void Devices::_note_read(sys_ms timestamp) {
-    int64_t ms = timestamp.time_since_epoch().count();
+void Devices::_note_read(sys_ms t) {
+    int64_t ms = epoch_ms(t);
     if (auto read_at = core.globals.get_integer(read_at_key); !read_at || ms > *read_at)
         core.globals.set(read_at_key, ms);
 
@@ -2976,7 +3001,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             auto type = in.require<std::string_view>("");
             if (type == "G") {
                 _record_group(msg);
-                receive_device_group_message(msg.data, msg.hash, msg.timestamp);
+                receive_device_group_message(msg.data, msg.hash);
             } else if (type == "L")
                 receive_link_request(msg.data, msg.hash, msg.expiry);
             else

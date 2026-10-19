@@ -113,7 +113,7 @@ CREATE TABLE device_groups (
     -- The X25519 half of the group's account key, as its newest message published it: what a link
     -- request asking to join the group is encrypted to.
     link_x25519 BLOB NOT NULL CHECK(length(link_x25519) == 32),
-    seen_at INTEGER NOT NULL,     -- swarm timestamp of the newest message seen, unix seconds
+    seen_at INTEGER NOT NULL,     -- signed time of the newest message seen, unix seconds
     -- The latest expiry among the messages seen, unix seconds.  The group is in the swarm until
     -- then, as far as fetching can tell: a deletion is not something a fetch reports.
     expires_at INTEGER NOT NULL,
@@ -138,12 +138,11 @@ CREATE TABLE device_own_requests (
     expires_at INTEGER,  -- when the swarm drops it; NULL until the swarm confirms storing it
     confirmed INTEGER NOT NULL DEFAULT 0,  -- the user said the SAS matched, through confirm_link
     -- A group message admitting us on this request before the user confirmed it, held until they
-    -- do, with the hash and swarm timestamp (unix milliseconds) it arrived with: a fetch delivers a
-    -- message only once.
+    -- do, with the hash it arrived with: a fetch delivers a message only once.  Its time is the one
+    -- signed inside it.
     admission BLOB,
     admission_hash TEXT,
-    admission_at INTEGER,
-    CHECK((admission IS NULL) == (admission_at IS NULL))
+    CHECK((admission IS NULL) == (admission_hash IS NULL))
 ) STRICT;
 
 -- This table holds current and recent device private keys for *this* device, including the

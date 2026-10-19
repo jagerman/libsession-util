@@ -1751,30 +1751,66 @@ TEST_CASE(
     CHECK(seen->first == first_key);
     CHECK(seen->second == epoch_seconds(expiry));
 
-    // The key follows the group's newest message, whichever order they arrive in.
+    // The key follows the group's newest message, by when it was written rather than when it
+    // arrived, whichever order they arrive in.
     l.core->devices.rotate_account_keys();
     auto second_key = key();
     REQUIRE(second_key != first_key);
-    auto second = l.core->devices.build_device_group_message().message;
+    std::vector<std::byte> second;
     {
         ScopedClockOffset later{1h};
+        second = l.core->devices.build_device_group_message().message;
         TestHelper::deliver_device_message(*l.applicant, second, in(10min), "G2");
     }
     CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
     TestHelper::deliver_device_message(*l.applicant, first, expiry, "G1");
     CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
 
-    // Not from a message whose signature does not check out: anything else could plant a key of
-    // its own for requests to this group to be encrypted to.
-    auto forged = first;
-    oxenc::bt_dict_consumer outer{forged};
-    auto x_at = outer.require_span<std::byte>("X").data() - forged.data();
-    forged[x_at] ^= std::byte{1};
+    // Not from a message whose signature does not check out, newer though it is: anything else
+    // could plant a key of its own for requests to this group to be encrypted to.
     {
         ScopedClockOffset later{2h};
+        auto forged = l.core->devices.build_device_group_message().message;
+        oxenc::bt_dict_consumer outer{forged};
+        auto x_at = outer.require_span<std::byte>("X").data() - forged.data();
+        forged[x_at] ^= std::byte{1};
         TestHelper::deliver_device_message(*l.applicant, forged, in(10min), "G3");
     }
     CHECK(TestHelper::seen_group(*l.applicant, *group)->first == second_key);
+}
+
+TEST_CASE(
+        "Devices - a group message dated too far ahead of this device's clock is ignored",
+        "[core][devices][group-id]") {
+    Linking l;
+    l.admit();
+    TempCore outsider{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    auto group = *TestHelper::group_id(*l.core);
+
+    // The applicant renames itself, and pushes from a clock running `ahead`.
+    auto renamed = l.applicant->devices.device_info(await).first;
+    auto push = [&](std::string description, std::chrono::minutes ahead, std::string hash) {
+        renamed.description = description;
+        l.applicant->devices.update_info(renamed, await);
+        std::vector<std::byte> message;
+        {
+            ScopedClockOffset fast{ahead};
+            message = l.applicant->devices.build_device_group_message().message;
+        }
+        TestHelper::deliver_device_message(*l.core, message, in(10min), hash);
+        TestHelper::deliver_device_message(*outsider, message, in(10min), hash);
+    };
+
+    // Neither merged nor noted as the group's newest, which would hold back every honest message
+    // for as long as it is ahead.
+    push("from the future", Devices::GROUP_MESSAGE_MAX_AHEAD + 1min, "G2");
+    CHECK(l.state_of_applicant().description != "from the future");
+    CHECK_FALSE(TestHelper::seen_group(*outsider, group));
+
+    // A clock merely running fast is another matter.
+    push("a little fast", Devices::GROUP_MESSAGE_MAX_AHEAD - 1min, "G3");
+    CHECK(l.state_of_applicant().description == "a little fast");
+    CHECK(TestHelper::seen_group(*outsider, group));
 }
 
 TEST_CASE(
@@ -2626,7 +2662,7 @@ TEST_CASE(
     auto before = l.core->devices.build_device_group_message().message;
 
     // Admitted by a message held until the user confirms, which is when it is read -- but as of
-    // when the swarm stored it.
+    // when it was written.
     l.ask();
     REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
     TestHelper::deliver_device_message(
@@ -2637,9 +2673,19 @@ TEST_CASE(
     TestHelper::deliver_device_message(*l.applicant, before, in(10min), "G-stale");
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 
-    // Beyond the grace, though, a message leaving it out is one the group sent without it.
+    // Nor when it arrives long after: it is as old as it was written, which is not something a
+    // storage server can change.
     ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
     TestHelper::deliver_device_message(*l.applicant, before, in(10min), "G-late");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+
+    // Beyond the grace, though, a message leaving it out is one the group sent without it.
+    auto [core_self, _] = l.core->devices.device_info(await);
+    TestHelper::deliver_device_message(
+            *l.applicant,
+            TestHelper::encrypt_device_data(l.core->devices, {{core_self.id, core_self}}),
+            in(10min),
+            "G-without");
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
 
     // And reading the group again, at or past what displaced it, puts it back.

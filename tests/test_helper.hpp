@@ -612,7 +612,7 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
     // something a push supersedes.
     static void receive_device_group_message(
             core::Devices& d, std::span<const std::byte> data, const std::string& hash = "") {
-        d.receive_device_group_message(data, hash, clock_now_ms());
+        d.receive_device_group_message(data, hash);
     }
 
     // Gives `core` another device's id, as a copy of that device's data would have it -- though

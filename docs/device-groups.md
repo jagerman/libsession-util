@@ -69,8 +69,9 @@ and on every change after, except one made by your own call (asking to join, sta
 renewing the device's identity). Re-read `membership()` after making those calls.
 
 `membership()` returns the state, this device's group (when in one), and `others`: every other
-group in the swarm, newest first, each with its id, when it was last seen, and whether the user
-has dismissed it here.
+group in the swarm, newest first, each with its id, when it was last active (when its newest
+message was written, by the clock of the device that wrote it), and whether the user has
+dismissed it here.
 
 | Membership | What it means | What to offer |
 |---|---|---|

@@ -289,7 +289,8 @@ namespace device {
     /// A device group in the swarm other than this device's own.
     struct VisibleGroup {
         GroupId id;
-        std::chrono::sys_seconds last_seen;  ///< When its newest message was stored.
+        std::chrono::sys_seconds last_seen;  ///< When its newest message was written, by the
+                                             ///< clock of the device that wrote it.
         bool dismissed;  ///< The user has dismissed it here: see `Devices::dismiss_group`.
     };
 
@@ -382,7 +383,8 @@ class Devices final : detail::CoreComponent {
     std::optional<device::GroupId> _group_of(std::span<const std::byte> message);
 
     // Notes a group message in `device_groups`, whether or not we can read it.  Throws on a bad
-    // signature.
+    // signature, and on a signed time further ahead of our clock than GROUP_MESSAGE_MAX_AHEAD: the
+    // message is then not to be taken in at all.
     void _record_group(const SwarmMessage& msg);
 
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
@@ -401,16 +403,15 @@ class Devices final : detail::CoreComponent {
     // The group message takes the swarm hash as well, because merging one is what makes it
     // redundant: our next push carries its contents forward, and that is when it can be deleted.
     // Recorded only on a message we could decrypt -- see `device_group_merged`.
-    void receive_device_group_message(
-            std::span<const std::byte> data, const std::string& hash, sys_ms timestamp);
+    void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
 
     // In the group and able to act for it: registered, and not displaced from it.
     bool _member();
     bool _displaced();
 
-    // A message from our own group, stored at `timestamp`, was one we could read.
-    void _note_read(sys_ms timestamp);
-    //
+    // A message from our own group, signed at `t`, was one we could read.
+    void _note_read(sys_ms t);
+
     // The link request takes the swarm's expiry, which is what bounds the request: it is when the
     // message stops being fetchable, so after it no device can accept the request at all.  And its
     // hash, which is what ignoring it can delete it from the swarm by.
@@ -827,6 +828,14 @@ class Devices final : detail::CoreComponent {
     // compared.  A real displacement is not missed for it: every later message is unreadable too,
     // and the account key's rotation guarantees one.
     static constexpr auto DISPLACEMENT_GRACE = 5min;
+
+    // How far ahead of our clock a group message's signed time may be before we ignore the
+    // message.  Some lead is only another device's clock running fast; much more is a broken clock
+    // or a forgery, and believed, it would hold the newest time we have seen from a group -- which
+    // displacement is measured from, and which picks the key requests to join it are encrypted to
+    // -- out of reach of every honest message until our own clock caught up.  Ten minutes is far
+    // more than clocks kept in sync disagree by, and caps what a bad time can hold back to that.
+    static constexpr auto GROUP_MESSAGE_MAX_AHEAD = 10min;
 
     // Rotates the shared account keys used for PFS+PQ message encryption.  Generates a new random
     // seed, stores it in the database, marks the previous active key as rotated, and prunes keys

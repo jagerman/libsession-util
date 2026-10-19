@@ -95,3 +95,6 @@ f4153a93  device-group, mid-branch
 d3ceb5e3  device-group, mid-branch
 741b1fd4  device-group, mid-branch
 405a304e  device-group, mid-branch
+23241523  device-group, mid-branch
+be28ebf1  device-group, mid-branch
+90535e9a  device-group, mid-branch

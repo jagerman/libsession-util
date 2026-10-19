@@ -133,6 +133,5 @@ CREATE TABLE device_own_requests (
     confirmed INTEGER NOT NULL DEFAULT 0,
     admission BLOB,
     admission_hash TEXT,
-    admission_at INTEGER,
-    CHECK((admission IS NULL) == (admission_at IS NULL))
+    CHECK((admission IS NULL) == (admission_hash IS NULL))
 ) STRICT;
