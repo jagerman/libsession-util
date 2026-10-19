@@ -114,10 +114,10 @@ class DeviceEvents {
     virtual void device_membership_changed(device::Info device) = 0;
 
     /// This device's membership changed, or became known with the first fetch of this run; see
-    /// device::Membership for what each value means.  `Removed`, `Displaced`, `Dissolved` and
-    /// `Forked` are the ones to alert on, and arrive as soon as the fetch that reveals them is
-    /// merged.  Not for the move to `Waiting` that `Devices::request_link` makes, nor back from it
-    /// when that call reports failure: the caller knows.  Never `Unknown`.
+    /// device::Membership for what each value means.  `Removed`, `Displaced`, `Dissolved`,
+    /// `Dropped` and `Forked` are the ones to alert on, and arrive as soon as the fetch that
+    /// reveals them is merged.  Not for the move to `Waiting` that `Devices::request_link` makes,
+    /// nor back from it when that call reports failure: the caller knows.  Never `Unknown`.
     virtual void membership_changed(device::Membership membership) = 0;
 };
 

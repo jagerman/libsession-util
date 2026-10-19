@@ -723,25 +723,31 @@ on a device that can see what it is choosing between.  There are two ways to it:
 - **Keeping its own group when forked** (see "Forks"), over the other group in view.
 
 A device never dissolves a group of its own accord.  One that comes back to an empty swarm pushes
-its group again, as it would whenever its messages had expired; one that comes back to find another
-group live, and no tombstone naming its own, is forked, and asks.  So no two devices can dissolve
-each other by accident, and nothing has to decide which of two groups came first.
+its group again, as it would whenever its messages had expired; one that comes back to find its own
+group's messages gone and another group live is dropped (see "Forks"), and asks to join again.  So
+no two devices can dissolve each other by accident, and nothing has to decide which of two groups
+came first.
 
 ### Forks
 
-A device in a group that sees a message carrying another group's identifier, while no tombstone
-names its own group, is **forked**.  Nothing has been decided, and as far as it knows it is still in
-its group.  It pushes nothing, since that would be carrying on as though its group had been chosen,
-and asks its user, showing when the other group was last active -- the `time` of its newest message
--- which tells a live set of devices ("an hour ago") from a stale leftover ("two months ago").  The
-user keeps this group, dissolving the other, or leaves it for the other: leaving it (see "Leaving a
-group") and asking to join the other, as any device outside a group does.
+A device in a group whose messages are in the swarm, that sees a message carrying another group's
+identifier while no tombstone names its own group, is **forked**.  Nothing has been decided, and
+nothing is wrong with its group, which goes on working -- pushing as it would anyway -- while the
+user decides, on this device or another.  It asks its user, showing when the other group was last
+active -- the `time` of its newest message -- which tells a live set of devices ("an hour ago")
+from a stale leftover ("two months ago").  The user keeps this group, dissolving the other, or
+leaves it for the other: leaving it (see "Leaving a group") and asking to join the other, as any
+device outside a group does.
 
-This holds whether or not any of the device's own group's messages are left in the swarm.  They
-leave it only by expiring, which takes every device of the group being offline for the whole TTL,
-or by a seed holder deleting them.  Dissolving a group does that, and the group's devices online at
-the time hear of it from the tombstone; either way, with another group live, only the user can say
-what happens next.
+A device in a group whose messages are gone from the swarm, while another group's are there, is
+**dropped**: no longer in a device group, and unable to tell why.  Its group's messages leave the
+swarm only by expiring, which takes every device of the group being offline for the whole TTL, or
+by a seed holder deleting them: it was removed or replaced while away and its group moved on, it was
+away too long, or its group was dissolved and the tombstone saying so expired before it came back.
+Whichever it was, the account's group is now the other.  A dropped device pushes nothing, which
+would bring its group back beside that one, and decides nothing about the other group: it never
+dissolves anything new.  It comes back as a new device, under a new ID, by asking to join, or by
+starting a group -- which, like any start with groups in view, dissolves them.
 
 A device outside any group that sees more than one may join any of them, the most recently active
 being the natural choice.  Once it has, it is forked as well, and its user settles the rest as any

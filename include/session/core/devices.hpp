@@ -291,12 +291,17 @@ namespace device {
                     ///< a new device id; it rejoins by asking to join the group that was kept, as
                     ///< any device outside a group does, and stays Dissolved until it joins a
                     ///< group or starts one.
-        Forked,     ///< In a group, while another group is in the swarm and no tombstone names
-                    ///< this one: the account has forked, and an account can have only one group.
-                    ///< Nothing has been decided, so the device pushes nothing until its user
-                    ///< decides: to keep this group, dissolving the others
-                    ///< (`Devices::dissolve_group`), or to leave it for another
-                    ///< (`Devices::leave_group`, then `Devices::request_link`).
+        Forked,     ///< In a group whose messages are in the swarm, while another group's are
+                    ///< too and no tombstone names this one: the account has forked, and an
+                    ///< account can have only one group.  Nothing is wrong with this group, which
+                    ///< goes on working; the user decides, here or on another device, whether to
+                    ///< keep it, dissolving the others (`Devices::dissolve_group`), or to leave it
+                    ///< for another (`Devices::leave_group`, then `Devices::request_link`).
+        Dropped,    ///< No longer in a device group: its group is gone from the swarm while
+                    ///< another group is there.  It was removed, replaced, or away too long, and
+                    ///< cannot tell which -- it may itself have been dissolved.  It pushes
+                    ///< nothing, and dissolves nothing new; it can come back only under a new
+                    ///< device id, which `request_link` and `start_group` take for it.
     };
 
     /// A device group in the swarm other than this device's own.
@@ -549,8 +554,8 @@ class Devices final : detail::CoreComponent {
     // that only its members can read it; the group must be one this device has seen in the swarm.
     // The account must already be restored here, and the device not in a group: an account has
     // only one, so there is no switching from one to another, only `leave_group` and then asking.
-    // A device `Removed` or `Displaced` asks as a new device: it takes a new device id, forgetting
-    // the group it is no longer in, as part of this call.
+    // A device `Removed`, `Displaced` or `Dropped` asks as a new device: it takes a new device id,
+    // forgetting the group it is no longer in, as part of this call.
     //
     // It is admitted only once a group message admitting it has arrived *and* its user has
     // confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` -- or
@@ -671,9 +676,9 @@ class Devices final : detail::CoreComponent {
     // Starts a new device group with this device as its only member, and answers its identifier.
     // For any device not in a group.  Any group in the swarm is dissolved: an account has only one,
     // and the user starting another over those in view is choosing it over them -- the one a
-    // `Removed` or `Displaced` device was in included, which it leaves first, taking a new device
-    // id.  A device `Waiting` on a link request withdraws it.  The group starts with a newly
-    // generated account key, whatever the device held before.
+    // `Removed`, `Displaced` or `Dropped` device was in included, which it leaves first, taking a
+    // new device id.  A device `Waiting` on a link request withdraws it.  The group starts with a
+    // newly generated account key, whatever the device held before.
     //
     // Fails with `err::already_registered` for a device already in a group, and
     // `err::membership_unknown` before the first fetch of this run: starting a group is the user's
@@ -718,7 +723,8 @@ class Devices final : detail::CoreComponent {
     device::MembershipState _membership();
     device::GroupId _start_group();
 
-    // Removed from its group, or displaced from it: still holding the group, but no longer in it.
+    // Removed from its group, displaced from it, or dropped (see Membership::Dropped): still
+    // holding the group, but no longer in it.
     bool _cast_out();
 
     // Forgets everything of the group this device was in: its devices, its messages, its account
@@ -738,8 +744,9 @@ class Devices final : detail::CoreComponent {
 
     bool _dissolve_group(const device::GroupId& group);
 
-    // Whether another group is in the swarm beside ours: what makes a member Membership::Forked.
-    bool _forked();
+    // Whether our group's messages are gone from the swarm while another group's are there: what
+    // makes a member Membership::Dropped.
+    bool _dropped();
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
     void _rebaseline_membership();
@@ -1021,7 +1028,7 @@ class Devices final : detail::CoreComponent {
     // Returns whether a push is currently needed.  Should be called after processing a final swarm
     // message batch (or at startup) to determine whether outgoing pushes are required.
     //
-    // device_group is true when this device is registered, neither displaced nor forked (see
+    // device_group is true when this device is registered, neither displaced nor dropped (see
     // device::Membership), AND any of the following hold:
     //   - what we would publish for ourselves differs from what the swarm holds for us
     //   - any device has a state transition (registered/removed) that needs broadcasting

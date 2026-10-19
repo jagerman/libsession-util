@@ -2043,8 +2043,8 @@ TEST_CASE(
     CHECK(state.others[0].id == second);
     CHECK(std::chrono::abs(state.others[0].last_seen - written) <= 1s);
 
-    // Pushing nothing meanwhile: that would be carrying on as though the user had chosen.
-    CHECK_FALSE(l.core->devices.needs_push().device_group);
+    // Nothing is wrong with its group, which goes on working while the user decides.
+    CHECK(l.core->devices.needs_push().device_group);
 
     // Only another group in view can be dissolved, and only from here.
     CHECK_THROWS_AS(l.core->devices.dissolve_group(ours, await), std::invalid_argument);
@@ -2059,10 +2059,11 @@ TEST_CASE(
     // Its own doing, so not news to it.
     CHECK(l.events.membership.back() == device::Membership::Forked);
 
-    // The other group's message deleted, and a tombstone naming it published in the same push.
+    // The other group's message deleted, and a tombstone naming it published in the same push --
+    // the latest one, after this group's own.
     auto sent = pushes(*net);
-    REQUIRE(sent.size() == 1);
-    auto reqs = push_requests(*sent[0]);
+    REQUIRE(!sent.empty());
+    auto reqs = push_requests(*sent.back());
     REQUIRE(reqs.size() == 2);
     CHECK(reqs[0]["method"] == "store");
     CHECK(reqs[1]["method"] == "delete");
@@ -2077,12 +2078,14 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - a device whose group is gone beside another is forked too",
+        "Devices - a device whose group is gone beside another is dropped",
         "[core][devices][membership]") {
     Linking l;
+    auto old_id = Linking::id_of(l.core);
 
     // Another group, whose message outlives everything we know of our own.
     TestHelper::start_group(*l.applicant);
+    auto theirs = *TestHelper::group_id(*l.applicant);
     TestHelper::deliver_device_message(
             *l.core,
             l.applicant->devices.build_device_group_message().message,
@@ -2090,12 +2093,24 @@ TEST_CASE(
             "B1");
     REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
 
-    // Ours gone from the swarm, as far as we can tell; theirs not.  Still nothing decided, and so
-    // still the user's choice rather than this device's.
+    // Ours gone from the swarm, as far as we can tell; theirs not.  Whatever became of ours, the
+    // account's group is now the other: nothing to push, and nothing for this device to dissolve.
     ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1h};
     TestHelper::finish_fetch(*l.core);
-    CHECK(l.core->devices.membership(await).membership == device::Membership::Forked);
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Dropped);
+    CHECK(l.events.membership.back() == device::Membership::Dropped);
     CHECK_FALSE(l.core->devices.needs_push().device_group);
+    CHECK_FALSE(l.core->devices.dissolve_group(theirs, await));
+
+    // It comes back as a new device, like a removed one.
+    auto* net = attach_mock_network(*l.core);
+    Asked got;
+    request_link(l.core, theirs, got);
+    answer_upload(l.core, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    CHECK(Linking::id_of(l.core) != old_id);
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Waiting);
 }
 
 TEST_CASE(

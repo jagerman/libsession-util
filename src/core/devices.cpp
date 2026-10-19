@@ -2860,13 +2860,16 @@ device::MembershipState Devices::_membership() {
     auto ours = _group_id();
     auto c = conn();
 
+    bool ours_present = false;
     for (auto [group, seen] :
          c.prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>, int64_t>(
                  "SELECT group_id, seen_at FROM device_groups"
                  " WHERE expires_at > ? ORDER BY seen_at DESC",
                  epoch_seconds(clock_now_s()))) {
         device::GroupId id{group};
-        if (id != ours)
+        if (id == ours)
+            ours_present = true;
+        else
             out.others.push_back({id, from_epoch_s(seen)});
     }
 
@@ -2882,13 +2885,14 @@ device::MembershipState Devices::_membership() {
     switch (own) {
         case device::State::Kicked: out.membership = device::Membership::Removed; break;
         case device::State::Registered:
-            // Another group beside ours is a fork whether or not our own messages are still there:
-            // the account can have only one, and only the user can say which.  None of ours left,
-            // with no other group, is a group whose messages have yet to reach the swarm, or
-            // expired while every device was away, and our next push restores them.
-            out.membership = _displaced()        ? device::Membership::Displaced
-                           : !out.others.empty() ? device::Membership::Forked
-                                                 : device::Membership::InGroup;
+            // Another group beside ours is a fork, for the user to settle.  Ours gone beside it is
+            // something else: whatever became of our group, the account's group is now the other.
+            // None of ours left, with no other group, is a group whose messages have yet to reach
+            // the swarm, or expired while every device was away, and our next push restores them.
+            out.membership = _displaced()                         ? device::Membership::Displaced
+                           : !out.others.empty() && !ours_present ? device::Membership::Dropped
+                           : !out.others.empty()                  ? device::Membership::Forked
+                                                                  : device::Membership::InGroup;
             break;
         case device::State::Pending: out.membership = device::Membership::Waiting; break;
         default: {
@@ -2952,10 +2956,11 @@ void Devices::_note_read(sys_ms t) {
 }
 
 bool Devices::_cast_out() {
-    return _displaced() || conn().prepared_maybe_get<int>(
-                                   "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                                   self_id,
-                                   static_cast<int>(device::State::Kicked));
+    return _displaced() || _dropped() ||
+           conn().prepared_maybe_get<int>(
+                   "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                   self_id,
+                   static_cast<int>(device::State::Kicked));
 }
 
 void Devices::_new_identity() {
@@ -3011,6 +3016,7 @@ device::GroupId Devices::_start_group() {
             throw session::error{err::already_registered, "This device is already in a group"};
         case device::Membership::Removed:
         case device::Membership::Displaced:
+        case device::Membership::Dropped:
             // Leaving the group it is no longer in, as any leaving does, under a new id -- after
             // which that group is one in view like any other.
             _new_identity();
@@ -3073,12 +3079,17 @@ bool Devices::_dissolve_group(const device::GroupId& group) {
     return true;
 }
 
-bool Devices::_forked() {
+bool Devices::_dropped() {
     auto ours = _group_id();
-    return ours && conn().prepared_maybe_get<int>(
-                           "SELECT 1 FROM device_groups WHERE group_id != ? AND expires_at > ?",
-                           std::span<const std::byte>{ours->value},
-                           epoch_seconds(clock_now_s()));
+    if (!ours)
+        return false;
+    auto c = conn();
+    auto id = std::span<const std::byte>{ours->value};
+    auto now = epoch_seconds(clock_now_s());
+    return !c.prepared_maybe_get<int>(
+                   "SELECT 1 FROM device_groups WHERE group_id = ? AND expires_at > ?", id, now) &&
+           c.prepared_maybe_get<int>(
+                   "SELECT 1 FROM device_groups WHERE group_id != ? AND expires_at > ?", id, now);
 }
 
 void Devices::remove_device(device::Id id, result_function<bool> cb) {
@@ -3358,9 +3369,9 @@ Devices::NeedsPush Devices::needs_push() {
     auto c = conn();
     auto [registered, owed, ap] = c.prepared_get<int, int, int>(NEEDS_PUSH_SQL, self_id);
     // Not for a group that has moved on without us: we cannot read what it holds now, and would
-    // push a snapshot of what it held before.  Nor while another group is beside ours: pushing
-    // would carry on as though the user had chosen this one, which only they can do.
-    bool dg = registered && !_displaced() && !_forked() &&
+    // push a snapshot of what it held before.  Nor for one gone from the swarm while another is
+    // there: pushing would bring it back beside the one the account now has.
+    bool dg = registered && !_displaced() && !_dropped() &&
               (owed || _own_record().seqno != _held_record()->seqno);
     return {.device_group = dg, .account_pubkey = bool(ap)};
 }

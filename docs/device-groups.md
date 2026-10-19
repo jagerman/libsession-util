@@ -81,9 +81,10 @@ its newest message was written, by the clock of the device that wrote it).
 | `NoGroup` | Not in a group, and no group is in the swarm. | "No existing device group was found. Start a new one, or bring one of your other devices online to link this one?" Start → `start_group`. Otherwise wait: the state changes when a group appears. |
 | `GroupsVisible` | Not in a group; groups it cannot read are in the swarm. | "Link to your existing devices" (see "Joining"). Less prominently, "Start a new device group instead" → `start_group`, with a warning that it **dissolves** the existing group (see "Starting a group"). |
 | `Waiting` | This device's link request is outstanding. | The waiting screen (see "Joining"). |
-| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. |
-| `Forked` | In its group, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself; until it is answered, this device pushes nothing to its group. See "Forks". |
-| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. |
+| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
+| `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
+| `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `GroupsVisible`. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
@@ -203,11 +204,10 @@ not an error. This device cannot remove itself.
 
 ### Forks
 
-`membership_changed(Forked)`: this device is in its group, and another group is in the swarm. An
-account can have only one, so the user has to choose, and until they do this device pushes nothing
-to its group: approving a request or removing a device still works here, but reaches the other
-devices only once the fork is settled. Nothing has been decided yet; nothing has been lost yet
-either.
+`membership_changed(Forked)`: this device is in its group, whose messages are in the swarm, and
+another group's are there too. An account can have only one, so the user has to choose. Nothing
+is wrong with this device's group, which goes on working meanwhile, and the user may settle the
+fork here or on another of their devices; nothing has been decided yet, and nothing lost.
 
 Two groups are in view, so show both by emoji and creation time, this device's included, with when
 each was last active: this device's own is active now, and the other's is `others[i].last_seen`.
@@ -244,13 +244,20 @@ a device that started a group of its own by mistake months ago ("two months ago"
   different group, and this device's group is gone. Nothing is needed before joining again: the
   device already has a new identity, and its messages and the account's configs are kept. Offer to
   link it to the group that was kept, an ordinary join with the emoji confirmation.
+- **Dropped** (`membership_changed(Dropped)`). This device's group has gone from the swarm while
+  another group is there, and the device cannot tell why: it may have been removed or replaced
+  while away, been away too long, or had its group dissolved. It stops pushing by itself. Tell the
+  user it is no longer in the account's device group, and offer to link it again (`request_link`,
+  which gives it a new identity first); starting a group instead is possible but dissolves the
+  group in view, so offer it less prominently and with the warning from "Starting a group".
 
 ## Starting a group
 
 `start_group()` creates a group with this device as its only member. It is valid from any state
-outside a group. A device that was `Waiting` drops its request; one `Removed` or `Displaced` takes a
-new identity first, and the group it was in is then one in view like any other. It fails with
-`err::membership_unknown` before the first fetch, and `err::already_registered` from a group.
+outside a group. A device that was `Waiting` drops its request; one `Removed`, `Displaced` or
+`Dropped` takes a new identity first, and the group it was in is then one in view like any other.
+It fails with `err::membership_unknown` before the first fetch, and `err::already_registered` from
+a group.
 
 From `GroupsVisible` (or anywhere else with groups in `others`), starting a group **dissolves every
 group in view**: an account has only one, and the user is choosing the new group over them. Their
