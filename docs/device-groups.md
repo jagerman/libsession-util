@@ -31,9 +31,13 @@ from libsession each time the screen is drawn, and the events below say when to 
   Matrix's SAS emoji table. Look each up with `sas_emoji(i)` and show its `emoji` with its
   `description` under it -- Matrix's English name for it, or your own translation of that name,
   which you keep by the same index -- the first 7 in a row, or all 21 as 3 rows of 7 for the
-  extended view. Never show the index itself. A few emoji look alike or render
-  differently from one platform to another, which the names settle. Ask whether the two devices
-  show "the same" emoji, not "identical" ones.
+  extended view. Never show the index itself. A few emoji look alike or render differently from
+  one platform to another, which the names settle. Ask whether the two devices show "the same"
+  emoji, not "identical" ones.
+- **Words for the user.** "Device group" is the API's term, and the protocol's. What the user sees
+  generally needs no "group" at all: "your devices", "link a device", "device list", "this device
+  was removed". Where two groups have to be told apart, and only then, say what they are rather
+  than naming the concept.
 - **One group per account.** An account can still end up with two, usually because a device
   started a new group when it should have joined the existing one: a **fork**. libsession does not
   resolve it by itself. The user does, by keeping one group, which **dissolves** the other: its
@@ -85,20 +89,20 @@ its newest message was written, by the clock of the device that wrote it).
 | Membership | What it means | What to offer |
 |---|---|---|
 | `InGroup` | A full member, and the only group in the swarm. | Normal operation: the device screen, approving requests. |
-| `NoGroup` | Not in a group, and no group is in the swarm. | "No existing device group was found. Start a new one, or bring one of your other devices online to link this one?" Start → `start_group`. Otherwise wait: the state changes when a group appears. |
-| `GroupsVisible` | Not in a group; groups it cannot read are in the swarm. | "Link to your existing devices" (see "Joining"). Less prominently, "Start a new device group instead" → `start_group`, with a warning that it **dissolves** the existing group (see "Starting a group"). |
+| `NoGroup` | Not in a group, and no group is in the swarm. | "No existing device group was found. Start a new one, or bring one of your other devices online to link this one?" Start → `start_device_group`. Otherwise wait: the state changes when a group appears. |
+| `DeviceGroupVisible` | Not in a group; groups it cannot read are in the swarm. | "Link to your existing devices" (see "Joining"). Less prominently, "Start a new device group instead" → `start_device_group`, with a warning that it **dissolves** the existing group (see "Starting a group"). |
 | `Requesting` | This device's link request is out, awaiting approval. | The waiting screen, without a confirm action (see "Joining"). |
 | `Approved` | Another device approved the request; the user has to confirm the emoji. | The confirmation, brought up wherever the user is (see "Joining"). |
-| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
+| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `DeviceGroupVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
 | `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
 | `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there, or has moved on to keys it doesn't hold without saying why. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
-| `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `GroupsVisible`. |
+| `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `DeviceGroupVisible`. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
 while all of the account's devices were offline for 30 days, and starting a group in that case
 forks the account. An application that really does want to start a group automatically can call
-`start_group` without asking, but that is its choice, not libsession's.
+`start_device_group` without asking, but that is its choice, not libsession's.
 
 There is no "link later" call. If the user dismisses the prompt, do nothing: the state is
 unchanged, and the next start (or the device screen) offers the choice again.
@@ -108,11 +112,11 @@ unchanged, and the next start (or the device screen) offers the choice again.
 - **New account:** `globals.create_account(SeedSize::Bits128)` (13 words) or `Bits256` (25
   words). A new account gets its group at once and becomes `InGroup` with the first fetch.
 - **Restored account:** `globals.restore_account(seed)`. No group is created. The first fetch
-  makes the state `GroupsVisible` (join one) or `NoGroup`.
+  makes the state `DeviceGroupVisible` (join one) or `NoGroup`.
 
 ## Joining a group (the new device)
 
-1. **Choose.** In `GroupsVisible`, take the group from `membership().others`. Usually there is
+1. **Choose.** In `DeviceGroupVisible`, take the group from `membership().others`. Usually there is
    exactly one: use it without asking, and without showing its emoji. If there are several, the
    account has forked: offer the most recently active (the first in `others`) by default, with the
    others listed by emoji, creation time and last activity. **Joining one dissolves the rest** once
@@ -147,9 +151,9 @@ the request lives in the swarm for its 10 minutes, across restarts, whatever the
 Closing the screen changes nothing, and tapping "Link" again while `Requesting` reopens the same
 request: `request_link` for the same group answers with it, same emoji and same deadline, and
 uploads nothing (on the decision screen, "join" then means "show my request"). If the deadline
-passes unapproved, `membership_changed` reports the device back in `GroupsVisible`/`NoGroup`; offer
-to try again, which makes a new request with a new SAS. Starting a group instead withdraws the
-request.
+passes unapproved, `membership_changed` reports the device back in `DeviceGroupVisible`/`NoGroup`;
+offer to try again, which makes a new request with a new SAS. Starting a group instead withdraws
+the request.
 
 An approval can arrive after the deadline has passed here: the other device approved in time, but
 this one fetched the message late. It is `Approved` all the same, and `outgoing_link_request()`
@@ -275,24 +279,24 @@ a device that started a group of its own by mistake months ago ("two months ago"
 
 ## Starting a group
 
-`start_group()` creates a group with this device as its only member. It is valid from any state
-outside a group. A device `Requesting` or `Approved` drops its request; one `Removed`, `Displaced`
-or `Dropped` takes a new identity first, and the group it was in is then one in view like any
-other. It fails with `err::membership_unknown` before the first fetch, and `err::already_registered`
-from a group.
+`start_device_group()` creates a group with this device as its only member. It is valid from any
+state outside a group. A device `Requesting` or `Approved` drops its request; one `Removed`,
+`Displaced` or `Dropped` takes a new identity first, and the group it was in is then one in view
+like any other. It fails with `err::membership_unknown` before the first fetch, and
+`err::already_registered` from a group.
 
-From `GroupsVisible` (or anywhere else with groups in `others`), starting a group **dissolves every
-group in view**: an account has only one, and the user is choosing the new group over them. Their
-devices become `Dissolved` and have to link to the new group. Make that the warning on the "Start a
-new device group instead" choice, and say what is lost: **messages that reached the existing
-devices only, encrypted to keys this device does not hold, cannot be recovered afterwards** unless
-another device still holds those keys. This device is not alerted about anything: the choice was
-its user's.
+From `DeviceGroupVisible` (or anywhere else with groups in `others`), starting a group **dissolves
+every group in view**: an account has only one, and the user is choosing the new group over them.
+Their devices become `Dissolved` and have to link to the new group. Make that the warning on the
+"Start a new device group instead" choice, and say what is lost: **messages that reached the
+existing devices only, encrypted to keys this device does not hold, cannot be recovered afterwards**
+unless another device still holds those keys. This device is not alerted about anything: the choice
+was its user's.
 
 ## Leaving a group
 
 `leave_group()` takes this device out of its group and forgets the group, leaving it `NoGroup` or
-`GroupsVisible`. Call it:
+`DeviceGroupVisible`. Call it:
 
 - **On logout, or when the user clears the app's data**, before wiping anything. The group is told
   the device has gone, so it stops listing it and encrypting to it; otherwise it stays in every

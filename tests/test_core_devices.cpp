@@ -1003,7 +1003,7 @@ struct Linking {
 
     // The existing device's group, as the applicant sees it once it has fetched a group message:
     // what it asks to join.  A completed fetch, so the applicant knows where it stands --
-    // GroupsVisible -- before it asks.
+    // DeviceGroupVisible -- before it asks.
     device::GroupId show_group() {
         TestHelper::deliver_device_message(
                 *applicant,
@@ -1644,7 +1644,7 @@ TEST_CASE(
     // then being admitted.
     REQUIRE(l.applicant->devices.confirm_link(await));
     CHECK(l.applicant_events.membership == std::vector{
-                                                   device::Membership::GroupsVisible,
+                                                   device::Membership::DeviceGroupVisible,
                                                    device::Membership::Approved,
                                                    device::Membership::InGroup});
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
@@ -1667,7 +1667,7 @@ TEST_CASE(
 
     // The caller has been told; that it is no longer waiting is not news.
     TestHelper::finish_fetch(*l.applicant);
-    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
 }
 
 TEST_CASE(
@@ -1824,7 +1824,7 @@ TEST_CASE(
     REQUIRE(got);
     REQUIRE(got->has_value());
 
-    REQUIRE(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    REQUIRE(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
     l.applicant_events.membership.clear();
 
     // Brought to within a second of the deadline, and the timer re-armed from there, so that it is
@@ -1834,7 +1834,7 @@ TEST_CASE(
     REQUIRE(l.applicant_events.membership.empty());
 
     REQUIRE(eventually(*l.applicant, [&] { return !l.applicant_events.membership.empty(); }));
-    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
     CHECK(own_state(l.applicant) == device::State::Unregistered);
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
 }
@@ -1874,7 +1874,7 @@ TEST_CASE(
             *l.applicant, [&] { return own_state(l.applicant) == device::State::Unregistered; }));
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
     TestHelper::finish_fetch(*l.applicant);
-    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
 }
 
 TEST_CASE(
@@ -1892,7 +1892,7 @@ TEST_CASE(
     CHECK(own_state(l.applicant) == device::State::Unregistered);
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
     TestHelper::finish_fetch(*l.applicant);
-    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
 }
 
 TEST_CASE(
@@ -2179,12 +2179,12 @@ TEST_CASE(
 
     auto group = l.show_group();
     auto state = l.applicant->devices.membership(await);
-    CHECK(state.membership == device::Membership::GroupsVisible);
+    CHECK(state.membership == device::Membership::DeviceGroupVisible);
     CHECK_FALSE(state.group);
     REQUIRE(state.others.size() == 1);
     CHECK(state.others[0].id == group);
     CHECK(l.applicant_events.membership ==
-          std::vector{device::Membership::NoGroup, device::Membership::GroupsVisible});
+          std::vector{device::Membership::NoGroup, device::Membership::DeviceGroupVisible});
 }
 
 namespace {
@@ -2214,7 +2214,7 @@ TEST_CASE(
     auto* net = attach_mock_network(*l.core);
 
     // Another device on the account starts a group of its own.
-    TestHelper::start_group(*l.applicant);
+    TestHelper::start_device_group(*l.applicant);
     auto second = *TestHelper::group_id(*l.applicant);
     auto written = std::chrono::floor<std::chrono::seconds>(clock_now_s());
     TestHelper::deliver_device_message(
@@ -2269,7 +2269,7 @@ TEST_CASE(
     auto old_id = Linking::id_of(l.core);
 
     // Another group, whose message outlives everything we know of our own.
-    TestHelper::start_group(*l.applicant);
+    TestHelper::start_device_group(*l.applicant);
     auto theirs = *TestHelper::group_id(*l.applicant);
     TestHelper::deliver_device_message(
             *l.core,
@@ -2327,7 +2327,7 @@ TEST_CASE(
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
 
     // Until it starts or joins a group.
-    l.applicant->devices.start_group(await);
+    l.applicant->devices.start_device_group(await);
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 }
 
@@ -2335,7 +2335,7 @@ TEST_CASE("Devices - a dissolved group is no longer one to join", "[core][device
     Linking l;
     auto theirs = l.show_group();
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto second = *TestHelper::group_id(*other);
     TestHelper::deliver_device_message(
             *l.applicant, other->devices.build_device_group_message().message, in(10min), "B1");
@@ -2385,7 +2385,7 @@ TEST_CASE(
 
     // A group of one device, beside ours, with a message of it ours never sees until later.
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto theirs = *TestHelper::group_id(*other);
     auto leftover = other->devices.build_device_group_message().message;
     TestHelper::deliver_device_message(
@@ -2435,7 +2435,7 @@ TEST_CASE(
     auto* net = attach_mock_network(*l.core);
 
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto theirs = *TestHelper::group_id(*other);
     TestHelper::deliver_device_message(
             *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
@@ -2448,7 +2448,7 @@ TEST_CASE(
     // empty swarm, or a third group, which leaves it dropped.
     bool dropped = GENERATE(false, true);
     TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*third);
+    TestHelper::start_device_group(*third);
     if (dropped)
         TestHelper::deliver_device_message(
                 *l.core,
@@ -2491,7 +2491,7 @@ TEST_CASE(
 
     // Another group on the account, which the existing device sees too: forked.
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto theirs = *TestHelper::group_id(*other);
     auto b1 = other->devices.build_device_group_message().message;
     TestHelper::deliver_device_message(*l.core, b1, in(10min), "B1");
@@ -2562,7 +2562,7 @@ TEST_CASE(
     TempCore impostor{
             core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
             Linking::reporting_to(impostor_events)};
-    TestHelper::start_group(*impostor);
+    TestHelper::start_device_group(*impostor);
     auto req = TestHelper::build_link_request(*l.applicant, *impostor);
 
     // The real group cannot read the request, so it never prompts, and the user never sees a SAS
@@ -2659,7 +2659,7 @@ TEST_CASE(
     ScopedClockOffset later{Devices::LINK_REQUEST_TTL + 1s};
     TestHelper::finish_fetch(*l.applicant);
     REQUIRE(eventually(*l.applicant, [&] { return !l.applicant_events.membership.empty(); }));
-    REQUIRE(l.applicant_events.membership.back() == device::Membership::GroupsVisible);
+    REQUIRE(l.applicant_events.membership.back() == device::Membership::DeviceGroupVisible);
 
     REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
     TestHelper::deliver_device_message(
@@ -2697,7 +2697,8 @@ TEST_CASE(
 
     TestHelper::deliver_device_message(
             *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
-    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    CHECK(l.applicant->devices.membership(await).membership ==
+          device::Membership::DeviceGroupVisible);
     CHECK(own_state(l.applicant) == device::State::Unregistered);
     CHECK_FALSE(l.applicant->devices.confirm_link(await));
 }
@@ -2781,11 +2782,11 @@ TEST_CASE(
     Linking l;
     TestHelper::finish_fetch(*l.core);
     auto theirs = l.show_group();
-    REQUIRE(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    REQUIRE(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
     auto held_before = l.applicant->devices.active_account_keys().front().x25519_pub;
     auto* net = attach_mock_network(*l.applicant);
 
-    auto mine = l.applicant->devices.start_group(await);
+    auto mine = l.applicant->devices.start_device_group(await);
     CHECK(mine != theirs);
 
     // With a key of its own, not whatever it held before.
@@ -2797,7 +2798,7 @@ TEST_CASE(
     CHECK(state.membership == device::Membership::InGroup);
     CHECK(state.group == mine);
     CHECK(state.others.empty());
-    CHECK(l.applicant_events.membership == std::vector{device::Membership::GroupsVisible});
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
 
     // The other group's message deleted, and a tombstone naming it published.
     auto sent = pushes(*net);
@@ -2826,18 +2827,19 @@ TEST_CASE(
     Linking l;
 
     // Before any fetch, nothing is known of what the swarm holds.
-    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) ==
+    CHECK(failure_code([&] { l.applicant->devices.start_device_group(await); }) ==
           err::membership_unknown);
 
     // Already in one.
     TestHelper::finish_fetch(*l.core);
-    CHECK(failure_code([&] { l.core->devices.start_group(await); }) == err::already_registered);
+    CHECK(failure_code([&] { l.core->devices.start_device_group(await); }) ==
+          err::already_registered);
 
     // Requesting: starting a group instead withdraws the request.
     l.show_group();
     TestHelper::build_link_request(*l.applicant, *l.core);
     REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
-    l.applicant->devices.start_group(await);
+    l.applicant->devices.start_device_group(await);
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
     CHECK(own_state(l.applicant) == device::State::Registered);
 }
@@ -2850,7 +2852,7 @@ TEST_CASE(
 
     // Another group on the account, which the applicant sees: forked.
     TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*third);
+    TestHelper::start_device_group(*third);
     auto other = *TestHelper::group_id(*third);
     TestHelper::deliver_device_message(
             *l.applicant, third->devices.build_device_group_message().message, in(10min), "Y1");
@@ -2869,7 +2871,8 @@ TEST_CASE(
 
     // Its user choosing the other group: leave, then ask.
     REQUIRE(l.applicant->devices.leave_group(await));
-    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    CHECK(l.applicant->devices.membership(await).membership ==
+          device::Membership::DeviceGroupVisible);
     got.reset();
     request_link(l.applicant, other, got);
     CHECK(own_state(l.applicant) == device::State::Pending);
@@ -2897,7 +2900,7 @@ TEST_CASE(
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
     CHECK(account_key_count(l.applicant) == 0);
     auto state = l.applicant->devices.membership(await);
-    CHECK(state.membership == device::Membership::GroupsVisible);
+    CHECK(state.membership == device::Membership::DeviceGroupVisible);
     REQUIRE(state.others.size() == 1);
     CHECK(state.others[0].id == group);
     // Its own doing, so not news to it.
@@ -3058,7 +3061,7 @@ TEST_CASE(
     Linking l;
     TestHelper::finish_fetch(*l.core);
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto theirs = *TestHelper::group_id(*other);
     TestHelper::deliver_device_message(
             *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
@@ -3136,7 +3139,8 @@ TEST_CASE(
     REQUIRE(l.applicant->devices.leave_group(await));
     CHECK(pushes(*net).empty());
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
-    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    CHECK(l.applicant->devices.membership(await).membership ==
+          device::Membership::DeviceGroupVisible);
 }
 
 namespace {
@@ -3171,7 +3175,7 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.applicant);
 
     // A group of its own: the first record of it carries the description.
-    l.applicant->devices.start_group(await);
+    l.applicant->devices.start_device_group(await);
     auto own = record_in(
             l.applicant->devices,
             l.applicant->devices.build_device_group_message().message,
@@ -3511,7 +3515,7 @@ TEST_CASE(
 
     // Out of the group it was removed from first, and so, under the rule for starting a group
     // with others in view, dissolving it: nothing of that group comes along.
-    auto mine = l.applicant->devices.start_group(await);
+    auto mine = l.applicant->devices.start_device_group(await);
     CHECK(mine != theirs);
     CHECK(l.applicant_id() != old_id);
     auto state = l.applicant->devices.membership(await);
@@ -3804,7 +3808,7 @@ TEST_CASE("Devices - a removal announced by another group is ignored", "[core][d
 
     // Another group on the account, whose message names the applicant's id as removed.
     TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
-    TestHelper::start_group(*other);
+    TestHelper::start_device_group(*other);
     auto other_self = other->devices.device_info(await).first;
     auto ours = tombstone(
             device::State::Kicked, std::chrono::floor<std::chrono::seconds>(clock_now_s()));

@@ -3087,7 +3087,7 @@ device::MembershipState Devices::_membership() {
                            : own == device::State::Pending ? device::Membership::Requesting
                            : core.globals.get_integer(dissolved_key) ? device::Membership::Dissolved
                            : out.others.empty()                      ? device::Membership::NoGroup
-                                                : device::Membership::GroupsVisible;
+                                                : device::Membership::DeviceGroupVisible;
         }
     }
     return out;
@@ -3184,15 +3184,15 @@ void Devices::_adopt_identity(const device::Id& id) {
     _ended.clear();
 }
 
-void Devices::start_group(result_function<device::GroupId> cb) {
-    async([this] { return _start_group(); }, std::move(cb));
+void Devices::start_device_group(result_function<device::GroupId> cb) {
+    async([this] { return _start_device_group(); }, std::move(cb));
 }
 
-device::GroupId Devices::start_group(await_t) {
-    return jq().call_get([this] { return _start_group(); });
+device::GroupId Devices::start_device_group(await_t) {
+    return jq().call_get([this] { return _start_device_group(); });
 }
 
-device::GroupId Devices::_start_group() {
+device::GroupId Devices::_start_device_group() {
     assert(on_loop());
     switch (_membership().membership) {
         case device::Membership::Unknown:
@@ -3212,7 +3212,7 @@ device::GroupId Devices::_start_group() {
         case device::Membership::Requesting:
         case device::Membership::Approved: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
-        case device::Membership::GroupsVisible:
+        case device::Membership::DeviceGroupVisible:
         case device::Membership::Dissolved: break;
     }
 

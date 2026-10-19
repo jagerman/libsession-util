@@ -673,7 +673,7 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 
     // Gives `core` a group of its own, as a new account gets one -- a second group, on an account
     // that already has a first.
-    static void start_group(core::Core& core) {
+    static void start_device_group(core::Core& core) {
         on_loop(core, [&] {
             core.devices._mark_group_owed();
             core.devices.establish_group();

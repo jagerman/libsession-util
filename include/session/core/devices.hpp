@@ -272,45 +272,54 @@ namespace device {
     /// Where this device stands with respect to the account's device groups.  An ongoing state
     /// rather than a step in setup: it is re-evaluated on every fetch, and any of these can recur.
     enum class Membership {
-        Unknown,  ///< Not yet known: no fetch from the swarm has completed since this Core started,
-                  ///< and what the swarm holds decides every other value.
-        InGroup,  ///< In a group, and the only group in the swarm.
-        NoGroup,  ///< Not in a group, and no group is in the swarm.  Either the account never had
-                  ///< one, or every device was offline long enough for it to expire, and the two
-                  ///< cannot be told apart -- so starting one is the user's decision.
-        GroupsVisible,  ///< Not in a group, and one or more groups it cannot read are in the swarm:
-                        ///< it may ask to join one, or start its own instead, which dissolves them.
-        Requesting,  ///< This device's own link request is out, for another device of the group to
-                     ///< approve before it lapses; see `outgoing_link_request`.  Nothing to confirm
-                     ///< yet: `confirm_link` answers false.
-        Approved,    ///< Another device approved this one's request, and the admission waits for
-                   ///< the user to confirm, through `confirm_link`, that the emoji match what that
-                   ///< device showed.  It no longer lapses.
-        Removed,  ///< Removed from its group by another device.  It can come back only under a new
-                  ///< device id, which `request_link` and `start_group` take for it.
-        Displaced,  ///< Its group has moved on without it: a newer message from the group is one
-                    ///< it cannot read, whose removals show that nothing removed it.  Another
-                    ///< device holds its place under its id -- a restored copy of it, admitted as
-                    ///< a replacement, or someone holding a copy of its data who has rotated it
-                    ///< out, which is an attack.  Never dismissable.  It can come back only under
-                    ///< a new device id, which `request_link` and `start_group` take for it.
-        Dissolved,  ///< Its group was dissolved: the user of another of the account's devices kept
-                    ///< another group over it.  What it held of the group is forgotten and it has
-                    ///< a new device id; it rejoins by asking to join the group that was kept, as
-                    ///< any device outside a group does, and stays Dissolved until it joins a
-                    ///< group or starts one.
-        Forked,     ///< In a group whose messages are in the swarm, while another group's are
-                    ///< too and no tombstone names this one: the account has forked, and an
-                    ///< account can have only one group.  Nothing is wrong with this group, which
-                    ///< goes on working; the user decides, here or on another device, whether to
-                    ///< keep it, dissolving the others (`Devices::dissolve_group`), or to leave it
-                    ///< for another (`Devices::leave_group`, then `Devices::request_link`).
-        Dropped,    ///< No longer in a device group: its group is gone from the swarm while
-                    ///< another group is there, or has moved on to keys it does not hold without
-                    ///< showing why.  It was removed, replaced, or away too long, and cannot tell
-                    ///< which -- it may itself have been dissolved.  It pushes nothing, acts for
-                    ///< the group in nothing, and dissolves nothing new; it can come back only
-                    ///< under a new device id, which `request_link` and `start_group` take for it.
+        /// Not yet known: no fetch from the swarm has completed since this Core started, and what
+        /// the swarm holds decides every other value.
+        Unknown,
+        /// In a group, and the only group in the swarm.
+        InGroup,
+        /// Not in a group, and no group is in the swarm.  Either the account never had one, or
+        /// every device was offline long enough for it to expire, and the two cannot be told apart
+        /// -- so starting one is the user's decision.
+        NoGroup,
+        /// Not in a group, and one or more groups it cannot read are in the swarm: it may ask to
+        /// join one, or start its own instead, which dissolves them.
+        DeviceGroupVisible,
+        /// This device's own link request is out, for another device of the group to approve
+        /// before it lapses; see `outgoing_link_request`.  Nothing to confirm yet: `confirm_link`
+        /// answers false.
+        Requesting,
+        /// Another device approved this one's request, and the admission waits for the user to
+        /// confirm, through `confirm_link`, that the emoji match what that device showed.  It no
+        /// longer lapses.
+        Approved,
+        /// Removed from its group by another device.  It can come back only under a new device id,
+        /// which `request_link` and `start_device_group` take for it.
+        Removed,
+        /// Its group has moved on without it: a newer message from the group is one it cannot read,
+        /// whose removals show that nothing removed it.  Another device holds its place under its
+        /// id -- a restored copy of it, admitted as a replacement, or someone holding a copy of its
+        /// data who has rotated it out, which is an attack.  Never dismissable.  It can come back
+        /// only under a new device id, which `request_link` and `start_device_group` take for it.
+        Displaced,
+        /// Its group was dissolved: the user of another of the account's devices kept another group
+        /// over it.  What it held of the group is forgotten and it has a new device id; it rejoins
+        /// by asking to join the group that was kept, as any device outside a group does, and stays
+        /// Dissolved until it joins a group or starts one.
+        Dissolved,
+        /// In a group whose messages are in the swarm, while another group's are too and no
+        /// tombstone names this one: the account has forked, and an account can have only one
+        /// group.  Nothing is wrong with this group, which goes on working; the user decides, here
+        /// or on another device, whether to keep it, dissolving the others
+        /// (`Devices::dissolve_group`), or to leave it for another (`Devices::leave_group`, then
+        /// `Devices::request_link`).
+        Forked,
+        /// No longer in a device group: its group is gone from the swarm while another group is
+        /// there, or has moved on to keys it does not hold without showing why.  It was removed,
+        /// replaced, or away too long, and cannot tell which -- it may itself have been dissolved.
+        /// It pushes nothing, acts for the group in nothing, and dissolves nothing new; it can come
+        /// back only under a new device id, which `request_link` and `start_device_group` take for
+        /// it.
+        Dropped,
     };
 
     /// A device group in the swarm other than this device's own.
@@ -729,8 +738,8 @@ class Devices final : detail::CoreComponent {
     // Fails with `err::already_registered` for a device already in a group, and
     // `err::membership_unknown` before the first fetch of this run: starting a group is the user's
     // decision, made from what the swarm holds.
-    void start_group(result_function<device::GroupId> cb);
-    device::GroupId start_group(await_t);
+    void start_device_group(result_function<device::GroupId> cb);
+    device::GroupId start_device_group(await_t);
 
     // Keeps this device's group over another in the swarm, which the user has chosen to do from
     // `Forked`: deletes the other's messages from the swarm, publishes a tombstone naming it, and
@@ -745,9 +754,9 @@ class Devices final : detail::CoreComponent {
     bool dissolve_group(const device::GroupId& group, await_t);
 
     // Leaves this device's group, which it then forgets -- its devices, its account keys and its
-    // identifier -- leaving the device `NoGroup` or `GroupsVisible`.  For logging out or clearing
-    // the device's data, and for a `Forked` device whose user chooses the other group: leave, then
-    // `request_link` to it.  See "Leaving a group".
+    // identifier -- leaving the device `NoGroup` or `DeviceGroupVisible`.  For logging out or
+    // clearing the device's data, and for a `Forked` device whose user chooses the other group:
+    // leave, then `request_link` to it.  See "Leaving a group".
     //
     // A member in good standing tells its group: a departure is pushed to the other members, so
     // that they stop encrypting to it and move to an account key it does not hold, or the group's
@@ -767,7 +776,7 @@ class Devices final : detail::CoreComponent {
   private:
     bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
     device::MembershipState _membership();
-    device::GroupId _start_group();
+    device::GroupId _start_device_group();
 
     // Removed from its group, displaced from it, or dropped (see Membership::Dropped): still
     // holding the group, but no longer in it.
