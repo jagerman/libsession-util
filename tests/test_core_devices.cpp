@@ -4521,3 +4521,106 @@ TEST_CASE(
         CHECK(view(*from) == held);
     }
 }
+
+namespace {
+
+// `count` devices the applicant never hears of, each admitted by the existing device and then
+// removed by it, a minute apart.
+void removals_since(Linking& l, ScopedClockOffset& clock, int count) {
+    for (int i = 0; i < count; i++) {
+        clock.advance(1min);
+        TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+        TestHelper::deliver_device_message(
+                *l.core,
+                TestHelper::build_link_request(*other, *l.core).message,
+                in(10min),
+                "LR" + std::to_string(i));
+        REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+        REQUIRE(l.core->devices.remove_device(Linking::id_of(other), await));
+    }
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a device whose removal is no longer carried reads as dropped, not removed",
+        "[core][devices][classify]") {
+    Linking l;
+    l.admit();
+    ScopedClockOffset later{1min};
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+
+    // As many removals since as a group of one device carries.
+    removals_since(l, later, 4);
+    later.advance(Devices::DISPLACEMENT_GRACE);
+    auto message = l.core->devices.build_device_group_message().message;
+    CHECK(kicked_slots(message) == 4);
+
+    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G9");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dropped);
+    CHECK(own_state(l.applicant) == device::State::Registered);
+}
+
+TEST_CASE(
+        "Devices - a removal restated after ours was evicted reads as displaced",
+        "[core][devices][classify]") {
+    Linking l;
+    l.admit();
+    TempCore known{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    join(l, known);
+
+    // A removal the applicant hears of...
+    ScopedClockOffset later{1min};
+    REQUIRE(l.core->devices.remove_device(Linking::id_of(known), await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    REQUIRE(l.applicant->devices.devices(false, false, true).contains(Linking::id_of(known)));
+    // ...with what the removed device still holds of the group, less the applicant.
+    auto revival_group = known->devices.devices(true, true, true);
+    revival_group.erase(l.applicant_id());
+
+    // Then the applicant's own, unheard, and three more.
+    later.advance(1min);
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    removals_since(l, later, 3);
+
+    // The removed device pushes its old view again, and the existing device restates its removal,
+    // as new as any.
+    later.advance(1min);
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(known->devices, revival_group),
+            in(10min),
+            "G8");
+    later.advance(Devices::DISPLACEMENT_GRACE);
+    auto message = l.core->devices.build_device_group_message().message;
+    CHECK(kicked_slots(message) == 4);
+
+    // The known false Displaced from the review: the cap has evicted our own removal while a
+    // removal older than it, reasserted, is still carried -- and a known removal carried says the
+    // list reaches back past our time, which here it does not.
+    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G9");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
+}
+
+TEST_CASE(
+        "Devices - a message carrying no removals says displaced only within the marker age",
+        "[core][devices][classify]") {
+    Linking l;
+    l.admit();
+    auto core_self = l.core->devices.device_info(await).first;
+    auto without_us = [&] {
+        return TestHelper::encrypt_device_data(l.core->devices, {{core_self.id, core_self}});
+    };
+
+    SECTION("last read just within it: displaced") {
+        ScopedClockOffset later{Devices::REMOVAL_MARKER_MAX_AGE - 1min};
+        TestHelper::deliver_device_message(*l.applicant, without_us(), in(10min), "G2");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
+    }
+    SECTION("last read just past it: dropped") {
+        ScopedClockOffset later{Devices::REMOVAL_MARKER_MAX_AGE + 1min};
+        TestHelper::deliver_device_message(*l.applicant, without_us(), in(10min), "G2");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dropped);
+    }
+}
