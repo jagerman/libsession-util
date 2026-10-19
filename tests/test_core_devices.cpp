@@ -4823,3 +4823,129 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.core);
     CHECK(dissolutions(*net).empty());
 }
+
+namespace {
+
+// Shuts `c` down and starts it again on the same database, reporting to `events`, which it starts
+// afresh: what follows is what the new run reports.
+void restart(TempCore& c, DeviceEventsRecorder& events) {
+    c.core.reset();
+    events = DeviceEventsRecorder{};
+    c.core = std::make_unique<core::Core>(c.path, Linking::reporting_to(events));
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a dissolved device is still dissolved after a restart",
+        "[core][devices][restart]") {
+    Linking l;
+    l.admit();
+    TempCore keeper{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *l.applicant,
+            TestHelper::build_dissolution(*keeper, {*TestHelper::group_id(*l.applicant)}),
+            in(10min),
+            "T1");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+
+    restart(l.applicant, l.applicant_events);
+    TestHelper::finish_fetch(*l.applicant);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::Dissolved});
+}
+
+TEST_CASE(
+        "Devices - a dropped device is still dropped after a restart", "[core][devices][restart]") {
+    Linking l;
+    SECTION("its group gone from the swarm beside another") {
+        TestHelper::start_device_group(*l.applicant);
+        TestHelper::deliver_device_message(
+                *l.core,
+                l.applicant->devices.build_device_group_message().message,
+                in(1min) + Devices::DEVICE_GROUP_TTL + 1h,
+                "B1");
+        ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1h};
+        TestHelper::finish_fetch(*l.core);
+        REQUIRE(l.core->devices.membership(await).membership == device::Membership::Dropped);
+
+        restart(l.core, l.events);
+        TestHelper::finish_fetch(*l.core);
+        CHECK(l.core->devices.membership(await).membership == device::Membership::Dropped);
+        CHECK(l.events.membership == std::vector{device::Membership::Dropped});
+    }
+    SECTION("a message from its group it cannot read, saying too little") {
+        l.admit();
+        auto core_self = l.core->devices.device_info(await).first;
+        auto unknown = tombstone(
+                device::State::Kicked, std::chrono::floor<std::chrono::seconds>(clock_now_s()));
+        ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                TestHelper::encrypt_device_data(
+                        l.core->devices, {{core_self.id, core_self}, {unknown.id, unknown}}),
+                in(10min),
+                "G2");
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Dropped);
+
+        restart(l.applicant, l.applicant_events);
+        TestHelper::finish_fetch(*l.applicant);
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dropped);
+        CHECK(l.applicant_events.membership == std::vector{device::Membership::Dropped});
+    }
+}
+
+TEST_CASE(
+        "Devices - when the next rotations are due is the same after a restart",
+        "[core][devices][restart][rotation]") {
+    Linking l;
+    l.admit();
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
+
+    // A departure, making the account key's rotation due early; and the device keys' own time.
+    auto [self, registered] = l.core->devices.device_info(await);
+    auto leaver = l.state_of_applicant();
+    leaver.state = device::State::Left;
+    leaver.kicked = std::chrono::floor<std::chrono::seconds>(clock_now_s());
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(
+                    l.applicant->devices, {{self.id, self}, {leaver.id, leaver}}),
+            in(10min),
+            "G2");
+    auto account = *l.core->devices.next_account_rotation();
+    auto device = *l.core->devices.next_device_rotation();
+    REQUIRE(account <= clock_now() + Devices::KEY_ROTATION_JITTER);
+
+    restart(l.core, l.events);
+    CHECK(*l.core->devices.next_account_rotation() == account);
+    CHECK(*l.core->devices.next_device_rotation() == device);
+}
+
+TEST_CASE(
+        "Devices - a fork, and a dissolution not yet sent, survive a restart",
+        "[core][devices][restart][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+
+    restart(l.core, l.events);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Forked);
+    CHECK(l.events.membership == std::vector{device::Membership::Forked});
+
+    // Kept, with no network to send the dissolution by, and then the device stopped.
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+    REQUIRE(pending_pushes(l.core) == 1);
+    restart(l.core, l.events);
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    REQUIRE(dissolutions(*net).size() == 1);
+    TestHelper::deliver_device_message(*other, latest_tombstone(*net), in(10min), "T1");
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+}
