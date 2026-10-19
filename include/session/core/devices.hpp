@@ -271,18 +271,15 @@ namespace device {
     enum class Membership {
         Unknown,  ///< Not yet known: no fetch from the swarm has completed since this Core started,
                   ///< and what the swarm holds decides every other value.
-        InGroup,  ///< In a group.  Others may be visible alongside it: see MembershipState::others.
+        InGroup,  ///< In a group, and the only group in the swarm.
         NoGroup,  ///< Not in a group, and no group is in the swarm.  Either the account never had
                   ///< one, or every device was offline long enough for it to expire, and the two
                   ///< cannot be told apart -- so starting one is the user's decision.
         GroupsVisible,  ///< Not in a group, and one or more groups it cannot read are in the swarm:
-                        ///< it may ask to join one, or start its own alongside them.
+                        ///< it may ask to join one, or start its own instead, which dissolves them.
         Waiting,        ///< Waiting on this device's own link request; see `outgoing_link_request`.
         Removed,  ///< Removed from its group by another device.  It can come back only under a new
                   ///< device id.
-        CutOff,   ///< Was in a group, none of whose messages are left in the swarm, while another
-                  ///< group's are.  It can no longer receive anything encrypted to its group, which
-                  ///< may be an attack, and is never dismissable.
         Displaced,  ///< Its group has moved on without it: a newer message from the group is one
                     ///< it cannot read, though nothing removed it.  Another device holds its place
                     ///< under its id -- a restored copy of it, admitted as a replacement, or
@@ -293,14 +290,19 @@ namespace device {
                     ///< a new device id; it rejoins by asking to join the group that was kept, as
                     ///< any device outside a group does, and stays Dissolved until it joins a
                     ///< group or starts one.
+        Forked,     ///< In a group, while another group is in the swarm and no tombstone names
+                    ///< this one: the account has forked, and an account can have only one group.
+                    ///< Nothing has been decided, so the device pushes nothing until its user
+                    ///< decides to keep this group, dissolving the others
+                    ///< (`Devices::dissolve_group`).
     };
 
     /// A device group in the swarm other than this device's own.
     struct VisibleGroup {
         GroupId id;
         std::chrono::sys_seconds last_seen;  ///< When its newest message was written, by the
-                                             ///< clock of the device that wrote it.
-        bool dismissed;  ///< The user has dismissed it here: see `Devices::dismiss_group`.
+                                             ///< clock of the device that wrote it: when the
+                                             ///< group was last active.
     };
 
     struct MembershipState {
@@ -351,7 +353,6 @@ class Devices final : detail::CoreComponent {
     std::vector<device::Id> _member_changes;
     bool _fetched = false;
     device::Membership _reported_membership = device::Membership::Unknown;
-    std::set<std::array<std::byte, 8>> _announced_groups;
     std::unordered_set<int64_t> _ended;
 
     // Fires a flush at the earliest deadline among our own request and those handed out and still
@@ -391,9 +392,10 @@ class Devices final : detail::CoreComponent {
 
     // Notes a group message in `device_groups`, and its hash in `device_group_messages`, whether or
     // not we can read it, answering whether to take it in any further.  Not for a group we know to
-    // be dissolved: its message is deleted from the swarm instead, and the dissolution published
-    // again if the message is newer than it.  Throws, so that it is not taken in either, on a bad
-    // signature and on a signed time too far ahead (see `_signed_time`).
+    // be dissolved, unless the message is newer than the dissolution and we are in no group to
+    // decide for: a member deletes it from the swarm instead, and publishes the dissolution again
+    // if it is newer.  Throws, so that it is not taken in either, on a bad signature and on a
+    // signed time too far ahead (see `_signed_time`).
     bool _record_group(const SwarmMessage& msg);
 
     // Checks that the namespace-21 message `in` is reading was signed by the account, throwing if
@@ -409,8 +411,7 @@ class Devices final : detail::CoreComponent {
     std::optional<sys_ms> _dissolved_at(const device::GroupId& group);
 
     // Remembers `group` as dissolved at `t`, and stops counting it among the groups in the swarm.
-    // Answers whether it was news.
-    bool _mark_dissolved(const device::GroupId& group, sys_ms t);
+    void _mark_dissolved(const device::GroupId& group, sys_ms t);
 
     // A tombstone ("T") naming `groups`, signed at `t`; see "Dissolving a group".
     std::vector<std::byte> _build_dissolution(std::span<const device::GroupId> groups, sys_ms t);
@@ -517,20 +518,16 @@ class Devices final : detail::CoreComponent {
     // Asks the devices of the group `group` to admit this one: uploads a link request for them to
     // accept, and answers once the swarm has stored it.  The request is encrypted to that group, so
     // that only its members can read it; the group must be one this device has seen in the swarm.
-    // The account must already be restored here.
+    // The account must already be restored here, and the device not in a group: an account has
+    // only one, so there is no switching from one to another.
     //
-    // A device already in a group may ask to switch to another.  It stays a working member of its
-    // own until admitted, and then leaves it: a departure pushed to the members left, or the old
-    // group's messages deleted if it was the only one.  The old group is dismissed and forgotten,
-    // its account keys included, and the new group's arrive with the message admitting it.
+    // It is admitted only once a group message admitting it has arrived *and* its user has
+    // confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` -- or
+    // `membership_changed` with what it sees if `expires` passes first.  Asking again replaces the
+    // request, and its SAS, with a new one.
     //
-    // Either way it is admitted only once a group message admitting it has arrived *and* its user
-    // has confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` --
-    // or, from outside a group, `membership_changed` with what it sees if `expires` passes first.
-    // Asking again replaces the request, and its SAS, with a new one.
-    //
-    // Fails with `err::already_registered` for the group it is already in, `err::removed` for a
-    // device displaced from its group, `err::network_unavailable`, `err::unknown_group`, or
+    // Fails with `err::already_registered` for a device in a group, `err::removed` for a device
+    // displaced from its group, `err::network_unavailable`, `err::unknown_group`, or
     // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
@@ -628,15 +625,14 @@ class Devices final : detail::CoreComponent {
     // Answers false if the device is not in the group -- unknown, still only asking to join (which
     // is `ignore_request`), or already gone -- or this device is no longer in it either.  None of
     // those is an error: each can happen between a device list being drawn and the user acting on
-    // it.  Passing this device's own id is an error (std::invalid_argument): a device leaves a
-    // group by joining another.
+    // it.  Passing this device's own id is an error (std::invalid_argument).
     void remove_device(device::Id id, result_function<bool> cb);
     bool remove_device(std::span<const std::byte, device::ID_SIZE> id, await_t);
 
     // Where this device stands, and which other groups are in the swarm.  What an application
-    // prompts from at startup and draws its device screen from; read again on `membership_changed`
-    // and `group_appeared`.  `Unknown` until the first fetch of this run completes, since the swarm
-    // may have changed while it was down.
+    // prompts from at startup and draws its device screen from; read again on `membership_changed`.
+    // `Unknown` until the first fetch of this run completes, since the swarm may have changed while
+    // it was down.
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
@@ -653,11 +649,10 @@ class Devices final : detail::CoreComponent {
     bool renew_device_identity(await_t);
 
     // Starts a new device group with this device as its only member, and answers its identifier.
-    // For `NoGroup`, and for `GroupsVisible`, where the new group is started *alongside* those
-    // already there: it replaces and deletes nothing, and their devices are alerted to it, so that
-    // a group started by mistake can be undone by joining one of theirs instead.  A device
-    // `Waiting` on a link request withdraws it.  The group starts with a newly generated account
-    // key, whatever the device held before.
+    // For `NoGroup`, `Dissolved` and `GroupsVisible`.  Any group in the swarm is dissolved: an
+    // account has only one, and the user starting another over those in view is choosing it over
+    // them.  A device `Waiting` on a link request withdraws it.  The group starts with a newly
+    // generated account key, whatever the device held before.
     //
     // Fails with `err::already_registered` for a device already in a group, `err::removed` for one
     // removed or displaced from its group, and `err::membership_unknown` before the first fetch of
@@ -665,11 +660,17 @@ class Devices final : detail::CoreComponent {
     void start_group(result_function<device::GroupId> cb);
     device::GroupId start_group(await_t);
 
-    // Dismisses the alert for another group, so that `group_appeared` does not fire for it again --
-    // here only: each device dismisses for itself.  Remembered across restarts.  It does not quiet
-    // `CutOff`, which is never dismissable.  Answers false for a group not seen in the swarm.
-    void dismiss_group(device::GroupId group, result_function<bool> cb);
-    bool dismiss_group(const device::GroupId& group, await_t);
+    // Keeps this device's group over another in the swarm, which the user has chosen to do from
+    // `Forked`: deletes the other's messages from the swarm, publishes a tombstone naming it, and
+    // remembers it as dissolved.  Its devices learn of it from the tombstone, or, back after that
+    // has expired, from this device or another of ours seeing their group again.  See "One group
+    // per account".
+    //
+    // Answers false unless `Forked` with `group` among the groups visible: the swarm can change
+    // between the choice being drawn and made.  Passing this device's own group is an error
+    // (std::invalid_argument).
+    void dissolve_group(device::GroupId group, result_function<bool> cb);
+    bool dissolve_group(const device::GroupId& group, await_t);
 
   private:
     bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
@@ -684,7 +685,10 @@ class Devices final : detail::CoreComponent {
     // Forgets the group and our requests, and replaces our device id and device keys with new ones.
     void _new_identity();
 
-    bool _dismiss_group(const device::GroupId& group);
+    bool _dissolve_group(const device::GroupId& group);
+
+    // Whether another group is in the swarm beside ours: what makes a member Membership::Forked.
+    bool _forked();
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
     void _rebaseline_membership();
@@ -700,7 +704,7 @@ class Devices final : detail::CoreComponent {
     };
 
     // Builds our link request to the group `group`, whose link key is `link_x25519`, records it as
-    // our newest request, and moves our own row to Pending if we are not in a group.
+    // our newest request, and moves our own row to Pending.
     LinkRequestResult _build_link_request(
             const device::GroupId& group, std::span<const std::byte, 32> link_x25519);
 
@@ -757,13 +761,12 @@ class Devices final : detail::CoreComponent {
     // new identity: none of them can admit it to anything after that.
     void _forget_own_requests();
 
-    // Whether this device is waiting to be admitted to a group: from outside any group (Pending, or
-    // with an admission held for the user's confirmation), or from inside one, asking to switch.
+    // Whether this device is waiting to be admitted to a group: Pending, or with an admission held
+    // for the user's confirmation.
     bool _asking();
 
-    // Leaves the group this device is in, on its admission to another: a departure pushed to the
-    // old group's other members, or the old group's messages deleted if it had none, and the old
-    // group dismissed and forgotten.  See "Leaving a group to join another".
+    // Leaves the group this device is in: a departure pushed to the group's other members, or its
+    // messages deleted if it had none, and the group forgotten.
     void _leave_group();
 
     bool _confirm_link();
@@ -960,7 +963,8 @@ class Devices final : detail::CoreComponent {
     // Returns whether a push is currently needed.  Should be called after processing a final swarm
     // message batch (or at startup) to determine whether outgoing pushes are required.
     //
-    // device_group is true when this device is registered AND any of the following hold:
+    // device_group is true when this device is registered, neither displaced nor forked (see
+    // device::Membership), AND any of the following hold:
     //   - our own device info has changed since the last confirmed device group push
     //   - any device has a state transition (registered/removed) that needs broadcasting
     //   - any account key seed has not yet been distributed via a confirmed push

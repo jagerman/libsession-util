@@ -433,10 +433,6 @@ void Client::membership_changed(core::device::Membership membership) {
     _emit([membership](const callbacks& cbs) { cbs.devices->membership_changed(membership); });
 }
 
-void Client::group_appeared(core::device::GroupId group) {
-    _emit([group](const callbacks& cbs) { cbs.devices->group_appeared(group); });
-}
-
 void Client::_init() {
     _disk_loop = core.disk_loop();
     _disk_jq.emplace(*_disk_loop);

@@ -116,9 +116,7 @@ CREATE TABLE device_groups (
     seen_at INTEGER NOT NULL,     -- signed time of the newest message seen, unix seconds
     -- The latest expiry among the messages seen, unix seconds.  The group is in the swarm until
     -- then, as far as fetching can tell: a deletion is not something a fetch reports.
-    expires_at INTEGER NOT NULL,
-    -- The user dismissed the alert for this group here.  This device's decision alone.
-    dismissed INTEGER NOT NULL DEFAULT 0
+    expires_at INTEGER NOT NULL
 ) STRICT;
 
 -- The swarm hashes of the group messages seen, every group's: what dissolving a group deletes from
@@ -130,9 +128,12 @@ CREATE TABLE device_group_messages (
 ) STRICT;
 CREATE INDEX device_group_messages_group ON device_group_messages(group_id);
 
--- The groups this device knows to be dissolved, by a tombstone it saw or one it published.  Never
--- forgotten: a tombstone lives only as long as any message does, and this is what lets a device
--- that sees a dissolved group in the swarm again dissolve it again.
+-- The groups this device knows to be dissolved, by a tombstone it saw or one it published.  A
+-- tombstone lives only as long as any message does, and this is what lets a device in a group that
+-- sees a dissolved group in the swarm again dissolve it again.  Kept for as long as the device
+-- stays in its group, and forgotten with it: leaving a group -- above all, having it dissolved --
+-- means the user's choice of group has moved on, and a dissolution kept past that could undo the
+-- group they chose.
 CREATE TABLE device_dissolved_groups (
     group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
     -- The signed time of the newest tombstone naming it, unix milliseconds: a message from the

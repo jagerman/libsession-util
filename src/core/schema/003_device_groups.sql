@@ -131,8 +131,7 @@ CREATE TABLE device_groups (
     group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
     link_x25519 BLOB NOT NULL CHECK(length(link_x25519) == 32),
     seen_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    dismissed INTEGER NOT NULL DEFAULT 0
+    expires_at INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE device_group_messages (

@@ -237,7 +237,6 @@ struct DeviceEventsRecorder : core::DeviceEvents {
     std::vector<std::pair<int, core::device::LinkRequestEnd>> ended;
     std::vector<core::device::map> replaced;
     std::vector<core::device::Membership> membership;
-    std::vector<core::device::GroupId> appeared;
     std::vector<core::device::Info> members;
     std::vector<std::string> order;  // which of them, as they arrived
 
@@ -262,10 +261,6 @@ struct DeviceEventsRecorder : core::DeviceEvents {
     void device_membership_changed(core::device::Info device) override {
         order.push_back("member");
         members.push_back(std::move(device));
-    }
-    void group_appeared(core::device::GroupId group) override {
-        order.push_back("appeared");
-        appeared.push_back(group);
     }
 };
 

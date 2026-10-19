@@ -33,8 +33,8 @@ be used by a new device asking to join the encrypted device group.
 
 The message types share the one namespace rather than being split across several: each is a bt-encoded
 dict whose `""` key carries a single-character type tag — `"G"` for a device group message, `"L"`
-for a link request, `"T"` for a tombstone dissolving a group (see "Dissolving a group") — so a client
-distinguishes them from the message itself rather than from where it was stored.
+for a link request, `"T"` for a tombstone dissolving a group (see "Dissolving a group") — so a
+client distinguishes them from the message itself rather than from where it was stored.
 
 ### Inner device data
 
@@ -169,7 +169,7 @@ A removed device is written into the devices dict as a tombstone: its ID maps to
 how and when it went, in place of the record a live device maps to.
 
 - `{"r": timestamp}` for a device removed by another;
-- `{"l": timestamp}` for one that left of its own accord (see "Leaving a group to join another").
+- `{"l": timestamp}` for one that left of its own accord (see "Leaving a group").
 
 The timestamp is the unix time, in seconds, of the removal or departure, and must be positive.  A
 tombstone holds exactly one of the two keys.  Every live record carries `seq`, and a tombstone never
@@ -184,8 +184,8 @@ all.
 
 A tombstone and a live record for one device ID cannot coexist, so a device that is removed and
 later rejoins the group must take a new device ID, with new device keys to go with it.  It also
-leaves behind the old group's account keys, as any device leaving a group does (see "Leaving a group
-to join another"); its message history, the account seed and configs are all still valid, and are
+leaves behind the old group's account keys, as any device leaving a group does (see "Leaving a
+group"); its message history, the account seed and configs are all still valid, and are
 kept.  It then asks to join as any device outside a group does.
 
 The removed device is not among the message recipients and cannot decrypt the payload; see
@@ -426,10 +426,10 @@ clocks.  It costs nothing in detection: every later message is unreadable too, a
 rotation guarantees one.
 
 A displaced device alerts its user, as a possible attack, and stops acting for the group: it pushes
-nothing, admits and removes nobody, and does not leave the group to join another, since a departure
-under its ID would now apply to the device holding it.  It can come back only under a new device
-ID, as a removed device does.  Reading a message from the group again, as new as the one that
-displaced it, undoes this.
+nothing, admits and removes nobody, and pushes no departure if it leaves the group, since a
+departure under its ID would now apply to the device holding it.  It can come back only under a new
+device ID, as a removed device does.  Reading a message from the group again, as new as the one
+that displaced it, undoes this.
 
 A holder of the account seed can forge a message carrying the group's identifier, and so cause this
 alert, as it can forge a `kicked` entry to cause a removal alert.  Neither gives it anything: the
@@ -439,7 +439,7 @@ device stops acting for its group, rather than starting to trust anything new.
 
 Each device group has an identifier, generated when the group is created and never changed
 afterwards: rotating keys, and adding or removing devices, all leave it alone.  It is what tells one
-group's messages from another's when an account has more than one (see "Multiple groups" below),
+group's messages from another's when an account forks (see "One group per account" below),
 it gives a user a way to check by eye that two devices are in the same group, and it says roughly
 when a group was created, so that one a device has not seen before can be shown with its age.
 
@@ -494,8 +494,9 @@ group -- checks namespace 21 for device group messages, and finds one of:
   from the swarm, and creating a group in the second case forks the account, so the device does not
   create one on its own.  The user decides between starting a new group and bringing an existing
   device online to link this one.
-- **One or more groups it cannot read.**  It may ask to join one, choosing by identifier when there
-  is more than one, or start a new group alongside them (see "Multiple groups").
+- **One or more groups it cannot read.**  It may ask to join one -- where there is more than one,
+  the account has forked, and the most recently active is the natural choice -- or start a new
+  group instead, which dissolves them (see "One group per account").
 
 A device that can decrypt a group message is already in that group, and needs nothing further.
 
@@ -693,24 +694,48 @@ keeps its requests for as long as an admission accepting one could still be in t
 This is what lets a device ask again, after a request seemed to go unanswered, without losing an
 earlier one that was accepted meanwhile.
 
-## Multiple groups
+## One group per account
 
-An account can come to have more than one device group, when a device starts a new group while
-another already exists, whether by mistake or deliberately.  Starting a group never deletes another
-group's messages: they are what lets the user notice and undo it.
+An account has one device group.  Two cannot both work: each rotates the account key and publishes
+its own to namespace -21 (see "Account keys"), each publish replacing the other's, so at any moment
+roughly half of the account's contacts would be encrypting to a key that only some of its devices
+hold.
 
-A device in a group that sees messages carrying another group's identifier alerts its user that
-another device group exists alongside its own.  The user can dismiss the alert, and the device then
-remembers that identifier and does not alert about it again; a group with yet another identifier
-still alerts.  Dismissing is each device's own decision and is not shared with the rest of its
-group, each of which alerts, and is dismissed, separately.
+A second group can still come about: a device restored from the recovery phrase starts a group of
+its own when it should have joined the existing one, or every device of a group is away for longer
+than its messages last, and comes back to find another.  No device settles this by itself.  The user
+does, by keeping one group, which **dissolves** the others, and always from a position of knowledge:
+on a device that can see what it is choosing between.  There are two ways to it:
 
-A device in a group that finds none of its own group's messages left, but another group's present,
-has been **cut off**: nothing it could still read remains, so it can no longer receive anything
-encrypted to its group.  Group messages leave the swarm only by expiring, which takes every device
-of the group being offline for the whole TTL, or by being deleted by a holder of the account seed.
-This is always alerted, as a possible attack, whether or not the other group's identifier was
-dismissed.
+- **Starting a group while others are in view.**  A device outside a group that starts one, while
+  groups it could have asked to join are in the swarm, is choosing its new group over them, and
+  dissolves them.
+- **Keeping its own group when forked** (see "Forks"), over the other group in view.
+
+A device never dissolves a group of its own accord.  One that comes back to an empty swarm pushes
+its group again, as it would whenever its messages had expired; one that comes back to find another
+group live, and no tombstone naming its own, is forked, and asks.  So no two devices can dissolve
+each other by accident, and nothing has to decide which of two groups came first.
+
+### Forks
+
+A device in a group that sees a message carrying another group's identifier, while no tombstone
+names its own group, is **forked**.  Nothing has been decided, and as far as it knows it is still in
+its group.  It pushes nothing, since that would be carrying on as though its group had been chosen,
+and asks its user, showing when the other group was last active -- the `time` of its newest message
+-- which tells a live set of devices ("an hour ago") from a stale leftover ("two months ago").  The
+user keeps this group, dissolving the other, or leaves it for the other: leaving it (see "Leaving a
+group") and asking to join the other, as any device outside a group does.
+
+This holds whether or not any of the device's own group's messages are left in the swarm.  They
+leave it only by expiring, which takes every device of the group being offline for the whole TTL,
+or by a seed holder deleting them.  Dissolving a group does that, and the group's devices online at
+the time hear of it from the tombstone; either way, with another group live, only the user can say
+what happens next.
+
+A device outside any group that sees more than one may join any of them, the most recently active
+being the natural choice.  Once it has, it is forked as well, and its user settles the rest as any
+member's can.
 
 ### Dissolving a group
 
@@ -742,45 +767,51 @@ The tombstone is transient.  It is stored with the group messages' 30-day TTL an
 and a group push never deletes it.  Its only job is to reach the dissolved group's devices that are
 online in the meantime; one offline for longer finds no message of its group at all.
 
-A device reading a tombstone that names its own group has been dissolved out of it.  It stops acting
-for the group, forgets everything of it -- its devices, its messages and its account keys -- and
-takes a new device ID, since nothing remains that the old one is any use for.  It may then ask to
-join the group that was kept, as any device outside a group does.  Its messages, the account's
-configs and the groups it has seen are kept, as for a removed device.  A tombstone naming any other
-group only stops the device counting that group among those in the swarm.
+A device reading a tombstone that names its own group has been **dissolved** out of it.  This is a
+different state from being forked: here the decision has been made, by the user on another device.
+The device stops acting for the group, forgets everything of it -- its devices, its messages and its
+account keys -- and takes a new device ID, since nothing remains that the old one is any use for.
+It may then ask to join the group that was kept, as any device outside a group does.  Its messages,
+the account's configs and the groups it has seen are kept, as for a removed device.  A tombstone
+naming any other group only stops the device counting that group among those in the swarm.
 
-Either way, the device remembers each identifier named as dissolved, with the tombstone's `t` (the
-newest, where several name it).  That memory is each device's own and kept for good, a few bytes a
-group, and it is what keeps a dissolved group dissolved without tombstones having to stay in the
-swarm forever: a device that later sees a group message carrying a dissolved identifier deletes it
-from the swarm, and if the message was written after the dissolution -- a device of that group that
-never heard of it, back after the tombstone expired, has pushed again -- publishes a new tombstone
-naming the group.  That device then rejoins the group that was kept.  In the time between, contacts
-may have encrypted to its group's account key, which cannot be helped.  A message written before
-the dissolution is only a leftover the dissolving device did not know of, and is just deleted.
+A device in a group remembers each identifier a tombstone names, with the tombstone's `t` (the
+newest, where several name it).  That memory, a few bytes a group, is what keeps a dissolved group
+dissolved without tombstones having to stay in the swarm forever.  A member of a group that later
+sees a message carrying a dissolved identifier deletes it from the swarm.  If the message was
+written after the dissolution -- a device of that group that never heard of it, back after the
+tombstone expired, has pushed again -- the member also publishes a new tombstone naming the group,
+and the device that pushed rejoins the group that was kept; in the time between, contacts may have
+encrypted to its group's account key, which cannot be helped.  A message written before the
+dissolution is only a leftover that the dissolving device did not know of.
 
-### Leaving a group to join another
+Only a member in good standing acts on what it remembers.  A device outside any group is in no
+position to say which group is the account's: it hides a dissolved group's leftovers, but takes a
+group that has pushed since as it would any other.  And a device forgets what it remembers when it
+leaves its group -- above all when its group is dissolved, after which it remembers only what that
+tombstone named.  A dissolution is undone only by the user, by dissolving the group that made it,
+and a device that held on to its old dissolutions past that would dissolve the very group they
+chose.  For the same reason a device admitted to a group forgets any dissolution of that group it
+had heard of: joining it was the user's later choice.
 
-A device in a group may ask to join a different one, for instance to undo starting a group by
-mistake.  It sends a link request naming the other group, as any applicant does, and stays in its
-own group, fully working, until it is accepted.  If the request lapses, nothing has changed.
+### Leaving a group
 
-Once accepted into the new group, it leaves the old one:
+A device in a group cannot ask to join another: an account has only one group, so there is no
+moving from one to another.  It leaves its group first, and then asks as any device outside a group
+does.  A device leaving its group:
 
-- If it was the old group's only member, it deletes that group's messages from the swarm.  No
-  device is left to read them, and other devices would otherwise go on alerting about a group that
-  nobody is in.
-- Otherwise it pushes one last update to the old group with a departure tombstone for itself, so
-  that the remaining members stop encrypting to it.  Being a departure rather than a removal, it
-  does not appear in the `kicked` list.  It also remembers the old group's identifier as dismissed,
-  so as not to alert about the group it has just left.
+- If it was the group's only member, deletes the group's messages from the swarm.  No device is left
+  to read them, and other devices would otherwise go on seeing a group that nobody is in.
+- Otherwise pushes one last update to the group with a departure tombstone for itself, so that the
+  remaining members stop encrypting to it.  Being a departure rather than a removal, it does not
+  appear in the `kicked` list.
 
-Either way it leaves all of the old group behind -- its devices, its messages, and its account keys
--- and takes on the new group's, all of which arrive with the message admitting it.  A group's
-account keys never carry into another: they would be handed to the new group's members in every
-message the device pushed, and the newest of them could displace the new group's current key.  For
-the same reason a device starting a group starts it with a newly generated account key, whatever it
-held before.
+Either way it leaves all of the group behind -- its devices, its messages, and its account keys --
+and a group it joins next brings its own, all of which arrive with the message admitting it.  A
+group's account keys never carry into another: they would be handed to the new group's members in
+every message the device pushed, and the newest of them could displace the new group's current key.
+For the same reason a device starting a group starts it with a newly generated account key,
+whatever it held before.
 
 The departed device still holds every account key the old group had, and the group must move to one
 it does not.  A removal does this in the same step: the removing device generates a new account key

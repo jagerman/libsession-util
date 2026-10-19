@@ -114,16 +114,11 @@ class DeviceEvents {
     virtual void device_membership_changed(device::Info device) = 0;
 
     /// This device's membership changed, or became known with the first fetch of this run; see
-    /// device::Membership for what each value means.  `Removed`, `CutOff` and `Dissolved` are the
-    /// ones to alert on, and arrive as soon as the fetch that reveals them is merged.  Not for the
-    /// move to `Waiting` that `Devices::request_link` makes, nor back from it when that call
-    /// reports failure: the caller knows.  Never `Unknown`.
+    /// device::Membership for what each value means.  `Removed`, `Displaced`, `Dissolved` and
+    /// `Forked` are the ones to alert on, and arrive as soon as the fetch that reveals them is
+    /// merged.  Not for the move to `Waiting` that `Devices::request_link` makes, nor back from it
+    /// when that call reports failure: the caller knows.  Never `Unknown`.
     virtual void membership_changed(device::Membership membership) = 0;
-
-    /// While this device is in a group, another group has appeared in the swarm alongside it: the
-    /// account has forked, which the user should be told of.  Once per group per run, and not for a
-    /// group dismissed through `Devices::dismiss_group`.
-    virtual void group_appeared(device::GroupId group) = 0;
 };
 
 /// Struct holding application callbacks to fire when libsession Core events happen to allow the
