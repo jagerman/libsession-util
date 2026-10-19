@@ -157,11 +157,12 @@ CREATE TABLE device_pending_pushes (
 ) STRICT;
 
 -- The link requests this device has sent, so that a group message admitting it can be matched to
--- the request it accepted.  A device can ask more than once -- again after a request seemed to go
--- unanswered, say -- and any of them may be the one accepted, possibly after its deadline here has
--- passed.  The user must have confirmed the SAS of that very request, since that is what the
--- accepting device showed; an admission matching none of them is not ours to take, since any holder
--- of the account seed could have sent it.
+-- the request it accepted, possibly after its deadline here has passed.  Only the newest is one the
+-- user can be shown, and so confirm; the SAS confirmed must be that very request's, since that is
+-- what the accepting device showed, and an admission matching none of them is not ours to take,
+-- since any holder of the account seed could have sent it.  The older ones are kept for as long as
+-- an admission on them could still arrive, so that the next request is stamped later than any of
+-- them and an admission on one can never be taken for the newest.
 CREATE TABLE device_own_requests (
     id INTEGER PRIMARY KEY NOT NULL,
     group_id BLOB NOT NULL CHECK(length(group_id) == 8),
@@ -171,10 +172,9 @@ CREATE TABLE device_own_requests (
     pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
     expires_at INTEGER,  -- when the swarm drops it; NULL until the swarm confirms storing it
-    confirmed INTEGER NOT NULL DEFAULT 0,  -- the user said the SAS matched, through confirm_link
-    -- A group message admitting us on this request before the user confirmed it, held until they
-    -- do, with the hash it arrived with: a fetch delivers a message only once.  Its time is the one
-    -- signed inside it.
+    -- A group message admitting us on this request, held until the user confirms the SAS through
+    -- confirm_link, with the hash it arrived with: a fetch delivers a message only once.  Its time
+    -- is the one signed inside it.
     admission BLOB,
     admission_hash TEXT,
     CHECK((admission IS NULL) == (admission_hash IS NULL))

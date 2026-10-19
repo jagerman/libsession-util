@@ -117,7 +117,7 @@ void Devices::init() {
     // A request of ours from the last run carries on if the swarm still holds it, or if an
     // admission on it waits for the user.  Otherwise it is withdrawn: lapsed, or never confirmed
     // stored, which leaves us Pending with nothing to wait on.  Withdrawn only here -- a copy that
-    // did reach the swarm can still be accepted, and admits us once the user confirms it.
+    // did reach the swarm can still be approved, which leaves us Approved all the same.
     auto newest = _newest_request();
     if (newest && newest->held)
         return;
@@ -1420,7 +1420,7 @@ static const std::string REASSERT_TOMBSTONE_SQL =
         "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
 
 void Devices::receive_device_group_message(
-        std::span<const std::byte> data, const std::string& hash) {
+        std::span<const std::byte> data, const std::string& hash, bool confirmed) {
     auto t = group_message_time(data);
     GroupPayload payload;
     try {
@@ -1489,8 +1489,8 @@ void Devices::receive_device_group_message(
 
     // Anything else is ours only as an admission on one of our own requests, which we make only
     // from outside a group.  Being able to read it shows only that some holder of the seed
-    // encrypted it to us, so it admits us only on a request whose SAS the user confirmed
-    // -- the one the accepting device showed, identified by the record it admitted.
+    // encrypted it to us, so it admits us only once the user has confirmed the SAS of that very
+    // request -- the one the approving device showed, identified by the record it admitted.
     std::optional<OwnRequest> accepted;
     if (!member) {
         auto self = payload.devices.find(self_id);
@@ -1500,13 +1500,13 @@ void Devices::receive_device_group_message(
             log::warning(cat, "Not merging a readable device group message from another group");
             return;
         }
-        if (!accepted->confirmed) {
-            // Held only for the request the user is looking at.  One they moved on from by asking
-            // again is not what they will confirm; the newer request admits them instead.
-            if (auto newest = _newest_request(); !newest || newest->row != accepted->row) {
-                log::info(cat, "Admitted on an earlier request the user never confirmed; ignoring");
-                return;
-            }
+        // Held only for the request the user is looking at.  One they moved on from by asking
+        // again is not what they will confirm; the newer request admits them instead.
+        if (auto newest = _newest_request(); !newest || newest->row != accepted->row) {
+            log::info(cat, "Admitted on a request the user has since replaced; ignoring");
+            return;
+        }
+        if (!confirmed) {
             conn().prepared_exec(
                     "UPDATE device_own_requests SET admission = ?, admission_hash = ? WHERE id = ?",
                     data,
@@ -2089,6 +2089,15 @@ void Devices::_request_link(
                 err::already_registered,
                 "This device is in a group; it must leave it before asking to join another"};
 
+    // Asking again while a request for the group is out is reopening it: a new one would show the
+    // user new emoji, and take the place of the one another device may be approving now.
+    if (auto newest = _newest_request(); newest && newest->group == group)
+        if (auto live = _outgoing_link_request()) {
+            if (cb)
+                cb(*live);
+            return;
+        }
+
     auto link_x25519 = conn().prepared_maybe_get<sqlite::blob_guts<std::array<std::byte, 32>>>(
             "SELECT link_x25519 FROM device_groups WHERE group_id = ? AND expires_at > ?",
             std::span<const std::byte>{group.value},
@@ -2168,22 +2177,19 @@ std::optional<Devices::OwnRequest> Devices::_select_own_request(
             sqlite::blob_guts<std::array<std::byte, 16>>,
             int64_t,
             std::optional<int64_t>,
-            int,
             int>(
-            "SELECT id, group_id, sas_seed, timestamp, expires_at, confirmed,"
-            "       admission IS NOT NULL"
+            "SELECT id, group_id, sas_seed, timestamp, expires_at, admission IS NOT NULL"
             "  FROM device_own_requests {} ORDER BY id DESC LIMIT 1"_format(where),
             bind...);
     if (!found)
         return std::nullopt;
-    auto& [row, group, seed, asked, expires, confirmed, held] = *found;
+    auto& [row, group, seed, asked, expires, held] = *found;
     return OwnRequest{
             .row = row,
             .group = device::GroupId{group},
             .sas_seed = seed,
             .asked = from_epoch_s(asked),
             .expires = expires ? std::optional{from_epoch_s(*expires)} : std::nullopt,
-            .confirmed = confirmed != 0,
             .held = held != 0};
 }
 
@@ -2224,9 +2230,7 @@ std::optional<Devices::OutgoingLinkRequest> Devices::_outgoing_link_request() {
 
     return OutgoingLinkRequest{
             .sas = sas_from_seed(newest->sas_seed),
-            .expires = newest->expires.value_or(newest->asked + LINK_REQUEST_TTL),
-            .confirmed = newest->confirmed,
-            .accepted = newest->held};
+            .expires = newest->expires.value_or(newest->asked + LINK_REQUEST_TTL)};
 }
 
 void Devices::confirm_link(result_function<bool> cb) {
@@ -2237,40 +2241,21 @@ bool Devices::confirm_link(await_t) {
     return jq().call_get([this] { return _confirm_link(); });
 }
 
-bool Devices::_asking() {
-    if (conn().prepared_maybe_get<int>(
-                "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                self_id,
-                static_cast<int>(device::State::Pending)))
-        return true;
-    auto newest = _newest_request();
-    if (!newest)
-        return false;
-    return newest->held;
-}
-
 bool Devices::_confirm_link() {
     assert(on_loop());
-    if (!_asking())
-        return false;
     auto newest = _newest_request();
-    if (!newest)
+    if (!newest || !newest->held)
         return false;
-
-    auto c = conn();
-    c.prepared_exec("UPDATE device_own_requests SET confirmed = 1 WHERE id = ?", newest->row);
-    if (!newest->held)
-        return true;
 
     std::vector<std::byte> admission;
     std::string hash;
-    for (auto [data, h] : c.prepared_results<sqlite::blob, std::string>(
+    for (auto [data, h] : conn().prepared_results<sqlite::blob, std::string>(
                  "SELECT admission, admission_hash FROM device_own_requests WHERE id = ?",
                  newest->row)) {
         admission.assign(data.begin(), data.end());
         hash = std::move(h);
     }
-    receive_device_group_message(admission, hash);
+    receive_device_group_message(admission, hash, true);
     _flush_events();
     return true;
 }
@@ -2948,11 +2933,12 @@ device::MembershipState Devices::_membership() {
                            : !out.others.empty() ? device::Membership::Forked
                                                  : device::Membership::InGroup;
             break;
-        case device::State::Pending: out.membership = device::Membership::Waiting; break;
         default: {
-            // Admitted after the request lapsed here, and waiting for the user to confirm it.
+            // Approved even after the request lapsed here, and so was withdrawn: the approval came
+            // in time, if its message reached us later.
             auto newest = _newest_request();
-            out.membership = newest && newest->held                  ? device::Membership::Waiting
+            out.membership = newest && newest->held        ? device::Membership::Approved
+                           : own == device::State::Pending ? device::Membership::Requesting
                            : core.globals.get_integer(dissolved_key) ? device::Membership::Dissolved
                            : out.others.empty()                      ? device::Membership::NoGroup
                                                 : device::Membership::GroupsVisible;
@@ -3077,7 +3063,8 @@ device::GroupId Devices::_start_group() {
             // which that group is one in view like any other.
             _new_identity();
             break;
-        case device::Membership::Waiting: _withdraw_own_request(); break;
+        case device::Membership::Requesting:
+        case device::Membership::Approved: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
         case device::Membership::GroupsVisible:
         case device::Membership::Dissolved: break;

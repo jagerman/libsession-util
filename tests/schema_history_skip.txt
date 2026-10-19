@@ -105,3 +105,8 @@ be28ebf1  device-group, mid-branch
 b49b4f57  device-group, mid-branch
 208065df  device-group, mid-branch
 105cdd06  device-group, mid-branch
+c967efc0  device-group, mid-branch
+611b5e20  device-group, mid-branch
+f1b1f9f4  device-group, mid-branch
+deab3a09  device-group, mid-branch
+e4f4ed04  device-group, mid-branch

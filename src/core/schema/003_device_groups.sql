@@ -162,7 +162,6 @@ CREATE TABLE device_own_requests (
     pubkey_x25519 BLOB NOT NULL CHECK(length(pubkey_x25519) == 32),
     sas_seed BLOB NOT NULL CHECK(length(sas_seed) == 16),
     expires_at INTEGER,
-    confirmed INTEGER NOT NULL DEFAULT 0,
     admission BLOB,
     admission_hash TEXT,
     CHECK((admission IS NULL) == (admission_hash IS NULL))

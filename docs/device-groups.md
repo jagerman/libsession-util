@@ -43,7 +43,7 @@ pure virtual, so none can be left out by accident:
 | `link_request_ended(reqid, why)` | That request can no longer be answered (accepted elsewhere, replaced, expired). Close its prompt. |
 | `device_membership_changed(device::Info)` | Another device joined the group, or was removed, or left. Tell the user ("Alice's laptop was added"). |
 | `devices_replaced(device::map)` | The group's device list changed. Redraw the device screen. |
-| `membership_changed(Membership)` | Where this device stands changed, or became known. Re-read `membership()` and act on it. |
+| `membership_changed(Membership)` | Where this device stands changed, or became known. Re-read `membership()` and act on it. `Approved` is the cue to bring up the new device's confirmation, wherever the user is. |
 
 Pass a pointer to your implementation as `callbacks::devices`: `client::callbacks` for a `Client`
 application, `core::callbacks` for one using `Core` directly. It must outlive the `Client` (or
@@ -80,7 +80,8 @@ its newest message was written, by the clock of the device that wrote it).
 | `InGroup` | A full member, and the only group in the swarm. | Normal operation: the device screen, approving requests. |
 | `NoGroup` | Not in a group, and no group is in the swarm. | "No existing device group was found. Start a new one, or bring one of your other devices online to link this one?" Start → `start_group`. Otherwise wait: the state changes when a group appears. |
 | `GroupsVisible` | Not in a group; groups it cannot read are in the swarm. | "Link to your existing devices" (see "Joining"). Less prominently, "Start a new device group instead" → `start_group`, with a warning that it **dissolves** the existing group (see "Starting a group"). |
-| `Waiting` | This device's link request is outstanding. | The waiting screen (see "Joining"). |
+| `Requesting` | This device's link request is out, awaiting approval. | The waiting screen, without a confirm action (see "Joining"). |
+| `Approved` | Another device approved the request; the user has to confirm the emoji. | The confirmation, brought up wherever the user is (see "Joining"). |
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
 | `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
@@ -115,29 +116,35 @@ unchanged, and the next start (or the device screen) offers the choice again.
 2. **Ask.** `request_link(group, cb)`. It uploads the request and answers once the swarm has stored
    it, with the SAS and the deadline (10 minutes). Errors: `err::unknown_group` (no longer in the
    swarm), `err::network_unavailable`, `err::store_failed` (worth retrying), `err::already_registered`
-   (this device is in a group; there is no moving straight to another). From `Removed` or
-   `Displaced` the call first gives the device a new identity, forgetting the group it is no
-   longer in: the request then comes from a new device.
-3. **Show the waiting screen**, drawn from `outgoing_link_request()` every time it is opened: the 7
-   emoji (21 extended), a countdown to `expires`, and a **"These match"** action. Tell the user to
-   open Session on one of their existing devices, where a matching prompt will appear.
-4. **Confirm.** When the user says the emoji match, call `confirm_link`. After that,
-   `outgoing_link_request()->confirmed` is true, so the screen shows "Waiting for your other device
-   to approve".
-5. **Done** when `membership_changed(InGroup)` arrives. If the other device approved before the
-   user confirmed here, joining happens inside the `confirm_link` call.
+   (this device is in a group; there is no moving straight to another). From `Removed`,
+   `Displaced` or `Dropped` the call first gives the device a new identity, forgetting the group it
+   is no longer in: the request then comes from a new device. The device is now `Requesting`; that
+   move is not reported, since the caller made it.
+3. **`Requesting`: show the waiting screen**, drawn from `outgoing_link_request()` every time it is
+   opened: the 7 emoji (21 extended), "Awaiting approval from one of your existing devices", and a
+   countdown to `expires`. **No confirm action**: there is nothing to confirm yet, and
+   `confirm_link` answers false. Tell the user to open Session on one of their existing devices,
+   where a matching prompt will appear.
+4. **`Approved`: ask the user to confirm.** `membership_changed(Approved)` means another device has
+   approved the request. Register for it and bring up the confirmation wherever the user is: the
+   same emoji, "Approved on your other device. Do these match?", and a **"These match"** action;
+   no countdown, since the request no longer lapses. When the user says they match, call
+   `confirm_link`.
+5. **Done** when `membership_changed(InGroup)` arrives, which happens inside the `confirm_link`
+   call.
 
-The waiting screen may be closed and reopened at will; it survives a restart while the request is
-live. If the deadline passes unanswered, `membership_changed` reports the device back in
-`GroupsVisible`/`NoGroup`; offer to try again. Asking again replaces the request with one that has
-a new SAS, which needs confirming again.
+The request is a background thing, and the waiting screen only a view of it. There is no cancel:
+the request lives in the swarm for its 10 minutes, across restarts, whatever the screen does.
+Closing the screen changes nothing, and tapping "Link" again while `Requesting` reopens the same
+request: `request_link` for the same group answers with it, same emoji and same deadline, and
+uploads nothing (on the decision screen, "join" then means "show my request"). If the deadline
+passes unapproved, `membership_changed` reports the device back in `GroupsVisible`/`NoGroup`; offer
+to try again, which makes a new request with a new SAS. Starting a group instead withdraws the
+request.
 
 An approval can arrive after the deadline has passed here: the other device approved in time, but
-this one fetched the message late. Then `membership_changed(Waiting)` comes back, and
-`outgoing_link_request()` returns that request with `accepted` set, past its `expires`. Show it
-without the countdown: "Your other device approved this. Do these emoji match what it showed?"
-Joining still needs `confirm_link`. If the user had already confirmed a request and then asked
-again, an approval of the earlier one still admits the device; libsession sorts that out.
+this one fetched the message late. It is `Approved` all the same, and `outgoing_link_request()`
+returns the request past its `expires`; show it as in step 4.
 
 **Why the confirmation on the new device matters.** Anyone who holds the account's recovery phrase
 (a removed device, a stolen backup) can publish a fake group. A device that asks *that* group to
@@ -260,10 +267,10 @@ a device that started a group of its own by mistake months ago ("two months ago"
 ## Starting a group
 
 `start_group()` creates a group with this device as its only member. It is valid from any state
-outside a group. A device that was `Waiting` drops its request; one `Removed`, `Displaced` or
-`Dropped` takes a new identity first, and the group it was in is then one in view like any other.
-It fails with `err::membership_unknown` before the first fetch, and `err::already_registered` from
-a group.
+outside a group. A device `Requesting` or `Approved` drops its request; one `Removed`, `Displaced`
+or `Dropped` takes a new identity first, and the group it was in is then one in view like any
+other. It fails with `err::membership_unknown` before the first fetch, and `err::already_registered`
+from a group.
 
 From `GroupsVisible` (or anywhere else with groups in `others`), starting a group **dissolves every
 group in view**: an account has only one, and the user is choosing the new group over them. Their

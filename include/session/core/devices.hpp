@@ -277,7 +277,12 @@ namespace device {
                   ///< cannot be told apart -- so starting one is the user's decision.
         GroupsVisible,  ///< Not in a group, and one or more groups it cannot read are in the swarm:
                         ///< it may ask to join one, or start its own instead, which dissolves them.
-        Waiting,        ///< Waiting on this device's own link request; see `outgoing_link_request`.
+        Requesting,  ///< This device's own link request is out, for another device of the group to
+                     ///< approve before it lapses; see `outgoing_link_request`.  Nothing to confirm
+                     ///< yet: `confirm_link` answers false.
+        Approved,    ///< Another device approved this one's request, and the admission waits for
+                   ///< the user to confirm, through `confirm_link`, that the emoji match what that
+                   ///< device showed.  It no longer lapses.
         Removed,  ///< Removed from its group by another device.  It can come back only under a new
                   ///< device id, which `request_link` and `start_group` take for it.
         Displaced,  ///< Its group has moved on without it: a newer message from the group is one
@@ -471,7 +476,11 @@ class Devices final : detail::CoreComponent {
     // The group message takes the swarm hash as well, because merging one is what makes it
     // redundant: our next push carries its contents forward, and that is when it can be deleted.
     // Recorded only on a message we could decrypt -- see `device_group_merged`.
-    void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
+    //
+    // An admission on our own request is held for the user's confirmation rather than taken, unless
+    // `confirmed`: the held admission, handed back by `confirm_link`.
+    void receive_device_group_message(
+            std::span<const std::byte> data, const std::string& hash, bool confirmed = false);
 
     // In the group and able to act for it: registered, neither displaced from it nor dropped.
     bool _member();
@@ -543,32 +552,28 @@ class Devices final : detail::CoreComponent {
         /// the standard display.
         std::array<std::string_view, 21> sas;
 
-        /// When the request lapses unanswered.  After it no device can accept it, and asking again
-        /// is the only way in.
+        /// When the request lapses unapproved, for the countdown while `Requesting`.  After it no
+        /// device can approve it, and asking again is the only way in.  Meaningless once
+        /// `Approved`: the approval came in time, even if the message carrying it reached this
+        /// device later.
         std::chrono::sys_seconds expires;
-
-        /// The user has confirmed, through `confirm_link`, that the emoji match the accepting
-        /// device's; what is left is for that device to accept.
-        bool confirmed = false;
-
-        /// Another device has accepted it, and this one joins once the user confirms the emoji.
-        /// Such a request stays here past `expires`: the acceptance came in time, even if the
-        /// message carrying it reached this device later.
-        bool accepted = false;
     };
 
     // Asks the devices of the group `group` to admit this one: uploads a link request for them to
-    // accept, and answers once the swarm has stored it.  The request is encrypted to that group, so
-    // that only its members can read it; the group must be one this device has seen in the swarm.
-    // The account must already be restored here, and the device not in a group: an account has
-    // only one, so there is no switching from one to another, only `leave_group` and then asking.
-    // A device `Removed`, `Displaced` or `Dropped` asks as a new device: it takes a new device id,
-    // forgetting the group it is no longer in, as part of this call.
+    // approve, and answers once the swarm has stored it, leaving the device `Requesting`.  The
+    // request is encrypted to that group, so that only its members can read it; the group must be
+    // one this device has seen in the swarm.  The account must already be restored here, and the
+    // device not in a group: an account has only one, so there is no switching from one to
+    // another, only `leave_group` and then asking.  A device `Removed`, `Displaced` or `Dropped`
+    // asks as a new device: it takes a new device id, forgetting the group it is no longer in, as
+    // part of this call.
     //
-    // It is admitted only once a group message admitting it has arrived *and* its user has
-    // confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` -- or
-    // `membership_changed` with what it sees if `expires` passes first.  Asking again replaces the
-    // request, and its SAS, with a new one.
+    // There is no cancelling: the request lives in the swarm until `expires`, across restarts,
+    // whatever the application shows meanwhile.  Asking again for the same group while it does --
+    // `Requesting` or `Approved` -- answers with that same request, emoji and deadline, and uploads
+    // nothing.  Once another device approves it the device is `Approved`, and joins when its user
+    // confirms the emoji through `confirm_link`; or, if `expires` passes first, it hears
+    // `membership_changed` with what it sees instead.
     //
     // Fails with `err::already_registered` for a device in a group, `err::network_unavailable`,
     // `err::unknown_group`, or `err::store_failed` -- the last worth retrying.  None of them leaves
@@ -576,9 +581,9 @@ class Devices final : detail::CoreComponent {
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting: stored by the swarm and not past
-    // its deadline, or accepted and waiting for the user to confirm it (`accepted`), whatever the
-    // deadline.  Nothing otherwise -- including while the upload is still in flight, when there is
-    // nothing another device could accept yet.
+    // its deadline (`Requesting`), or approved and waiting for the user to confirm it
+    // (`Approved`), whatever the deadline.  Nothing otherwise -- including while the upload is
+    // still in flight, when there is nothing another device could approve yet.
     //
     // What a waiting screen is drawn from, each time it is drawn or reopened, and what to read
     // again on `membership_changed`.  Survives a restart for as long as the request itself does,
@@ -586,22 +591,20 @@ class Devices final : detail::CoreComponent {
     void outgoing_link_request(result_function<std::optional<OutgoingLinkRequest>> cb);
     std::optional<OutgoingLinkRequest> outgoing_link_request(await_t);
 
-    // The user's confirmation, on this device, that its SAS matches the one the accepting device
-    // showed.  A device joins only once it has this *and* a group message admitting it, in either
-    // order: being able to read such a message is not enough on its own, since anyone holding the
-    // account seed can publish a group of its own with a link key of its own, and admit into it a
-    // device that encrypted its request there.  The real group can read no such request, and so
-    // never prompts for it, which is what makes the user's confirmation mean something.  See
-    // "Confirmation on the requesting device".
+    // The user's confirmation, on this device, that its SAS matches the one the approving device
+    // showed, which joins it to the group: `Approved` to `InGroup`.  Being able to read the group
+    // message admitting it is not enough on its own, since anyone holding the account seed can
+    // publish a group of its own with a link key of its own, and admit into it a device that
+    // encrypted its request there.  The real group can read no such request, and so never prompts
+    // for it, which is what makes the user's confirmation mean something.  See "Confirmation on
+    // the requesting device".
     //
-    // An admission is matched to the request it accepted, and admits the device only if that is a
-    // request the user confirmed, or the one they are being shown now; one matching none of this
-    // device's requests is ignored.  So a device that asks again, after a request seemed to go
-    // unanswered, is still admitted if the earlier one is accepted after all -- provided the user
-    // confirmed it before moving on.
+    // Only after the approval, never before: confirming ahead of it would authorise whatever
+    // admission came next.  An admission is held only for the request the user is being shown,
+    // matched by the record it admitted; one on an earlier request, or matching none of this
+    // device's, is ignored.
     //
-    // Answers false if this device is not waiting on a request.  Asking again needs confirming
-    // again: a new request has a new SAS.
+    // Answers false unless `Approved`.
     void confirm_link(result_function<bool> cb);
     bool confirm_link(await_t);
 
@@ -685,8 +688,8 @@ class Devices final : detail::CoreComponent {
     // For any device not in a group.  Any group in the swarm is dissolved: an account has only one,
     // and the user starting another over those in view is choosing it over them -- the one a
     // `Removed`, `Displaced` or `Dropped` device was in included, which it leaves first, taking a
-    // new device id.  A device `Waiting` on a link request withdraws it.  The group starts with a
-    // newly generated account key, whatever the device held before.
+    // new device id.  A device `Requesting` or `Approved` withdraws its request.  The group starts
+    // with a newly generated account key, whatever the device held before.
     //
     // Fails with `err::already_registered` for a device already in a group, and
     // `err::membership_unknown` before the first fetch of this run: starting a group is the user's
@@ -799,7 +802,6 @@ class Devices final : detail::CoreComponent {
         std::array<std::byte, 16> sas_seed;
         std::chrono::sys_seconds asked;                   // the record's timestamp
         std::optional<std::chrono::sys_seconds> expires;  // unset until the swarm stores it
-        bool confirmed;
         bool held;  // an admission on it waits for the user's confirmation
     };
 
@@ -821,17 +823,12 @@ class Devices final : detail::CoreComponent {
     std::optional<OutgoingLinkRequest> _outgoing_link_request();
 
     // Returns our own row from Pending to Unregistered, answering whether it was Pending.  The
-    // request is kept: one already in the swarm can still be accepted, and admits us once the user
-    // confirms it.
+    // request is kept: one already in the swarm can still be approved, which leaves us `Approved`.
     bool _withdraw_own_request();
 
     // Forgets every request of ours, for a device admitted to a group, starting one, or taking a
     // new identity: none of them can admit it to anything after that.
     void _forget_own_requests();
-
-    // Whether this device is waiting to be admitted to a group: Pending, or with an admission held
-    // for the user's confirmation.
-    bool _asking();
 
     // What `leave_group` does once on the loop: a departure (or the group's deletion) queued only
     // by a member in good standing, in the same commit as `_forget_identity`.  False with no group

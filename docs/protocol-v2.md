@@ -562,7 +562,9 @@ message namespace 21.  This message is constructed as follows:
 
 That is, it is simply the information to add to the linked device list plus some metadata.  It is
 uploaded to namespace 21 with a TTL of 10 minutes.  (Since device linking requires a user to have
-access to both devices at the same time, a longer TTL accomplishes nothing.)
+access to both devices at the same time, a longer TTL accomplishes nothing.)  A device has one
+request out at a time, and what it does while waiting on it is in "Confirmation on the requesting
+device".
 
 The request is encrypted to the group asked to join, using the `link_x25519` pubkey from that
 group's messages, so that only the group's members can read it.  It must not be readable by every
@@ -705,8 +707,13 @@ device message that it is successfully able to decrypt.
 #### Confirmation on the requesting device
 
 Decrypting a group message is not by itself enough for the requesting device to consider itself
-linked: its user must also confirm on it that its SAS matches the one the accepting device showed,
-and it joins only once both have happened.
+linked: its user must also confirm on it that its SAS matches the one the accepting device showed.
+The two happen strictly in that order.  While its request is out, the requesting device shows its
+SAS and the request's deadline, and has nothing to confirm.  Once a group message admitting it
+arrives it is **approved**: it holds that message, and asks its user whether the SAS matches what
+the accepting device showed.  The user's confirmation then admits it.  A confirmation before the
+approval is refused: given ahead of time, it would authorise whatever admission came next, which is
+what it is there to prevent.
 
 Encrypting the request to the group stops a removed device, or any other seed holder outside the
 group, from reading it.  It does not stop one from publishing a group message of its own, carrying
@@ -723,15 +730,17 @@ device stamps each of its requests later than the one before, so no two carry th
 keeps its requests for as long as an admission accepting one could still be in the swarm, and:
 
 - an admission matching none of them is ignored: the device asked for nothing that it answers;
-- one matching a request the user confirmed admits the device;
-- one matching the device's newest request, unconfirmed, is held until the user confirms it --
-  even past that request's deadline, since the acceptance came in time and only the message
-  carrying it arrived late;
-- one matching an older request the user never confirmed is ignored.  The user has moved on to a
-  newer request, whose SAS is what they are now looking at, and that one admits them instead.
+- one matching the device's newest request is held until the user confirms it -- even past that
+  request's deadline, since the acceptance came in time and only the message carrying it arrived
+  late.  Once one is held, the request no longer lapses;
+- one matching an older request is ignored.  The user has moved on to a newer request, whose SAS is
+  what they are now looking at, and that one admits them instead.
 
-This is what lets a device ask again, after a request seemed to go unanswered, without losing an
-earlier one that was accepted meanwhile.
+There is no cancelling a request.  It lives in the swarm until its deadline, whatever the requesting
+device shows meanwhile, and the device asking again for the same group while it does -- approved or
+not -- reopens that request, with the same SAS and deadline, rather than making a new one, which
+would show its user new emoji while another device may be approving the old ones.  Only a request
+that lapsed unapproved, or one for another group, is replaced by asking again.
 
 ## One group per account
 
