@@ -570,14 +570,15 @@ class Devices final : detail::CoreComponent {
         std::chrono::sys_seconds expires;
     };
 
-    // Asks the devices of the group `group` to admit this one: uploads a link request for them to
-    // approve, and answers once the swarm has stored it, leaving the device `Requesting`.  The
-    // request is encrypted to that group, so that only its members can read it; the group must be
-    // one this device has seen in the swarm.  The account must already be restored here, and the
-    // device not in a group: an account has only one, so there is no switching from one to
-    // another, only `leave_group` and then asking.  A device `Removed`, `Displaced` or `Dropped`
-    // asks as a new device: it takes a new device id, forgetting the group it is no longer in, as
-    // part of this call.
+    // Asks the devices of the group `group` to admit this one: fetches the group from the swarm,
+    // uploads a link request for them to approve, and answers once the swarm has stored it,
+    // leaving the device `Requesting`.  The request is encrypted to that group as the fetch finds
+    // it, so that only its members can read it; the group must be one this device has seen in the
+    // swarm, and still be there.  The account must already be restored here, and the device not in
+    // a group: an account has only one, so there is no switching from one to another, only
+    // `leave_group` and then asking.  A device `Removed`, `Displaced` or `Dropped` asks as a new
+    // device: it takes a new device id, forgetting the group it is no longer in, as part of this
+    // call.
     //
     // There is no cancelling: the request lives in the swarm until `expires`, across restarts,
     // whatever the application shows meanwhile.  Asking again for the same group while it does --
@@ -586,9 +587,11 @@ class Devices final : detail::CoreComponent {
     // confirms the emoji through `confirm_link`; or, if `expires` passes first, it hears
     // `membership_changed` with what it sees instead.
     //
-    // Fails with `err::already_registered` for a device in a group, `err::network_unavailable`,
-    // `err::unknown_group`, or `err::store_failed` -- the last worth retrying.  None of them leaves
-    // a request outstanding, and none but the last comes after a new device id was taken.
+    // Fails with `err::already_registered` for a device in a group, `err::network_unavailable`
+    // with no network or none that reached the swarm for the fetch, `err::unknown_group` for a
+    // group the fetch does not find, or `err::store_failed` -- the last two worth retrying.  None
+    // of them leaves a request outstanding, and none but the last comes after a new device id was
+    // taken.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting: stored by the swarm and not past
@@ -791,8 +794,15 @@ class Devices final : detail::CoreComponent {
             const device::GroupId& group, std::span<const std::byte, 32> link_x25519);
 
     // Takes the handler by reference and moves from it only once nothing more can throw, so that
-    // `request_link` can still report a failure through it.
+    // `request_link` can still report a failure through it.  `_request_link` fetches the group,
+    // and `_send_link_request` does the rest once it has.
     void _request_link(const device::GroupId& group, result_function<OutgoingLinkRequest>& cb);
+    void _send_link_request(const device::GroupId& group, result_function<OutgoingLinkRequest>& cb);
+
+    // Whether a device that may ask to join a group is cast out of the one it holds, and so asks
+    // under a new id.  Throws err::already_registered for one in a group, which has to leave it
+    // first: an account has only one.
+    bool _cast_out_asking();
 
     // The outer link request message carrying `plaintext`, encrypted to the group whose link key is
     // `link_x25519`; see "Initiating a device link".

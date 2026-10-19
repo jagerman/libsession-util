@@ -113,10 +113,12 @@ unchanged, and the next start (or the device screen) offers the choice again.
    so at the choice, with what is lost: messages that reached those groups' devices only,
    encrypted to keys the chosen group's devices do not hold, cannot be recovered afterwards unless
    another device still holds those keys.
-2. **Ask.** `request_link(group, cb)`. It uploads the request and answers once the swarm has stored
-   it, with the SAS and the deadline (10 minutes). Errors: `err::unknown_group` (no longer in the
-   swarm), `err::network_unavailable`, `err::store_failed` (worth retrying), `err::already_registered`
-   (this device is in a group; there is no moving straight to another). From `Removed`,
+2. **Ask.** `request_link(group, cb)`. It fetches the group from the swarm first, then uploads the
+   request and answers once the swarm has stored it, with the SAS and the deadline (10 minutes).
+   Errors: `err::unknown_group` (the fetch found the group gone), `err::network_unavailable` (no
+   network, or the swarm could not be reached), `err::store_failed` (worth retrying),
+   `err::already_registered` (this device is in a group; there is no moving straight to another).
+   Show progress meanwhile: the fetch and the upload take a round trip each. From `Removed`,
    `Displaced` or `Dropped` the call first gives the device a new identity, forgetting the group it
    is no longer in: the request then comes from a new device. The device is now `Requesting`; that
    move is not reported, since the caller made it.

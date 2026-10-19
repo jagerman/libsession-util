@@ -1466,12 +1466,50 @@ namespace {
 
 using Asked = std::optional<Expected<Devices::OutgoingLinkRequest>>;
 
-// Asks for a link from `c` and runs the job, so that the upload has been sent by the time this
-// returns.  What it answers lands in `into`, once the upload is answered.
+// Whether `r` is the fetch of the device namespace alone that asking to join begins with, rather
+// than an ordinary poll.
+bool is_device_fetch(const MockNetwork::SentRequest& r) {
+    if (r.request.endpoint != "batch")
+        return false;
+    auto reqs = push_requests(r);
+    return reqs.size() == 1 && reqs[0]["params"]["namespace"] == 21;
+}
+
+using Held = std::vector<std::pair<std::vector<std::byte>, std::string>>;
+
+// Answers the fetch asking to join begins with, as a swarm holding `held` -- messages and their
+// hashes -- beyond what the device already has; or fails it, as an unreachable swarm would.
+size_t answer_fetch(TempCore& c, MockNetwork& net, const Held& held = {}, bool reached = true) {
+    auto answered = answer_requests(
+            net,
+            is_device_fetch,
+            [&](MockNetwork::SentRequest& r) {
+                if (!reached)
+                    return r.callback(false, true, 0, {}, std::nullopt);
+                nlohmann::json messages = nlohmann::json::array();
+                for (const auto& [data, hash] : held)
+                    messages.push_back(
+                            {{"data", oxenc::to_base64(to_string_view(data))},
+                             {"hash", hash},
+                             {"expiry", epoch_ms(clock_now_ms() + 10min)}});
+                nlohmann::json result{
+                        {"code", 200}, {"body", {{"messages", messages}, {"more", false}}}};
+                r.callback(true, false, 200, {}, nlohmann::json{{"results", {result}}}.dump());
+            },
+            1);
+    TestHelper::drain(*c);
+    return answered;
+}
+
+// Asks for a link from `c` and runs the job, answering the fetch it begins with as a swarm holding
+// nothing new, so that the upload has been sent by the time this returns.  What it answers lands in
+// `into`, once the upload is answered.
 void request_link(TempCore& c, const device::GroupId& group, Asked& into) {
     c->devices.request_link(
             group, [&into](Expected<Devices::OutgoingLinkRequest> r) { into = std::move(r); });
     TestHelper::drain(*c);
+    if (auto* net = dynamic_cast<MockNetwork*>(c->network()))
+        answer_fetch(c, *net);
 }
 
 // The applicant asks to join the existing device's group, having first seen it in the swarm.
@@ -1632,20 +1670,104 @@ TEST_CASE(
     CHECK(same(**second, **first));
     CHECK(pushes(*net).size() == uploads);
 
-    // Approved, too: the approval waiting on it is not let go.
+    // Approved, too, by an approval the asking itself fetches: it is not let go.
     TestHelper::deliver_device_message(*l.core, message, (*first)->expires, "L1");
     REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
-    TestHelper::deliver_device_message(
-            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
-    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Approved);
     Asked third;
-    request_link(l, third);
+    l.applicant->devices.request_link(
+            *TestHelper::group_id(*l.core),
+            [&third](Expected<Devices::OutgoingLinkRequest> r) { third = std::move(r); });
+    TestHelper::drain(*l.applicant);
+    REQUIRE(answer_fetch(
+                    l.applicant,
+                    *net,
+                    {{l.core->devices.build_device_group_message().message, "G1"}}) == 1);
     REQUIRE(third);
     REQUIRE(third->has_value());
     CHECK(same(**third, **first));
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::Approved);
     REQUIRE(l.applicant->devices.confirm_link(await));
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+}
+
+TEST_CASE(
+        "Devices - asking to join fetches the group first, and asks under the key it finds",
+        "[core][devices][linking][request]") {
+    Linking l;
+    l.admit();
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G2");
+    auto group = *TestHelper::group_id(*l.core);
+
+    // A new device, which saw the group while the applicant was in it.
+    TempCore asking{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *asking, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    auto* net = attach_mock_network(*asking);
+
+    // The applicant removed since, which moves the group to a key the applicant does not hold.
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    auto since = l.core->devices.build_device_group_message().message;
+
+    Asked got;
+    asking->devices.request_link(
+            group, [&got](Expected<Devices::OutgoingLinkRequest> r) { got = std::move(r); });
+    TestHelper::drain(*asking);
+    CHECK(pushes(*net).empty());
+    auto prompts = l.events.added.size();
+
+    SECTION("finding the group as it is now: asked under its current key, and prompted for") {
+        REQUIRE(answer_fetch(asking, *net, {{since, "G4"}}) == 1);
+        auto message = uploaded(*net);
+        answer_upload(asking, *net, true);
+        REQUIRE(got);
+        REQUIRE(got->has_value());
+        TestHelper::deliver_device_message(*l.core, message, (*got)->expires, "L2");
+        CHECK(l.events.added.size() == prompts + 1);
+    }
+
+    SECTION("finding nothing newer: under the key it saw, which the removed device holds") {
+        REQUIRE(answer_fetch(asking, *net) == 1);
+        auto message = uploaded(*net);
+        answer_upload(asking, *net, true);
+        REQUIRE(got);
+        REQUIRE(got->has_value());
+        TestHelper::deliver_device_message(*l.core, message, (*got)->expires, "L2");
+        CHECK(l.events.added.size() == prompts);
+    }
+}
+
+TEST_CASE(
+        "Devices - what the fetch before asking finds can stop the asking",
+        "[core][devices][linking][request]") {
+    Linking l;
+    auto group = l.show_group();
+    auto* net = attach_mock_network(*l.applicant);
+    Asked got;
+    l.applicant->devices.request_link(
+            group, [&got](Expected<Devices::OutgoingLinkRequest> r) { got = std::move(r); });
+    TestHelper::drain(*l.applicant);
+
+    SECTION("the swarm out of reach") {
+        while (!got && answer_fetch(l.applicant, *net, {}, false))
+            ;
+        REQUIRE(got);
+        REQUIRE_FALSE(got->has_value());
+        CHECK(got->error().code == err::network_unavailable);
+    }
+
+    SECTION("the group dissolved since") {
+        REQUIRE(answer_fetch(
+                        l.applicant,
+                        *net,
+                        {{TestHelper::build_dissolution(*l.core, {group}), "T1"}}) == 1);
+        REQUIRE(got);
+        REQUIRE_FALSE(got->has_value());
+        CHECK(got->error().code == err::unknown_group);
+    }
+
+    CHECK(pushes(*net).empty());
+    CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
+    CHECK(own_state(l.applicant) == device::State::Unregistered);
 }
 
 TEST_CASE(

@@ -773,17 +773,33 @@ void Core::_conclude_profile_fetch(ProfileFanOut& state) {
         state.done(state.found);
 }
 
+void Core::_fetch(std::vector<config::Namespace> namespaces, std::function<void(bool)> done) {
+    auto& waiting = _fetches[namespaces];
+    waiting.push_back(std::move(done));
+    if (waiting.size() > 1)
+        return;
+
+    // Taken out before any is called, since one may well fetch again.
+    _send_poll(namespaces, 0, std::nullopt, [this, namespaces](bool fetched) {
+        auto joined = _fetches.extract(namespaces);
+        for (auto& f : joined.mapped())
+            if (f)
+                f(fetched);
+    });
+}
+
 void Core::_send_poll(
         std::vector<config::Namespace> namespaces,
         int round,
-        std::optional<network::service_node> node) {
+        std::optional<network::service_node> node,
+        std::function<void(bool)> done) {
     _swarm_request(
             globals.pubkey_x25519(),
             "batch",
             [this, namespaces](const network::service_node& n) {
                 return _build_poll_body(n, namespaces);
             },
-            [this, namespaces, round](SwarmResponse res) mutable {
+            [this, namespaces, round, done = std::move(done)](SwarmResponse res) mutable {
                 if (!res.ok() || !res.body) {
                     log::warning(
                             cat,
@@ -791,6 +807,8 @@ void Core::_send_poll(
                             res.timeout ? "timed out"
                             : res.body  ? *res.body
                                         : "request failed");
+                    if (done)
+                        done(false);
                     return;
                 }
 
@@ -799,7 +817,12 @@ void Core::_send_poll(
                 // the subscription that a drained poll goes on to make.
                 _swarm_node = res.node;
 
-                _handle_poll_response(res.node, std::move(namespaces), std::move(*res.body), round);
+                _handle_poll_response(
+                        res.node,
+                        std::move(namespaces),
+                        std::move(*res.body),
+                        round,
+                        std::move(done));
             },
             std::move(node));
 }
@@ -952,9 +975,14 @@ void Core::_handle_poll_response(
         network::service_node node,
         std::vector<config::Namespace> namespaces,
         std::string body,
-        int round) {
+        int round,
+        std::function<void(bool)> done) {
 
     const auto& sn_pubkey = node.remote_pubkey;
+    auto finish = [&done](bool drained) {
+        if (done)
+            done(drained);
+    };
 
     // Namespaces the node says it has more of, to continue in another round.  Collected rather than
     // continued in place because the cursor each one resumes from is written below.
@@ -964,7 +992,7 @@ void Core::_handle_poll_response(
         auto json = nlohmann::json::parse(body);
         auto it = json.find("results");
         if (it == json.end() || !it->is_array())
-            return;
+            return finish(false);
 
         // One poll can carry several config namespaces, and each merge would otherwise dump on its
         // way out.  Nothing reads those intermediate states, so hold them until the whole response
@@ -989,7 +1017,7 @@ void Core::_handle_poll_response(
         }
     } catch (const std::exception& e) {
         log::warning(cat, "Failed to parse poll response: {}", e.what());
-        return;
+        return finish(false);
     }
 
     // Nothing reports more, so this node's namespaces are drained and its cursors are current --
@@ -997,9 +1025,10 @@ void Core::_handle_poll_response(
     // retrieve and the subscription taking effect would be lost.
     if (unfinished.empty()) {
         _maybe_subscribe(node);
-        return;
+        return finish(true);
     }
 
+    // As drained as a node that never stops saying "more" lets it be.
     if (round + 1 >= POLL_MAX_ROUNDS) {
         log::warning(
                 cat,
@@ -1007,14 +1036,14 @@ void Core::_handle_poll_response(
                 sn_pubkey.hex(),
                 POLL_MAX_ROUNDS,
                 unfinished.size());
-        return;
+        return finish(true);
     }
 
     // Named rather than chosen afresh: the cursor these resume from is this node's, so the
     // continuation has to go back to the same one.  If it has since become unusable the swarm
     // request falls back to choosing normally, and the round starts over from that member's
     // cursor rather than resuming from one it never issued.
-    _send_poll(std::move(unfinished), round + 1, std::move(node));
+    _send_poll(std::move(unfinished), round + 1, std::move(node), std::move(done));
 }
 
 std::optional<network::PathInfo> Core::current_swarm_path() const {

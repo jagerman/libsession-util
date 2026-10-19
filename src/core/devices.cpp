@@ -2113,17 +2113,22 @@ device::Membership Devices::_unreadable_verdict(std::span<const std::byte> data)
     return device::Membership::Dropped;
 }
 
+// Runs `f`, reporting to `cb` whatever it throws.  Once `f` hands `cb` on, moving from it, nothing
+// it does may throw, so that `cb` hears at most once either way.
+template <typename T, typename F>
+static void reporting_failure(result_function<T>& cb, F&& f) {
+    try {
+        f();
+    } catch (const std::exception& e) {
+        detail::log_component_failure(e);
+        if (cb)
+            cb(unexpected{error_from(e)});
+    }
+}
+
 void Devices::request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb) {
     enqueue([this, group, cb = std::move(cb)]() mutable {
-        // Everything that can throw comes before the upload takes `cb`, so this reports at most
-        // once.
-        try {
-            _request_link(group, cb);
-        } catch (const std::exception& e) {
-            detail::log_component_failure(e);
-            if (cb)
-                cb(unexpected{error_from(e)});
-        }
+        reporting_failure(cb, [&] { _request_link(group, cb); });
     });
 }
 
@@ -2135,11 +2140,42 @@ void Devices::_request_link(
     // network cannot be attached without one.
     if (!core.network())
         throw session::error{err::network_unavailable, "Cannot request a link: no network"};
+    _cast_out_asking();
+
+    // Encrypted to the link key the group publishes now, rather than as of whenever we last
+    // fetched: one that has since reached a removed device is a key the group refuses requests
+    // under.  The fetch also shows whether the group is still there at all, and brings in an
+    // admission on a request already out.
+    core._fetch(
+            {config::Namespace::Devices},
+            [this, alive = std::weak_ptr<int>{_alive}, group, cb = std::move(cb)](
+                    bool fetched) mutable {
+                if (alive.expired())
+                    return;
+                reporting_failure(cb, [&] {
+                    if (!fetched)
+                        throw session::error{
+                                err::network_unavailable,
+                                "Cannot request a link: could not fetch the device group"};
+                    _send_link_request(group, cb);
+                });
+            });
+}
+
+bool Devices::_cast_out_asking() {
     bool cast_out = _cast_out();
     if (!cast_out && _device_info().second)
         throw session::error{
                 err::already_registered,
                 "This device is in a group; it must leave it before asking to join another"};
+    return cast_out;
+}
+
+void Devices::_send_link_request(
+        const device::GroupId& group, result_function<OutgoingLinkRequest>& cb) {
+    assert(on_loop());
+    // Again, since the fetch may have changed it.
+    bool cast_out = _cast_out_asking();
 
     // Asking again while a request for the group is out is reopening it: a new one would show the
     // user new emoji, and take the place of the one another device may be approving now.

@@ -567,7 +567,11 @@ request out at a time, and what it does while waiting on it is in "Confirmation 
 device".
 
 The request is encrypted to the group asked to join, using the `link_x25519` pubkey from that
-group's messages, so that only the group's members can read it.  It must not be readable by every
+group's messages, so that only the group's members can read it.  The device fetches namespace 21
+just before asking and uses the newest of the group's messages that fetch finds, rather than
+whatever it fetched last: a key the group has since rotated away from may be one it refuses
+requests under (see below), and the fetch also shows whether the group is still there, and brings
+in an admission on a request already out.  It must not be readable by every
 holder of the root seed: a removed device still holds the seed, and a request it could read would
 give it the requesting device's keys and SAS, enough to admit that device into a group of its own.
 Encrypting to the group also means only that group's devices prompt for it, where an account has
@@ -632,7 +636,8 @@ key, whether the member merged it or pushed it, delivered the key to each of the
 exactly the keys a removed device holds, the retained keys handed over on its admission included,
 and every other retained key is honoured, so an ordinary rotation never costs a request its
 prompt.  What it does cost is a request made under a key that reached a device removed in the
-meantime, which lapses unprompted and has to be made again.
+meantime, which lapses unprompted and has to be made again; with the requesting device fetching
+the group just before it asks, that takes a removal within moments of the request.
 
 #### Handshake short authentication string
 

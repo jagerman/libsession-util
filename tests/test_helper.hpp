@@ -323,7 +323,7 @@ inline std::string store_hash_for(std::string_view pubkey_hex) {
     return "hash-for-{}"_format(pubkey_hex);
 }
 
-/// Hands the first `max` captured requests for `endpoint` to `respond`, leaving everything else
+/// Hands the first `max` captured requests that `which` picks to `respond`, leaving everything else
 /// pending, and returns how many were answered.
 ///
 /// The pending list is taken away before any of it runs, and must be: a response can prompt Core to
@@ -331,7 +331,7 @@ inline std::string store_hash_for(std::string_view pubkey_hex) {
 /// the very callback being invoked.
 inline size_t answer_requests(
         MockNetwork& net,
-        std::string_view endpoint,
+        const std::function<bool(const MockNetwork::SentRequest&)>& which,
         const std::function<void(MockNetwork::SentRequest&)>& respond,
         size_t max = std::numeric_limits<size_t>::max()) {
     auto pending = std::exchange(net.sent_requests, {});
@@ -339,18 +339,35 @@ inline size_t answer_requests(
     std::vector<MockNetwork::SentRequest> others;
 
     for (auto& r : pending) {
-        if (r.request.endpoint == endpoint && answered < max) {
+        if (answered < max && which(r)) {
             respond(r);
             answered++;
         } else
             others.push_back(std::move(r));
     }
 
-    // Appended rather than assigned: whatever the responses prompted belongs in the list too.
-    for (auto& r : others)
+    // Whatever the responses prompted belongs in the list too, after what was already waiting: it
+    // was sent later, and "the oldest one not yet answered" has to keep meaning that.
+    auto prompted = std::exchange(net.sent_requests, std::move(others));
+    for (auto& r : prompted)
         net.sent_requests.push_back(std::move(r));
 
     return answered;
+}
+
+/// The same, for the requests to `endpoint`.
+inline size_t answer_requests(
+        MockNetwork& net,
+        std::string_view endpoint,
+        const std::function<void(MockNetwork::SentRequest&)>& respond,
+        size_t max = std::numeric_limits<size_t>::max()) {
+    return answer_requests(
+            net,
+            [endpoint](const MockNetwork::SentRequest& r) {
+                return r.request.endpoint == endpoint;
+            },
+            respond,
+            max);
 }
 
 /// Answers every captured store, and returns how many there were -- which is itself worth asserting

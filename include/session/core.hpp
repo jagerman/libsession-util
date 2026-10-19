@@ -1,6 +1,7 @@
 #pragma once
 
 #include <concepts>
+#include <map>
 #include <memory>
 #include <oxen/quic/loop.hpp>
 #include <session/clock.hpp>
@@ -434,15 +435,22 @@ class Core {
             int16_t status,
             std::optional<std::string> body);
 
+    // Fetches `namespaces` now, outside the polling schedule, handling what comes back as any poll
+    // does, and then calls `done` on Core's queue: true once they are drained, false if the fetch
+    // failed.  One for the same namespaces already in flight is joined rather than sent again.
+    void _fetch(std::vector<config::Namespace> namespaces, std::function<void(bool)> done);
+    std::map<std::vector<config::Namespace>, std::vector<std::function<void(bool)>>> _fetches;
+
     // Sends one round of retrieves to `node` for `namespaces`.  A retrieve is capped by the storage
     // server, so one round may not exhaust a namespace; `round` counts continuations and bounds
     // them.  Every round goes to the same node: the retrieve cursor is stored per (namespace,
     // node), so continuing against a different swarm member would resume from that member's
-    // position.
+    // position.  `done`, if given, hears whether the namespaces were drained, after the last round.
     void _send_poll(
             std::vector<config::Namespace> namespaces,
             int round,
-            std::optional<network::service_node> node);
+            std::optional<network::service_node> node,
+            std::function<void(bool)> done = nullptr);
 
     // The batch of retrieves to send `node`, carrying that node's cursor for each namespace.
     std::vector<std::byte> _build_poll_body(
@@ -451,7 +459,8 @@ class Core {
             network::service_node node,
             std::vector<config::Namespace> namespaces,
             std::string body,
-            int round);
+            int round,
+            std::function<void(bool)> done);
 
     // Records where `node`'s next retrieve of `ns` resumes from.  The node is a parameter rather
     // than something read from the surroundings because the cursor is kept per (namespace, node):
