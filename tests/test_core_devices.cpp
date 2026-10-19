@@ -2864,15 +2864,19 @@ TEST_CASE(
     CHECK(l.applicant_events.membership.back() == device::Membership::InGroup);
 
     // And the group hears of the departure, from a message it can read and the leaver will not
-    // again, and moves to an account key the leaver does not hold.
+    // again, and moves to an account key the leaver does not hold: the one it was given, by the
+    // push that admitted it.
     auto sent = pushes(*net);
     REQUIRE(sent.size() == 1);
     auto [farewell, deleted] = pushed(*sent[0]);
     REQUIRE_FALSE(farewell.empty());
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
     auto key_before = l.core->devices.active_account_keys().front().x25519_pub;
     TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G9");
     CHECK(l.core->devices.devices(true, true, true, old_id).at(old_id).state ==
           device::State::Left);
+    ScopedClockOffset later{Devices::KEY_ROTATION_JITTER + 1s};
+    TestHelper::finish_fetch(*l.core);
     CHECK(l.core->devices.active_account_keys().front().x25519_pub != key_before);
 
     // Nothing more to leave.
@@ -3505,12 +3509,16 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - a member learning of a departure rotates the account key",
-        "[core][devices][removal]") {
+        "Devices - a member learning of a departure replaces the account key within the jitter",
+        "[core][devices][removal][rotation]") {
     Linking l;
     l.admit();
+    // The existing device's push, confirmed: what delivered the key to the applicant.
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
     auto current = [&] { return l.core->devices.active_account_keys().front().x25519_pub; };
     auto before = current();
+    auto scheduled = *l.core->devices.next_account_rotation();
+    REQUIRE(scheduled > clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
 
     // The farewell the applicant pushes on leaving: its own view of the group, itself departed.
     auto [self, registered] = l.core->devices.device_info(await);
@@ -3522,11 +3530,22 @@ TEST_CASE(
             l.applicant->devices, {{self.id, self}, {leaver.id, leaver}});
     TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G2");
 
-    // A key the departed device does not hold.
+    // Not at once, but soon: every member learning of it is due within the jitter, and whichever
+    // rotates first stands the rest down.  The same moment however often it is asked.
+    CHECK(current() == before);
+    auto due = *l.core->devices.next_account_rotation();
+    CHECK(due <= clock_now() + Devices::KEY_ROTATION_JITTER);
+    CHECK(*l.core->devices.next_account_rotation() == due);
+
+    // A key the departed device does not hold, and nothing early about the next.
+    ScopedClockOffset later{Devices::KEY_ROTATION_JITTER + 1s};
+    TestHelper::finish_fetch(*l.core);
     auto after = current();
     CHECK(after != before);
     for (const auto& k : l.applicant->devices.active_account_keys())
         CHECK(k.x25519_pub != after);
+    CHECK(*l.core->devices.next_account_rotation() >
+          clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
 
     // Hearing of the same departure again -- restated later, as a device trying to return gets --
     // is not a second one.
@@ -3541,13 +3560,17 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - a member learning of a removal elsewhere does not rotate",
-        "[core][devices][removal]") {
+        "Devices - a member learning of a removal brings both its rotations forward",
+        "[core][devices][removal][rotation]") {
     Linking l;
     l.admit();
-    auto before = l.core->devices.active_account_keys().front().x25519_pub;
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
+    auto soon = [] { return clock_now() + Devices::KEY_ROTATION_JITTER; };
+    REQUIRE(*l.core->devices.next_account_rotation() > soon());
+    REQUIRE(*l.core->devices.next_device_rotation() > soon());
 
-    // The device that removed it rotated in the same step; a second rotation here buys nothing.
+    // A removal made elsewhere, by a device that kept the key the removed device holds -- one that
+    // never heard of the rotation the remover made, say.
     auto [self, registered] = l.core->devices.device_info(await);
     REQUIRE(registered);
     auto removed = l.state_of_applicant();
@@ -3559,7 +3582,10 @@ TEST_CASE(
                     l.applicant->devices, {{self.id, self}, {removed.id, removed}}),
             in(10min),
             "G2");
-    CHECK(l.core->devices.active_account_keys().front().x25519_pub == before);
+
+    // The account key, because the removed device holds it; our device keys, because it knows them.
+    CHECK(*l.core->devices.next_account_rotation() <= soon());
+    CHECK(*l.core->devices.next_device_rotation() <= soon());
 }
 
 namespace {
@@ -4005,4 +4031,81 @@ TEST_CASE(
     later.advance(2s);
     REQUIRE(answer_fetch(l.core, *net) == 1);
     CHECK((account_key(l.core) != account || device_key(l.core) != device));
+}
+
+TEST_CASE(
+        "Devices - a key minted without hearing of a removal is replaced, at once by the remover",
+        "[core][devices][removal][rotation]") {
+    Linking l;
+    l.admit();
+
+    // A third member, which hears nothing of what follows until it has rotated.
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*third, *l.core).message, in(10min), "L2");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    auto joined = l.core->devices.build_device_group_message();
+    l.core->devices.mark_device_group_pushed(joined, "G2");
+    TestHelper::deliver_device_message(*third, joined.message, in(10min), "G2");
+    REQUIRE(third->devices.confirm_link(await));
+    REQUIRE(third->devices.membership(await).membership == device::Membership::InGroup);
+
+    // The existing device removes the applicant, rotating as it does...
+    ScopedClockOffset later{1min};
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    auto removal = l.core->devices.build_device_group_message();
+    l.core->devices.mark_device_group_pushed(removal, "G3");
+
+    // ...while the third rotates on its own schedule, and its push delivers the newer key -- the
+    // one every device will take as current -- to the removed device.
+    later.advance(1min);
+    third->devices.rotate_account_keys();
+    auto concurrent = third->devices.build_device_group_message();
+    third->devices.mark_device_group_pushed(concurrent, "G4");
+    auto leaked = account_key(third);
+
+    SECTION("the remover replaces it at once") {
+        TestHelper::deliver_device_message(*l.core, concurrent.message, in(10min), "G4");
+        CHECK(account_key(l.core) != leaked);
+    }
+
+    SECTION("any other member within the jitter, standing down when another gets there first") {
+        TestHelper::deliver_device_message(*third, removal.message, in(10min), "G3");
+        REQUIRE(account_key(third) == leaked);
+        CHECK(*third->devices.next_account_rotation() <=
+              clock_now() + Devices::KEY_ROTATION_JITTER);
+
+        TestHelper::deliver_device_message(*l.core, concurrent.message, in(10min), "G4");
+        TestHelper::deliver_device_message(
+                *third, l.core->devices.build_device_group_message().message, in(10min), "G5");
+        CHECK(account_key(third) == account_key(l.core));
+        CHECK(*third->devices.next_account_rotation() >
+              clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
+    }
+}
+
+TEST_CASE(
+        "Devices - a device admitted to a group with an old departure does not rotate",
+        "[core][devices][rotation][linking]") {
+    Linking l;
+
+    // A device that was in the group once, and left a month ago.
+    auto [self, registered] = l.core->devices.device_info(await);
+    REQUIRE(registered);
+    auto gone = tombstone(
+            device::State::Left,
+            std::chrono::floor<std::chrono::seconds>(clock_now_s()) - Devices::DEVICE_GROUP_TTL);
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(l.core->devices, {{self.id, self}, {gone.id, gone}}),
+            in(10min),
+            "G0");
+    REQUIRE(l.core->devices.devices(false, false, true).contains(gone.id));
+
+    // Every departure in the group's history is new to a device joining it, and none of them
+    // holds the key it is given.
+    l.admit();
+    CHECK(account_key(l.applicant) == account_key(l.core));
+    CHECK(*l.applicant->devices.next_account_rotation() >
+          clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
 }

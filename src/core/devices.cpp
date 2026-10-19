@@ -102,6 +102,10 @@ static constexpr auto dissolved_key = "devices_group_dissolved"sv;
 // all, when they were made, and kept so that the jitter is the same however often it is asked.
 static constexpr auto device_rotation_key = "devices_device_rotation_at"sv;
 
+// When the current account key, having reached a device no longer in the group, is to be replaced
+// early, in unix milliseconds; see `_early_account_rotation`.
+static constexpr auto early_rotation_key = "devices_account_rotation_early_at"sv;
+
 // How long the rotation timer waits to try again after its fetch failed.
 static constexpr auto ROTATION_RETRY = 1min;
 
@@ -271,11 +275,14 @@ Devices::DeviceKeys Devices::rotate_device_keys() {
     return keys;
 }
 
+// A delay picked uniformly from [0, KEY_ROTATION_JITTER].
+static std::chrono::milliseconds jitter() {
+    return std::chrono::milliseconds{random::get_uniform_distribution<int64_t>(
+            0, std::chrono::milliseconds{Devices::KEY_ROTATION_JITTER}.count())};
+}
+
 sys_ms Devices::_schedule_device_rotation(std::chrono::sys_seconds created) {
-    auto half = std::chrono::duration_cast<std::chrono::milliseconds>(KEY_ROTATION_JITTER / 2);
-    auto due = created + KEY_ROTATION_PERIOD +
-               std::chrono::milliseconds{
-                       random::get_uniform_distribution(-half.count(), half.count())};
+    auto due = created + KEY_ROTATION_PERIOD - KEY_ROTATION_JITTER / 2 + jitter();
     core.globals.set(device_rotation_key, epoch_ms(due));
     return due;
 }
@@ -1615,7 +1622,7 @@ void Devices::receive_device_group_message(
             recipients.push_back(id);
     _record_key_delivery(carried_keys, recipients);
 
-    bool departed = false;
+    bool removed = false;
     std::vector<device::Id> members;
     for (const auto& [id, info] : payload.devices) {
         if (tombstoned(info)) {
@@ -1631,12 +1638,12 @@ void Devices::receive_device_group_message(
                         id,
                         static_cast<int>(info.state))) {
                 _devices_changed = true;
-                if (info.state == device::State::Left &&
-                    was < static_cast<int>(device::State::Left))
-                    departed = true;
                 // Gone from the group, rather than a tombstone for a device we never knew of.
-                if (was == static_cast<int>(device::State::Registered) && id != self_id)
+                if (was == static_cast<int>(device::State::Registered) && id != self_id) {
                     members.push_back(id);
+                    if (info.state == device::State::Kicked)
+                        removed = true;
+                }
             }
             continue;
         }
@@ -1684,14 +1691,11 @@ void Devices::receive_device_group_message(
         }
     }
 
-    // A device that left still holds every account key we have, and could not rotate to one it
-    // lacks on our behalf: the rotation falls to whichever remaining member learns of it first --
-    // or to several, whose rotations then settle on one key as any crossing rotations do.  Not for
-    // a removal, which the removing device rotated for in the same step.
-    if (departed && _member()) {
-        log::info(cat, "A device left the group; rotating the account key");
-        rotate_account_keys();
-    }
+    // A removed device knows our device pubkeys, and could encrypt to them a group message of its
+    // own making; rotating soon makes what it knows go stale.  The account key it may hold is
+    // `next_account_rotation`'s to deal with.
+    if (removed)
+        _pull_in_device_rotation();
 
     _note_read(t);
 
@@ -1959,15 +1963,16 @@ std::vector<device::Id> Devices::_key_recipients(int64_t key) {
     return out;
 }
 
-bool Devices::_key_held_outside(int64_t key) {
+bool Devices::_key_held_outside(int64_t key, bool ours) {
     return conn()
             .prepared_maybe_get<int>(
                     "SELECT 1 FROM device_account_key_recipients r"
                     " JOIN devices d ON d.unique_id = r.device"
-                    " WHERE r.key = ? AND d.state IN (?, ?)",
+                    " WHERE r.key = ? AND d.state IN (?, ?) AND (? = 0 OR d.removed_by_us)",
                     key,
                     static_cast<int>(device::State::Kicked),
-                    static_cast<int>(device::State::Left))
+                    static_cast<int>(device::State::Left),
+                    ours ? 1 : 0)
             .has_value();
 }
 
@@ -3290,7 +3295,7 @@ bool Devices::_remove_device(std::span<const std::byte, device::ID_SIZE> id) {
         return false;
 
     if (!c.prepared_maybe_get<int64_t>(
-                "UPDATE devices SET state = ?, kicked_timestamp = ?,"
+                "UPDATE devices SET state = ?, kicked_timestamp = ?, removed_by_us = 1,"
                 " broadcast_needed = broadcast_needed + 1"
                 " WHERE unique_id = ? AND state = ? RETURNING id",
                 static_cast<int>(device::State::Kicked),
@@ -3302,6 +3307,7 @@ bool Devices::_remove_device(std::span<const std::byte, device::ID_SIZE> id) {
     // In the same transaction, so there is no moment at which the removal is recorded and the key
     // the removed device holds is still the one a push would treat as current.
     rotate_account_keys();
+    _pull_in_device_rotation();
     tx.commit();
 
     log::info(cat, "Removed device {} from the group", oxenc::to_hex(id));
@@ -3665,11 +3671,13 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotat
     if (!_member())
         return std::nullopt;
 
+    int64_t key_id = 0;
     int64_t t_created = 0;
     std::optional<cleared_b32> active_seed;
-    for (auto [created, seed] : c.prepared_results<int64_t, sqlite::blobn<32>>(
-                 "SELECT created, seed FROM device_account_keys"
+    for (auto [id, created, seed] : c.prepared_results<int64_t, int64_t, sqlite::blobn<32>>(
+                 "SELECT id, created, seed FROM device_account_keys"
                  " WHERE rotated IS NULL ORDER BY created DESC LIMIT 1")) {
+        key_id = id;
         t_created = created;
         std::memcpy(active_seed.emplace().data(), seed.data(), seed.size());
     }
@@ -3694,8 +3702,35 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotat
     auto offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
             (KEY_ROTATION_PERIOD - KEY_ROTATION_JITTER / 2) +
             KEY_ROTATION_JITTER * (1.0 - std::pow(u, static_cast<double>(N))));
+    std::chrono::system_clock::time_point scheduled =
+            std::chrono::sys_seconds{std::chrono::seconds{t_created}} + offset;
 
-    return std::chrono::sys_seconds{std::chrono::seconds{t_created}} + offset;
+    if (auto early = _early_account_rotation(key_id))
+        return std::min(scheduled, std::chrono::system_clock::time_point{*early});
+    return scheduled;
+}
+
+std::optional<sys_ms> Devices::_early_account_rotation(int64_t key) {
+    if (!_key_held_outside(key)) {
+        core.globals.erase(early_rotation_key);
+        return std::nullopt;
+    }
+    if (auto at = core.globals.get_integer(early_rotation_key))
+        return from_epoch_ms(*at);
+
+    auto at = clock_now_ms();
+    if (!_key_held_outside(key, true))
+        at += jitter();
+    core.globals.set(early_rotation_key, epoch_ms(at));
+    log::info(cat, "The account key reached a device no longer in the group; replacing it early");
+    return at;
+}
+
+void Devices::_pull_in_device_rotation() {
+    auto at = clock_now_ms() + jitter();
+    auto due = core.globals.get_integer(device_rotation_key);
+    if (!due || epoch_ms(at) < *due)
+        core.globals.set(device_rotation_key, epoch_ms(at));
 }
 
 std::optional<std::chrono::system_clock::time_point> Devices::next_device_rotation() {

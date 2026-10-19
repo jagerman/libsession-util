@@ -937,10 +937,11 @@ The departed device still holds every account key the old group had, and the gro
 it does not.  A removal does this in the same step: the removing device generates a new account key
 and pushes it in the message that carries the tombstone, which the removed device is not given a key
 to.  A departing device cannot do the same for itself, since it would know any key it generated,
-and so the rotation is a second step: a remaining member that merges a departure tombstone it did
-not already hold generates a new account key and pushes it.  Several members may do so at once; as
-with any rotations that cross, the merge keeps the most recently created key as current, the lowest
-seed breaking a tie, so every device settles on the same one.
+and so the rotation is a second step: a remaining member that learns of the departure finds the
+current key delivered to a device no longer in the group, and replaces it within the rotation
+jitter (see "Rotating early").  The first to do so stands the others down; any that cross settle
+as all crossing rotations do, the merge keeping the most recently created key as current and the
+lowest seed breaking a tie.
 
 # Account keys
 
@@ -1190,12 +1191,42 @@ account pubkeys) *after* they have been rotated away so that an offline device i
 any incoming messages that may still be in the swarm.  We use 16 days to include an extra 24h safety
 buffer.
 
-### Unimplemented accelerated rotation
+### Rotating early
 
-One idea that is possible but not currently implemented is to allow earlier rotation when lots of
-messages are being received.  One possible downside would be the metadata leakage: an outside
-observing watching the public account keys for an account could infer that the account is receiving
-lots of messages because of a higher rotation frequency.
+An account key can be replaced before its time, though not retired: contacts cache it for up to
+48h and every device keeps it for 16 days after it is rotated away.  Replacing it early buys one
+thing, that link requests stop being honoured under it (see "Initiating a device link"), and is done
+for one reason: **the current account key was delivered to a device that is no longer a member**.
+
+A device knows which: for each account key it keeps the devices it was delivered to, since every
+payload carrying a key is encrypted to exactly the live records it carries.  When the current key
+was delivered to a device now removed or departed, the device's next rotation is due at once if it
+removed that device itself, and otherwise at `now + uniform[0, 2h]` -- picked when it first sees
+this, and kept, so that it holds still across fetches and restarts.  Only the remover knows it is
+one, from a mark it keeps on the removal, so its zero delay collides with nobody's; two devices
+removing the same device at once both rotate at once, an ordinary tie that the merge settles.
+
+The rule is a fact about the key rather than about timing, and covers:
+
+- **A removal.**  The remover rotates as part of removing, so the condition is ordinarily false
+  everywhere from the start.  It matters when a member that had not heard of the removal rotates
+  meanwhile and delivers its new key, newer and so current everywhere, to the removed device: the
+  remover then replaces it at once, and every other member within the jitter.
+- **A departure.**  The departing device holds the current key and cannot rotate it away for
+  itself, so every member learning of the departure is due within the jitter.
+
+Standing down needs nothing of its own: the first replacement's payload lists the device as gone,
+so the key it carries was never delivered to it, and the condition is false on every device that
+merges it.  A device admitted to a group is not caught out by departures in the group's history
+either: the key its admission gives it was delivered only to the live devices that admission lists.
+
+Accepting a request that replaces a device's record rotates at once too (see "Device link request
+acceptance"): the displaced copy holds the current key under an ID that is still a member, which the
+rule cannot see.
+
+Every device keeps and honours an early-replaced key for contacts' messages for its full retention;
+only link requests refuse it.  A removal also brings device keys forward (see "Device key
+rotation").
 
 ## Device key rotation
 
@@ -1214,8 +1245,10 @@ What only an older key could decrypt is a superseded snapshot or a forgery.
 Rotation is also what makes a former member's knowledge of the group go stale.  A removed device
 keeps the device pubkeys it saw, and holding the seed, could encrypt a forged group message --
 adding a device of its own, say -- to them; once those devices have rotated, nothing it encrypts
-is readable by any of them.  Devices offline throughout stay exposed until they come back and
-rotate.
+is readable by any of them.  So on learning of a removal, a member brings its next device key
+rotation forward to `now + uniform[0, 2h]`, unless it is due sooner already, and what the removed
+device knows goes stale within the jitter.  Devices offline throughout stay exposed until they come
+back and rotate.
 
 
 # Non-PFS fallback (post transition)

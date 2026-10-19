@@ -23,6 +23,10 @@ CREATE TABLE devices (
     broadcast_needed INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),  -- when the device was removed, or left
+    -- 1 for a device this one removed, which is what has it replace at once an account key the
+    -- removed device turns out to hold, where every other member waits a jittered while: only the
+    -- remover knows it is one, so its zero delay collides with nobody's.
+    removed_by_us INTEGER NOT NULL DEFAULT 0 CHECK(removed_by_us IN (0, 1)),
     device_type TEXT NOT NULL, -- typically a/i/d (Android/iOS/Desktop), but can be anything
     description TEXT NOT NULL, -- freeform device description
     version INTEGER NOT NULL, -- = 1000000*V + 1000*v + p for version "V.v.p"

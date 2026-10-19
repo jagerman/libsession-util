@@ -456,8 +456,20 @@ class Devices final : detail::CoreComponent {
     std::vector<device::Id> _key_recipients(int64_t key);
 
     // Whether account key `key` was delivered to a device that is no longer in the group, removed
-    // or departed, which can therefore still use it.
-    bool _key_held_outside(int64_t key);
+    // or departed, which can therefore still use it; `ours` narrows that to one this device
+    // removed.
+    bool _key_held_outside(int64_t key, bool ours = false);
+
+    // When the current account key, `key`, is to be replaced early for having reached a device no
+    // longer in the group: at once by the device that removed it, and at a jittered moment within
+    // KEY_ROTATION_JITTER by every other.  Recorded when first seen, so that it holds still across
+    // fetches and restarts, and dropped as soon as the current key is one no such device holds --
+    // a rotation by anyone stands it down.  Nullopt if there is no reason to.
+    std::optional<sys_ms> _early_account_rotation(int64_t key);
+
+    // Brings our next device key rotation forward to within KEY_ROTATION_JITTER, unless it is due
+    // sooner already: on a removal, so that what the removed device knows of our keys goes stale.
+    void _pull_in_device_rotation();
 
     // Deletes `hashes` from the swarm, once and without reporting back; `what` names them in logs.
     void _delete_from_swarm(std::vector<std::string> hashes, std::string_view what);
@@ -684,9 +696,10 @@ class Devices final : detail::CoreComponent {
 
     // Removes a device from the group, permanently: its id can never rejoin.  The account key
     // rotates in the same step, so that the device does not hold the current one, and it is given
-    // no key to anything the group pushes from here on.  The removal reaches the other devices --
-    // and, through the `kicked` list, the removed device itself -- with the next group push, which
-    // happens once the next fetch completes.
+    // no key to anything the group pushes from here on; this device's own keys rotate within
+    // KEY_ROTATION_JITTER, as every member's do on learning of it.  The removal reaches the other
+    // devices -- and, through the `kicked` list, the removed device itself -- with the next group
+    // push, which happens once the next fetch completes.
     //
     // Answers false if the device is not in the group -- unknown, still only asking to join (which
     // is `ignore_request`), or already gone -- or this device is no longer in it either.  None of
@@ -1029,7 +1042,8 @@ class Devices final : detail::CoreComponent {
     }
 
     // When this device is due to rotate the account key, KEY_ROTATION_PERIOD after the current one
-    // was made, offset within KEY_ROTATION_JITTER as the spec's "Account Key Rotation timer" says.
+    // was made, offset within KEY_ROTATION_JITTER as the spec's "Account Key Rotation timer" says;
+    // or sooner, if the current key reached a device no longer in the group (see "Rotating early").
     // Nullopt for a device that is not a member of a group in good standing.
     std::optional<std::chrono::system_clock::time_point> next_account_rotation();
 

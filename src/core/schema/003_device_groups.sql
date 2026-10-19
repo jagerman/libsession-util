@@ -10,6 +10,7 @@ CREATE TABLE devices_new (
     broadcast_needed INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),
+    removed_by_us INTEGER NOT NULL DEFAULT 0 CHECK(removed_by_us IN (0, 1)),
     device_type TEXT NOT NULL,
     description TEXT NOT NULL,
     version INTEGER NOT NULL,
