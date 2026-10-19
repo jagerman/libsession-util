@@ -429,8 +429,8 @@ class Devices final : detail::CoreComponent {
 
     // Dissolves `groups`, none of them ours: deletes from the swarm every message of theirs we know
     // of, and `obsolete` with them, publishes a tombstone naming them, and remembers them as
-    // dissolved.  Best effort: without a network only the last happens, and seeing one of their
-    // messages again then dissolves it again.
+    // dissolved.  The deletions and the tombstone go out through `_queue_push`, so without a
+    // network they wait for one.
     void _dissolve(std::span<const device::GroupId> groups, std::vector<std::string> obsolete = {});
 
     // Dissolves every group in the swarm but `kept`, which the user has chosen: by starting it, or

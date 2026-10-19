@@ -131,10 +131,9 @@ CREATE INDEX device_group_messages_group ON device_group_messages(group_id);
 
 -- The groups this device knows to be dissolved, by a tombstone it saw or one it published.  A
 -- tombstone lives only as long as any message does, and this is what lets a device in a group that
--- sees a dissolved group in the swarm again dissolve it again.  Kept for as long as the device
--- stays in its group, and forgotten with it: leaving a group -- above all, having it dissolved --
--- means the user's choice of group has moved on, and a dissolution kept past that could undo the
--- group they chose.
+-- sees a dissolved group in the swarm again dissolve it again.  Kept for good, whatever group the
+-- device goes on to, except for a group it is itself admitted to: joining that is the user's
+-- later choice.
 CREATE TABLE device_dissolved_groups (
     group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
     -- The signed time of the newest tombstone naming it, unix milliseconds: a message from the

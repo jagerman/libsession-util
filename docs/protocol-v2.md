@@ -714,22 +714,26 @@ hold.
 A second group can still come about: a device restored from the recovery phrase starts a group of
 its own when it should have joined the existing one, or every device of a group is away for longer
 than its messages last, and comes back to find another.  No device settles this by itself.  The user
-does, by keeping one group, which **dissolves** the others, and always from a position of knowledge:
-on a device that can see what it is choosing between.  There are two ways to it:
+does, by choosing one group, which **dissolves** the others, and always from a position of
+knowledge: on a device that can see what it is choosing between.  Dissolving is only ever the effect
+of that choice, and a device dissolves groups in exactly these cases:
 
-- **Starting a group while others are in view.**  A device outside a group that starts one, while
-  groups it could have asked to join are in the swarm, is choosing its new group over them, and
-  dissolves them.
-- **Completing a join while others are in view.**  A device that sees more than one group and asks
-  to join one is choosing it over the rest, and once it is admitted -- the user having confirmed
-  the SAS -- it dissolves them.
-- **Keeping its own group when forked** (see "Forks"), over the other group in view.
+1. **Starting a group while others are in view.**  A device outside a group that starts one, while
+   groups it could have asked to join are in the swarm, is choosing its new group over them, and
+   dissolves them.
+2. **Completing a join while others are in view.**  A device that sees more than one group and asks
+   to join one is choosing it over the rest, and once it is admitted -- the user having confirmed
+   the SAS -- it dissolves them.
+3. **Keeping its own group when forked** (see "Forks"), over the other group in view.
+4. **Republishing a tombstone it has already seen**, when a group it knows to be dissolved pushes
+   again (see "Dissolving a group").  This decides nothing: the choice was made when the group was
+   first dissolved.
 
 A device never dissolves a group of its own accord.  One that comes back to an empty swarm pushes
-its group again, as it would whenever its messages had expired; one that comes back to find its own
-group's messages gone and another group live is dropped (see "Forks"), and asks to join again.  So
-no two devices can dissolve each other by accident, and nothing has to decide which of two groups
-came first.
+its group again, its account key being due for rotation if nothing else; one that comes back to
+find its own group's messages gone and another group live is dropped (see "Forks"), and a dropped
+device never dissolves anything new.  So no two devices can dissolve each other by accident, and
+nothing has to decide which of two groups came first.
 
 ### Forks
 
@@ -793,24 +797,27 @@ It may then ask to join the group that was kept, as any device outside a group d
 the account's configs and the groups it has seen are kept, as for a removed device.  A tombstone
 naming any other group only stops the device counting that group among those in the swarm.
 
-A device in a group remembers each identifier a tombstone names, with the tombstone's `t` (the
-newest, where several name it).  That memory, a few bytes a group, is what keeps a dissolved group
-dissolved without tombstones having to stay in the swarm forever.  A member of a group that later
-sees a message carrying a dissolved identifier deletes it from the swarm.  If the message was
-written after the dissolution -- a device of that group that never heard of it, back after the
-tombstone expired, has pushed again -- the member also publishes a new tombstone naming the group,
-and the device that pushed rejoins the group that was kept; in the time between, contacts may have
-encrypted to its group's account key, which cannot be helped.  A message written before the
-dissolution is only a leftover that the dissolving device did not know of.
+Every device remembers each identifier a tombstone names, with the tombstone's `t` (the newest,
+where several name it), and keeps that memory whatever group it goes on to, except that a device
+admitted to a group forgets any dissolution of that group it had heard of: joining it was the
+user's later choice.  That memory, a few bytes a group, is what keeps a dissolved group dissolved
+without tombstones having to stay in the swarm forever.  A message carrying a dissolved identifier
+that was written before the dissolution is only a leftover that the dissolving device did not know
+of: a device in a group deletes it from the swarm, and every device ignores it.  One written after
+it is a **revival**: a device of that group that never heard of the dissolution, back after the
+tombstone expired, has pushed again.  A device in a group, forked or dropped as it may be, deletes
+it and publishes a new tombstone naming the group, and the device that pushed rejoins the group
+that was kept; in the time between, contacts may have encrypted to its group's account key, which
+cannot be helped.  A device outside any group is in no position to say which group is the
+account's: it takes a group that has pushed since as it would any other.
 
-Only a member in good standing acts on what it remembers.  A device outside any group is in no
-position to say which group is the account's: it hides a dissolved group's leftovers, but takes a
-group that has pushed since as it would any other.  And a device forgets what it remembers when it
-leaves its group -- above all when its group is dissolved, after which it remembers only what that
-tombstone named.  A dissolution is undone only by the user, by dissolving the group that made it,
-and a device that held on to its old dissolutions past that would dissolve the very group they
-chose.  For the same reason a device admitted to a group forgets any dissolution of that group it
-had heard of: joining it was the user's later choice.
+A remembered dissolution is never stale.  A device that sees a group again after a tombstone named
+it is always looking at a revival by devices that missed the tombstone, never at a group the user
+has chosen since, because a revived group and a live kept group cannot coexist.  A device of the
+dissolved group that comes back while the kept group is in the swarm finds its own group gone and
+another live, and is dropped, which pushes nothing; so the dissolved group can come back only into a
+swarm the kept group has lapsed from, and any member of the kept group that returns dissolves it
+again before anything else.
 
 ### Leaving a group
 

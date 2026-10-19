@@ -1734,9 +1734,11 @@ bool Devices::_record_group(const SwarmMessage& msg) {
     }
 
     // A dissolved group stays dissolved.  An older message of it is only a leftover the dissolving
-    // device did not know to delete; one written since is a device of it that never heard, back
-    // after the tombstone expired.  A member of a group tells it again.  A device outside one is in
-    // no position to decide what the account's group is, and takes it as it would any other.
+    // device did not know to delete.  One written since is a device of it that never heard, back
+    // after the tombstone expired, and never a group the user has chosen since: beside the kept
+    // group that device would have been dropped, so it can only have pushed into a swarm the kept
+    // group had lapsed from.  A device in a group tells it again, forked or dropped as it may be,
+    // since that decides nothing.  A device outside one takes it as it would any other group.
     if (auto dissolved = _dissolved_at(group)) {
         bool back = t > *dissolved;
         if (_member()) {
@@ -1965,9 +1967,7 @@ void Devices::receive_dissolution(std::span<const std::byte> data) {
 
     // The user of another device kept another group over this one.  Nothing of this group is any
     // use now, our id included: the way back is to ask to join the group that was kept, as a new
-    // device.  The dissolutions we remember go with it: they were made in our group's favour, or
-    // learned while in it, and the user has since chosen otherwise -- kept, one of them could undo
-    // the very group chosen.
+    // device.
     //
     // All of it in one commit with the groups it marks dissolved, so that no crash leaves this
     // device holding a group the tombstone named, or forgotten from it but not told it is
@@ -2930,14 +2930,11 @@ void Devices::_forget_group() {
     auto c = conn();
     // Its devices, ourselves included: a group started from these would carry them over as members,
     // and a group joined says who is in it.  Its account keys, which never carry into another group
-    // -- a group joined brings its own, and a group started mints a fresh one.
-    //
-    // And the dissolutions it remembers, which were decided while in it: the next group's are its
-    // own, and one decided for this group could undo a choice of group made since.
+    // -- a group joined brings its own, and a group started mints a fresh one.  Not the groups it
+    // has seen dissolved, which stay dissolved whatever group this device is in.
     c.prepared_exec("DELETE FROM devices");
     c.prepared_exec("DELETE FROM device_group_merged");
     c.prepared_exec("DELETE FROM device_account_keys");
-    c.prepared_exec("DELETE FROM device_dissolved_groups");
     core.globals.erase(group_id_key);
     core.globals.erase(read_at_key);
     core.globals.erase(displaced_key);
