@@ -4949,3 +4949,96 @@ TEST_CASE(
     TestHelper::deliver_device_message(*other, latest_tombstone(*net), in(10min), "T1");
     CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
 }
+
+TEST_CASE(
+        "Devices - asking another group while approved lets the approval go",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.applicant);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    TestHelper::deliver_device_message(
+            *l.applicant, other->devices.build_device_group_message().message, in(10min), "B0");
+
+    Asked first;
+    request_link(l, first);
+    auto request = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(first);
+    REQUIRE(first->has_value());
+    TestHelper::deliver_device_message(*l.core, request, (*first)->expires, "L1");
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    auto admission = l.core->devices.build_device_group_message().message;
+    TestHelper::deliver_device_message(*l.applicant, admission, in(10min), "G1");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Approved);
+
+    // The other group instead: a new request, with emoji of its own.
+    Asked second;
+    request_link(l.applicant, *TestHelper::group_id(*other), second);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(second);
+    REQUIRE(second->has_value());
+    CHECK((*second)->sas != (*first)->sas);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
+    CHECK_FALSE(l.applicant->devices.confirm_link(await));
+
+    // And the approval of the first is nothing now, even fetched again.
+    TestHelper::deliver_device_message(*l.applicant, admission, in(10min), "G1-again");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
+    CHECK_FALSE(l.applicant->devices.confirm_link(await));
+    CHECK(own_state(l.applicant) == device::State::Pending);
+}
+
+TEST_CASE(
+        "Devices - the rotation timer tries again when its fetch fails",
+        "[core][devices][rotation]") {
+    Linking l;
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    answer_upload(l.core, *net, true);
+    auto account = account_key(l.core);
+    auto device = device_key(l.core);
+
+    // To within a second of the earlier rotation, the timer re-armed from there by a fetch.
+    auto next = std::min(
+            *l.core->devices.next_account_rotation(), *l.core->devices.next_device_rotation());
+    ScopedClockOffset later{
+            std::chrono::duration_cast<std::chrono::seconds>(next - clock_now()) - 1s};
+    TestHelper::finish_fetch(*l.core);
+    REQUIRE(eventually(
+            *l.core, [&] { return std::ranges::any_of(net->sent_requests, is_device_fetch); }));
+
+    // The swarm out of reach: nothing rotated, and the timer set to try again by itself.
+    later.advance(2s);
+    REQUIRE(answer_fetch(l.core, *net, {}, false) == 1);
+    CHECK(account_key(l.core) == account);
+    CHECK(device_key(l.core) == device);
+    CHECK(TestHelper::rotation_timer_armed(*l.core));
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+
+    // Its retry, fired now rather than waited for, fetches again, and rotates after that fetch.
+    TestHelper::fire_rotation_timer(*l.core);
+    REQUIRE(eventually(
+            *l.core, [&] { return std::ranges::any_of(net->sent_requests, is_device_fetch); }));
+    REQUIRE(answer_fetch(l.core, *net) == 1);
+    CHECK((account_key(l.core) != account || device_key(l.core) != device));
+}
+
+TEST_CASE(
+        "Devices - two fetches of the same namespace asked at once are one request",
+        "[core][devices][fetch]") {
+    TempCore c;
+    auto* net = attach_mock_network(*c);
+    int done = 0;
+    for (int i = 0; i < 2; i++)
+        TestHelper::fetch(*c, {config::Namespace::Devices}, [&done](bool fetched) {
+            if (fetched)
+                done++;
+        });
+    TestHelper::drain(*c);
+    CHECK(std::ranges::count_if(net->sent_requests, is_device_fetch) == 1);
+
+    REQUIRE(answer_fetch(c, *net) == 1);
+    CHECK(done == 2);
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+}

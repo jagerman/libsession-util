@@ -739,6 +739,23 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         on_loop(core, [&] { core.devices.parse_device_messages({}, true); });
     }
 
+    // Whether the rotation timer will fire by itself, and firing it now: what it does once its
+    // interval is up, without waiting that out in real time.
+    static bool rotation_timer_armed(core::Core& core) {
+        return on_loop(core, [&] { return core.devices.jq().armed(core.devices._rotation_timer); });
+    }
+    static void fire_rotation_timer(core::Core& core) {
+        on_loop(core, [&] { core.devices.jq().wake(core.devices._rotation_timer); });
+    }
+
+    // Core's one-off fetch of `namespaces`, as Devices asks for one.
+    static void fetch(
+            core::Core& core,
+            std::vector<config::Namespace> namespaces,
+            std::function<void(bool)> done) {
+        on_loop(core, [&] { core._fetch(std::move(namespaces), std::move(done)); });
+    }
+
     // Returns the raw 32-byte seed for the account key identified by the given x25519 public key.
     static cleared_b32 account_key_seed(
             core::Devices& d, std::span<const std::byte, 32> x25519_pub) {
