@@ -133,7 +133,9 @@ namespace device {
         // Unique device id, in raw bytes.
         Id id;
 
-        // Device seqno.  Incremented on device key rotation and/or info updates.
+        // Device seqno, which goes up whenever what a device publishes for itself changes: its
+        // description, type, version or keys.  For this device, one more than the record the swarm
+        // holds for it when what it would publish differs from that, and that record's otherwise.
         int64_t seqno;
 
         // Timestamp of the most recent update.
@@ -173,10 +175,9 @@ namespace device {
         std::array<std::byte, 1184> pk_mlkem768;
 
         // Blake2b over this record as it was encoded, and the last term the merge compares.  Unset
-        // for a record that never came off the wire: our own, and a tombstone for a device we never
-        // knew.  A stored NULL makes the comparison NULL at equal state and seqno, so such a row
-        // cannot be displaced by an equal-ranked arrival -- which for our own row is the point,
-        // since only we author it.
+        // for a record that never came off the wire, such as a tombstone for a device we never
+        // knew: a stored NULL makes the comparison NULL at equal state and seqno, so such a row is
+        // not displaced by an equal-ranked arrival.
         std::optional<std::array<std::byte, 8>> digest;
 
         // Fields from a device running a newer libsession than ours, kept so that we republish them
@@ -474,6 +475,18 @@ class Devices final : detail::CoreComponent {
     // calls internally, since it is already there.  Each asserts it got there.
     std::pair<device::Info, bool> _device_info();
     void _update_info(const device::Info& info);
+
+    // What this device describes itself as, from its master copy (see `own_info_key`): every field
+    // but the id, seqno, timestamp, state and keys.
+    device::Info _described();
+
+    // Our own row in `devices`: what the swarm holds for us, as far as we know.  Never what we
+    // publish from, only what we publish against.
+    std::optional<device::Info> _held_record();
+
+    // The record we publish for ourselves: what we describe ourselves as, under our current keys.
+    // The held record itself if it already says that; otherwise one past its seqno, stamped now.
+    device::Info _own_record();
 
   public:
     // Returns the current device's random identifier, in hex.
@@ -801,10 +814,11 @@ class Devices final : detail::CoreComponent {
     size_t _forget_link_requests(std::span<const int> reqids);
 
   public:
-    // Updates this device's info locally to match the given info; if the current device is
-    // registered then this dirties the device config data, requiring a push.
+    // Sets what this device describes itself as -- type, description, version and `extra` -- which
+    // every record it publishes is built from, in this group or any it joins later.  If the
+    // device is registered, its group is owed a push carrying it.
     //
-    // The state and pk_* fields of the input value are ignored.
+    // The id, seqno, timestamp, state and pk_* fields of the input value are ignored.
     //
     // Filling these in is the application's job -- libsession establishes the group with them
     // blank -- and an application is on its own thread when it does.  The handler form takes the
@@ -938,7 +952,7 @@ class Devices final : detail::CoreComponent {
 
     struct DeviceGroupPush {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
-        int64_t seqno;                   // this device's seqno at the moment the message was built
+        device::Info own;                // our record as this message carries it
 
         // What this message carries that was owed, so that confirming it clears exactly that and no
         // more.  A device kicked, or a key minted, while the push was in flight is not in these and
@@ -959,9 +973,10 @@ class Devices final : detail::CoreComponent {
     // nothing to say about it, and pushing anyway would announce a group of one that every other
     // device would merge in as authoritative.
     //
-    // `seqno` comes back rather than being read again afterwards because the message is built from
-    // a snapshot: pass it to mark_device_group_pushed() once the swarm confirms the store, so that
-    // a change made while the push was in flight stays dirty.
+    // `own` comes back rather than being read again afterwards because the message is built from a
+    // snapshot: pass the push to mark_device_group_pushed() once the swarm confirms the store, so
+    // that it is what we take the swarm to hold for us, and a change made while the push was in
+    // flight stays owed.
     DeviceGroupPush build_device_group_message();
 
     // Builds the signed account public key message for upload to namespace -21.  The message is a
@@ -982,7 +997,7 @@ class Devices final : detail::CoreComponent {
     //
     // device_group is true when this device is registered, neither displaced nor forked (see
     // device::Membership), AND any of the following hold:
-    //   - our own device info has changed since the last confirmed device group push
+    //   - what we would publish for ourselves differs from what the swarm holds for us
     //   - any device has a state transition (registered/removed) that needs broadcasting
     //   - any account key seed has not yet been distributed via a confirmed push
     //
@@ -990,9 +1005,9 @@ class Devices final : detail::CoreComponent {
     // on the swarm (i.e. neither we nor another device has pushed it and we've received it back).
     NeedsPush needs_push();
 
-    // Records that a built device group message reached the swarm: stores its seqno and hash
-    // against this device's row, and clears what `push` said it carried.  `hash` is what the next
-    // push names to delete this one.
+    // Records that a built device group message reached the swarm: takes the record of ours it
+    // carried as what the swarm holds for us, stores its hash, and clears what `push` said it
+    // carried.  `hash` is what the next push names to delete this one.
     void mark_device_group_pushed(const DeviceGroupPush& push, std::string hash);
 
     // Builds and uploads the device group message, if one is owed and this device is registered.

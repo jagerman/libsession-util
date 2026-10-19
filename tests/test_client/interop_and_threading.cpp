@@ -80,9 +80,13 @@ TEST_CASE("Client: device events arrive through the dispatcher", "[client][callb
     TempClient c{std::move(cbs)};
     c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
 
+    // Renamed, and the group's record of this device renamed with it once a push carrying it is
+    // stored -- reported at the next fetch.
     core::device::Info info{};
     info.description = "renamed";
     c->core.devices.update_info(info, await);
+    c->core.devices.mark_device_group_pushed(c->core.devices.build_device_group_message(), "h");
+    TestHelper::finish_fetch(c->core);
     sync(*c);
 
     CHECK(events.replaced.empty());

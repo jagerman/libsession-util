@@ -58,7 +58,10 @@ handler form. Failures carry an `Error` whose `code` is one of `core::err::*`.
 
 At startup, and whenever the user changes them, describe this device with `update_info`: its
 `type` (e.g. `device::Type::Session_CLI`), a short `description`, and its `version`. That is what
-other devices show for it.
+other devices show for it. It is this device's own and kept across joining, leaving and starting
+groups, so there is no need to set it again after any of those. `device_info()` reads back what it
+publishes; the device list (`devices()`) shows what the group holds for it, which catches up once a
+push carrying a change has reached the swarm.
 
 ## Startup: membership drives everything
 

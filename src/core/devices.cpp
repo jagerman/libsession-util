@@ -67,6 +67,12 @@ static auto cat = log::Cat("core.dev");
 
 static constexpr auto dev_key = "device_unique_id"sv;
 
+// What this device describes itself as -- description, type, version, and whatever later versions
+// add -- encoded as the tail of a record is (see `encode_described`).  The master copy: every
+// record of ours is built from it, and nothing the group holds is ever copied back into it, so
+// leaving a group and forgetting its devices loses none of it.
+static constexpr auto own_info_key = "devices_own_info"sv;
+
 // Set by Globals when it *generates* an account, and cleared once the device group exists.  A
 // restored account never sets it: its group, if it has one, belongs to devices we have not met yet.
 static constexpr auto establish_key = "devices_establish_group"sv;
@@ -139,19 +145,14 @@ void Devices::establish_group() {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    // `broadcast_needed` rather than a bumped seqno is what marks this for pushing: seqno tracks
-    // changes to our *info*, and nothing about our info has changed -- we have gone from being no
-    // device at all to being a registered one, which is a state transition.
-    //
-    // The descriptive fields are left empty deliberately.  An application sets them through
-    // update_info() whenever it gets around to it, and that bumps the seqno normally; a group whose
-    // sole device has no description is honest about what we know, where inventing one would not
-    // be.
+    // Registered, but at seqno 0: the swarm holds no record of ours yet, so the first push carries
+    // seqno 1, built from what we describe ourselves as (see `_own_record`).  `broadcast_needed`
+    // marks the state transition: from no device at all to a registered one.
     c.prepared_exec(
             R"(INSERT INTO devices
                 (unique_id, state, seqno, timestamp, device_type, description, version,
                  pubkey_mlkem768, pubkey_x25519, broadcast_needed)
-               VALUES (?1, ?2, 1, ?3, '', '', 0, ?4, ?5, 1)
+               VALUES (?1, ?2, 0, ?3, '', '', 0, ?4, ?5, 1)
                ON CONFLICT(unique_id) DO UPDATE SET
                    state = ?2,
                    broadcast_needed = 1,
@@ -230,25 +231,12 @@ Devices::DeviceKeys Devices::rotate_device_keys() {
     // Call this mainly to ensure that we can successfully produce keys from this seed.
     auto keys = keys_from_seed<DeviceKeys>(seed);
 
-    auto c = conn();
-    SQLite::Transaction tx{c.sql};
-
-    auto now = epoch_seconds(clock_now_s());
-    c.prepared_exec("INSERT INTO device_privkeys (created, seed) VALUES (?, ?)", now, seed);
-
-    // Update our own device row with the new pubkeys and bump seqno so the change gets broadcast.
-    // If no row exists yet, this is a no-op; the new pubkeys will be read from the active device
-    // keys when the row is first created.
-    c.prepared_exec(
-            "UPDATE devices"
-            " SET pubkey_mlkem768 = ?, pubkey_x25519 = ?, seqno = seqno + 1, timestamp = ?"
-            " WHERE unique_id = ?",
-            keys.mlkem768_pub,
-            keys.x25519_pub,
-            now,
-            self_id);
-
-    tx.commit();
+    // Nothing else to update: our record is built from the current keys when next it is published
+    // (see `_own_record`).
+    conn().prepared_exec(
+            "INSERT INTO device_privkeys (created, seed) VALUES (?, ?)",
+            epoch_seconds(clock_now_s()),
+            seed);
 
     log::info(cat, "New rotating device keys generated: {}", keys);
 
@@ -538,18 +526,6 @@ std::pair<device::Info, bool> Devices::device_info(await_t) {
     return jq().call_get([this] { return _device_info(); });
 }
 
-std::pair<device::Info, bool> Devices::_device_info() {
-    assert(on_loop());
-    auto devs = devices(true, true, true, self_id);
-    if (auto it = devs.find(self_id); it != devs.end()) {
-        // Read the state out before the move: the elements of a braced-init-list are evaluated in
-        // order, so testing `it->second` in the second element is testing a moved-from Info.
-        bool registered = it->second.state == device::State::Registered;
-        return {std::move(it->second), registered};
-    }
-    return {device::Info{.id = self_id}, false};
-}
-
 bool device::Info::same_user_fields(const Info& other) const {
     auto fields = [](const Info& i) {
         return std::tie(i.type, i.other_device, i.description, i.version, i.extra);
@@ -563,61 +539,6 @@ void Devices::update_info(device::Info info, result_function<> cb) {
 
 void Devices::update_info(const device::Info& info, await_t) {
     jq().call_get([this, &info] { _update_info(info); });
-}
-
-void Devices::_update_info(const device::Info& info) {
-    assert(on_loop());
-    auto [current, is_registered] = _device_info();
-
-    // Early-exit if nothing changed: no seqno bump, no push triggered.
-    // current.seqno == 0 means no row exists yet (default-init sentinel; real rows have seqno >=
-    // 1).
-    if (current.seqno > 0 && current.same_user_fields(info))
-        return;
-
-    auto keys = active_device_keys();
-    auto& front_key = keys.front();
-    auto now = clock_now_s();
-    auto ver = info.version[0] * 1000000 + info.version[1] * 1000 + info.version[2];
-
-    auto c = conn();
-    SQLite::Transaction tx{c.sql};
-
-    auto dev_id = c.prepared_get<int64_t>(
-            R"(INSERT INTO devices
-                (unique_id, state, seqno, timestamp, device_type, description, version,
-                 pubkey_mlkem768, pubkey_x25519)
-               VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(unique_id) DO UPDATE SET
-                   seqno = seqno + 1,
-                   timestamp = excluded.timestamp,
-                   device_type = excluded.device_type,
-                   description = excluded.description,
-                   version = excluded.version
-               RETURNING id)",
-            self_id,
-            static_cast<int>(device::State::Unregistered),
-            now.time_since_epoch().count(),
-            info.encoded_type(),
-            info.description,
-            ver,
-            std::as_bytes(std::span{front_key.mlkem768_pub}),
-            std::as_bytes(std::span{front_key.x25519_pub}));
-
-    c.prepared_exec("DELETE FROM device_unknown WHERE device = ?", dev_id);
-    for (const auto& [key, val] : info.extra) {
-        auto encoded = std::visit([](const auto& v) { return oxenc::bt_serialize(v); }, val);
-        c.prepared_exec(
-                "INSERT INTO device_unknown (device, key, bt_value) VALUES (?, ?, ?)",
-                dev_id,
-                key,
-                to_span<std::byte>(encoded));
-    }
-
-    tx.commit();
-
-    _devices_changed = true;
-    _flush_events();
 }
 
 namespace {
@@ -680,15 +601,14 @@ namespace {
         out.append(key, value);
     }
 
-    // Encodes the fields of a device::Info into an already-opened bt_dict_producer (passed as
-    // rvalue to allow callers to pass sub-producers directly from append_dict()).
-    void encode_device_info(oxenc::bt_dict_producer&& devout, const device::Info& info) {
-        auto xit = info.extra.cbegin();
-        auto xend = info.extra.cend();
-        write_next(devout, "#", info.seqno, xit, xend);
-        write_next(devout, "@", info.timestamp.time_since_epoch().count(), xit, xend);
-        write_next(devout, "M", info.pk_mlkem768, xit, xend);
-        write_next(devout, "X", info.pk_x25519, xit, xend);
+    // What a device describes itself by -- its description, type and version, and whatever later
+    // versions add (the rest of `info.extra`, from `xit` on) -- which is the tail of its record,
+    // and the whole of this device's own copy of what it publishes (see `own_info_key`).
+    void encode_described(
+            oxenc::bt_dict_producer& devout,
+            const device::Info& info,
+            oxenc::bt_dict::const_iterator& xit,
+            oxenc::bt_dict::const_iterator xend) {
         write_next(devout, "d", info.description, xit, xend);
         write_extras(devout, "t", xit, xend);
         if (auto t = info.encoded_type(); !t.empty())
@@ -700,6 +620,18 @@ namespace {
             devout.append("v", ver);
         for (; xit != xend; ++xit)
             devout.append_bt(xit->first, xit->second);
+    }
+
+    // Encodes the fields of a device::Info into an already-opened bt_dict_producer (passed as
+    // rvalue to allow callers to pass sub-producers directly from append_dict()).
+    void encode_device_info(oxenc::bt_dict_producer&& devout, const device::Info& info) {
+        auto xit = info.extra.cbegin();
+        auto xend = info.extra.cend();
+        write_next(devout, "#", info.seqno, xit, xend);
+        write_next(devout, "@", info.timestamp.time_since_epoch().count(), xit, xend);
+        write_next(devout, "M", info.pk_mlkem768, xit, xend);
+        write_next(devout, "X", info.pk_x25519, xit, xend);
+        encode_described(devout, info, xit, xend);
     }
 
     bool tombstoned(const device::Info& info) {
@@ -811,22 +743,8 @@ namespace {
             consume_extra(btdc, extra);
     }
 
-    void decode_one(device::Info& info, oxenc::bt_dict_consumer dev, device::State state) {
-        info.state = state;
-        read_extras(dev, "#", info.extra);
-        info.seqno = dev.require<int64_t>("#");
-
-        read_extras(dev, "@", info.extra);
-        info.timestamp = std::chrono::sys_seconds{std::chrono::seconds{dev.require<int64_t>("@")}};
-
-        read_extras(dev, "M", info.extra);
-        auto M = dev.require_span<std::byte, mlkem768::PUBLICKEYBYTES>("M");
-        std::memcpy(info.pk_mlkem768.data(), M.data(), M.size());
-
-        read_extras(dev, "X", info.extra);
-        auto X = dev.require_span<std::byte, 32>("X");
-        std::memcpy(info.pk_x25519.data(), X.data(), X.size());
-
+    // The inverse of `encode_described`.
+    void decode_described(device::Info& info, oxenc::bt_dict_consumer& dev) {
         read_extras(dev, "d", info.extra);
         info.description = dev.maybe<std::string_view>("d").value_or(""sv);
 
@@ -843,6 +761,25 @@ namespace {
 
         while (!dev.is_finished())
             consume_extra(dev, info.extra);
+    }
+
+    void decode_one(device::Info& info, oxenc::bt_dict_consumer dev, device::State state) {
+        info.state = state;
+        read_extras(dev, "#", info.extra);
+        info.seqno = dev.require<int64_t>("#");
+
+        read_extras(dev, "@", info.extra);
+        info.timestamp = std::chrono::sys_seconds{std::chrono::seconds{dev.require<int64_t>("@")}};
+
+        read_extras(dev, "M", info.extra);
+        auto M = dev.require_span<std::byte, mlkem768::PUBLICKEYBYTES>("M");
+        std::memcpy(info.pk_mlkem768.data(), M.data(), M.size());
+
+        read_extras(dev, "X", info.extra);
+        auto X = dev.require_span<std::byte, 32>("X");
+        std::memcpy(info.pk_x25519.data(), X.data(), X.size());
+
+        decode_described(info, dev);
     }
 
     // The device record a stored link request asks to have admitted.  Already verified when the
@@ -1074,6 +1011,63 @@ std::array<std::string_view, 21> device::GroupId::sas() const {
     std::array<std::byte, 16> seed;
     hash::blake2b_pers(seed, PERS_GROUP_SAS, value);
     return sas_from_seed(seed);
+}
+
+device::Info Devices::_described() {
+    device::Info info{};
+    if (auto blob = core.globals.get_blob(own_info_key)) {
+        oxenc::bt_dict_consumer in{std::span<const std::byte>{*blob}};
+        decode_described(info, in);
+    }
+    return info;
+}
+
+std::optional<device::Info> Devices::_held_record() {
+    auto held = devices(true, true, true, self_id);
+    if (held.empty())
+        return std::nullopt;
+    return std::move(held.begin()->second);
+}
+
+device::Info Devices::_own_record() {
+    auto own = _described();
+    own.id = self_id;
+    auto keys = active_device_keys();
+    own.pk_x25519 = keys.front().x25519_pub;
+    own.pk_mlkem768 = keys.front().mlkem768_pub;
+
+    auto held = _held_record();
+    own.state = held ? held->state : device::State::Unregistered;
+    own.kicked = held ? held->kicked : std::nullopt;
+
+    // Seqno 0 holds nothing: a group just established, whose swarm has no record of ours yet.
+    if (held && held->seqno > 0 && held->same_user_fields(own) &&
+        held->pk_x25519 == own.pk_x25519 && held->pk_mlkem768 == own.pk_mlkem768)
+        return std::move(*held);
+
+    own.seqno = (held ? held->seqno : 0) + 1;
+    own.timestamp = clock_now_s();
+    own.digest = record_digest(own);
+    return own;
+}
+
+std::pair<device::Info, bool> Devices::_device_info() {
+    assert(on_loop());
+    auto own = _own_record();
+    bool registered = own.state == device::State::Registered;
+    return {std::move(own), registered};
+}
+
+void Devices::_update_info(const device::Info& info) {
+    assert(on_loop());
+    if (_described().same_user_fields(info))
+        return;
+
+    oxenc::bt_dict_producer out;
+    auto xit = info.extra.cbegin();
+    encode_described(out, info, xit, info.extra.cend());
+    auto encoded = std::move(out).str();
+    core.globals.set(own_info_key, to_span<std::byte>(encoded));
 }
 
 std::optional<device::GroupId> Devices::_group_id() {
@@ -1679,6 +1673,11 @@ bool Devices::_leave_group() {
                      .data = encrypt_device_data(devices(true, true, true)),
                      .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(
                              DEVICE_GROUP_TTL)});
+        } else {
+            // Nobody left in it, so not a group to see in the swarm, beside one joined next.
+            auto ours = std::span<const std::byte>{_group_id()->value};
+            c.prepared_exec("DELETE FROM device_groups WHERE group_id = ?", ours);
+            c.prepared_exec("DELETE FROM device_group_messages WHERE group_id = ?", ours);
         }
         if (core.network())
             core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
@@ -2139,26 +2138,15 @@ Devices::LinkRequestResult Devices::_build_link_request(
     auto [info, is_registered] = _device_info();
     auto c = conn();
 
-    // After every request before it, even within the same second: the timestamp is what tells an
+    // A new record even if nothing it says has changed, since it is stamped anew: after every
+    // request before it, even within the same second, because the timestamp is what tells an
     // admission which of our requests it accepted.
-    info.id = self_id;
-    info.seqno++;
+    auto held = _held_record();
+    info.seqno = (held ? held->seqno : 0) + 1;
     info.timestamp = std::max(
             clock_now_s(),
             from_epoch_s(c.prepared_get<int64_t>(
                     "SELECT IFNULL(MAX(timestamp) + 1, 0) FROM device_own_requests")));
-
-    // Always use the current active device keys for the pubkeys in the link request, regardless
-    // of what is stored in the DB, as the DB may lag a key rotation.
-    auto keys = active_device_keys();
-    std::memcpy(
-            info.pk_x25519.data(),
-            reinterpret_cast<const std::byte*>(keys.front().x25519_pub.data()),
-            info.pk_x25519.size());
-    std::memcpy(
-            info.pk_mlkem768.data(),
-            reinterpret_cast<const std::byte*>(keys.front().mlkem768_pub.data()),
-            info.pk_mlkem768.size());
 
     // Our own row moves to Pending with the updated seqno, timestamp, and pubkeys: Pending is what
     // says we are waiting.
@@ -3263,33 +3251,35 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
 
 static const std::string NEEDS_PUSH_SQL =
         "SELECT"
-        // device_group: we are registered AND (own seqno dirty OR broadcast needed OR
-        // undistributed account key)
-        " CASE WHEN EXISTS("
-        "   SELECT 1 FROM devices WHERE unique_id = ? AND state = {0}"
-        " ) THEN ("
-        "   (SELECT pushed_seqno IS NULL OR seqno > pushed_seqno"
-        "    FROM devices WHERE unique_id = ?)"
-        "   OR EXISTS(SELECT 1 FROM devices WHERE broadcast_needed)"
-        "   OR EXISTS(SELECT 1 FROM device_account_keys WHERE NOT distributed)"
-        " ) ELSE 0 END,"
+        // registered
+        " EXISTS(SELECT 1 FROM devices WHERE unique_id = ? AND state = {0}),"
+        // something other than our own record owed: a state transition, or an undistributed key
+        " EXISTS(SELECT 1 FROM devices WHERE broadcast_needed)"
+        "   OR EXISTS(SELECT 1 FROM device_account_keys WHERE NOT distributed),"
         // account_pubkey: the current active account key has not yet been confirmed on the swarm
         " EXISTS(SELECT 1 FROM device_account_keys WHERE rotated IS NULL AND NOT published)"_format(
                 static_cast<int>(device::State::Registered));
 
 Devices::NeedsPush Devices::needs_push() {
     auto c = conn();
-    auto [dg, ap] = c.prepared_get<int, int>(NEEDS_PUSH_SQL, self_id, self_id);
+    auto [registered, owed, ap] = c.prepared_get<int, int, int>(NEEDS_PUSH_SQL, self_id);
     // Not for a group that has moved on without us: we cannot read what it holds now, and would
     // push a snapshot of what it held before.  Nor while another group is beside ours: pushing
     // would carry on as though the user had chosen this one, which only they can do.
-    return {.device_group = bool(dg) && !_displaced() && !_forked(), .account_pubkey = bool(ap)};
+    bool dg = registered && !_displaced() && !_forked() &&
+              (owed || _own_record().seqno != _held_record()->seqno);
+    return {.device_group = dg, .account_pubkey = bool(ap)};
 }
 
 void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
-    c.prepared_exec("UPDATE devices SET pushed_seqno = ? WHERE unique_id = ?", push.seqno, self_id);
+
+    // What the swarm now holds for us.  Rank-guarded like any merge, so a record that has
+    // overtaken it meanwhile -- a forged one, say -- stays, and our next push overtakes that in
+    // turn.
+    if (upsert_device_info(c, push.own))
+        _devices_changed = true;
 
     // Our own group, seen as it now is in the swarm -- its link key included -- without waiting for
     // the next fetch to bring the message back.
@@ -3423,17 +3413,17 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_device_rotati
 }
 
 Devices::DeviceGroupPush Devices::build_device_group_message() {
-    // One query for the whole group, so the seqno we report is the one the payload was built from.
-    // Reading our own row separately would let an update_info() land between the two and have the
-    // push confirm a seqno that is not what went out.
     auto devs = devices(true, true, true);
 
     auto self = devs.find(self_id);
     if (self == devs.end() || self->second.state != device::State::Registered)
         throw std::logic_error{"Cannot build device group message: this device is not registered"};
 
+    // Ours as we publish it, not as the group holds it: the group's copy only says what reached
+    // the swarm, and is never what we take ours from.
     DeviceGroupPush push;
-    push.seqno = self->second.seqno;
+    push.own = _own_record();
+    self->second = push.own;
 
     // Read in the same breath as the payload, so that what the confirm clears is what the message
     // actually contains rather than whatever is owed by the time the swarm answers.

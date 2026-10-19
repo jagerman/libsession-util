@@ -101,6 +101,15 @@ names used here are not the actual key names that will be in the encoded data):
   data.  Other devices will ignore any update that is not larger than the most recent value they
   know of.
 
+  A device keeps no counter of its own for it.  What it describes itself as -- description, type,
+  version and any later fields -- it keeps apart from the group, and builds every record of its own
+  from that and its current device keys.  The group's copy of its record only says what the swarm
+  holds for it: when what the device would publish differs from that, its next record is one past
+  the held record's `seq`, and otherwise it is the held record.  Nothing in the group's copy flows
+  back into what the device publishes, so a record written for it by anyone else is merged like any
+  other and simply overtaken by its next push; and a device that has left a group starts again at
+  1 in the next, nothing being held for it there.
+
 - `timestamp` is the unix timestamp when the device last updated its data.  Its primary purpose is
   to allow other devices a (very rough) indicator of when a device was last active.  Note that
   clients typically only update this when rotating keys, and so devices should only treat this as a

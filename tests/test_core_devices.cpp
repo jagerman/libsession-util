@@ -61,8 +61,9 @@ TEST_CASE("Devices - initial state", "[core][devices]") {
 
     SECTION("device_info defaults") {
         auto [info, is_registered] = c->devices.device_info(await);
-        // seqno == 0 is the sentinel meaning no row exists yet
-        CHECK(info.seqno == 0);
+        // Nothing held for it anywhere, so what it would publish first.
+        CHECK(info.seqno == 1);
+        CHECK(info.description.empty());
         CHECK_FALSE(is_registered);
     }
 
@@ -80,7 +81,7 @@ TEST_CASE("Devices - initial state", "[core][devices]") {
 TEST_CASE("Devices - update_info and same_user_fields", "[core][devices]") {
     auto c = restored_core();
 
-    SECTION("update_info persists fields and sets seqno=1") {
+    SECTION("update_info persists fields") {
         device::Info info{};
         info.type = device::Type::Session_iOS;
         info.description = "test phone";
@@ -95,72 +96,22 @@ TEST_CASE("Devices - update_info and same_user_fields", "[core][devices]") {
         CHECK(got.version == std::array<int, 3>{1, 2, 3});
         CHECK(got.state == device::State::Unregistered);
         CHECK_FALSE(is_registered);
+
+        // Across a restart too: it is this device's own, not anything a group holds.
+        auto path = c.path;
+        c.core.reset();
+        c.core = std::make_unique<core::Core>(path);
+        CHECK(c->devices.device_info(await).first.description == "test phone");
     }
 
-    SECTION("identical update does not bump seqno") {
-        device::Info info{};
-        info.type = device::Type::Session_Desktop;
-        info.description = "desktop";
-        info.version = {0, 1, 0};
-
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-
-        c->devices.update_info(info, await);  // identical — should not bump
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-    }
-
-    SECTION("changed description bumps seqno") {
-        device::Info info{};
-        info.description = "first";
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-
-        info.description = "second";
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 2);
-    }
-
-    SECTION("changed type bumps seqno") {
-        device::Info info{};
-        info.type = device::Type::Session_Android;
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-
-        info.type = device::Type::Session_Desktop;
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 2);
-    }
-
-    SECTION("changed version bumps seqno") {
-        device::Info info{};
-        info.version = {1, 0, 0};
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-
-        info.version = {2, 0, 0};
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 2);
-    }
-
-    SECTION("extra fields round-trip and participate in comparison") {
+    SECTION("extra fields round-trip") {
         device::Info info{};
         info.extra["custom_key"] = std::string{"hello"};
         c->devices.update_info(info, await);
 
         auto [got, _] = c->devices.device_info(await);
-        CHECK(got.seqno == 1);
         REQUIRE(got.extra.count("custom_key"));
         CHECK(std::get<std::string>(got.extra.at("custom_key")) == "hello");
-
-        // Same extra — no bump
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 1);
-
-        // Changed extra — bump
-        info.extra["custom_key"] = std::string{"world"};
-        c->devices.update_info(info, await);
-        CHECK(c->devices.device_info(await).first.seqno == 2);
     }
 
     SECTION("same_user_fields ignores state/seqno/pk_*") {
@@ -182,15 +133,88 @@ TEST_CASE("Devices - update_info and same_user_fields", "[core][devices]") {
         CHECK_FALSE(a.same_user_fields(b));
     }
 
-    SECTION("update_info device appears in devices(include_unregistered=true)") {
+    SECTION("a device outside a group describing itself puts nothing in the group's list") {
         device::Info info{};
         info.description = "my device";
         c->devices.update_info(info, await);
 
-        auto devs = c->devices.devices(false, false, true);
-        CHECK(devs.size() == 1);
-        CHECK(devs.begin()->second.description == "my device");
+        CHECK(c->devices.devices(true, true, true).empty());
+        CHECK(c->devices.device_info(await).first.description == "my device");
     }
+}
+
+TEST_CASE(
+        "Devices - this device's seqno counts on from what the swarm holds for it",
+        "[core][devices]") {
+    TempCore c;
+    auto seqno = [&] { return c->devices.device_info(await).first.seqno; };
+    auto owed = [&] { return c->devices.needs_push().device_group; };
+    auto push = [&] {
+        c->devices.mark_device_group_pushed(c->devices.build_device_group_message(), "h");
+    };
+
+    // Nothing held yet, so the first record is 1 however often it is described before it goes out.
+    device::Info info{};
+    info.description = "first";
+    c->devices.update_info(info, await);
+    CHECK(seqno() == 1);
+    info.description = "second";
+    c->devices.update_info(info, await);
+    CHECK(seqno() == 1);
+    push();
+    CHECK(seqno() == 1);
+    CHECK_FALSE(owed());
+
+    // Each change makes the next record one past what is held, once however often it is made, and
+    // a change back to what is held is no change at all.
+    int64_t n = 1;
+    auto changed = [&](auto&& change) {
+        change();
+        CHECK(seqno() == n + 1);
+        CHECK(owed());
+        change();
+        CHECK(seqno() == n + 1);
+        push();
+        CHECK(seqno() == ++n);
+        CHECK_FALSE(owed());
+    };
+    changed([&] {
+        info.description = "third";
+        c->devices.update_info(info, await);
+    });
+    changed([&] {
+        info.type = device::Type::Session_Desktop;
+        c->devices.update_info(info, await);
+    });
+    changed([&] {
+        info.version = {2, 0, 0};
+        c->devices.update_info(info, await);
+    });
+    changed([&] {
+        info.extra["custom_key"] = std::string{"hello"};
+        c->devices.update_info(info, await);
+    });
+    info.description = "fourth";
+    c->devices.update_info(info, await);
+    CHECK(seqno() == n + 1);
+    info.description = "third";
+    c->devices.update_info(info, await);
+    CHECK(seqno() == n);
+    CHECK_FALSE(owed());
+
+    // New keys are a new record too.
+    c->devices.rotate_device_keys();
+    CHECK(seqno() == n + 1);
+    CHECK(owed());
+    push();
+    CHECK(seqno() == n + 1);
+
+    // And what the group holds for it is what it said.
+    auto self = c->devices.device_info(await).first;
+    auto held = c->devices.devices(true, false, false, self.id).at(self.id);
+    CHECK(held.description == "third");
+    CHECK(held.type == device::Type::Session_Desktop);
+    CHECK(held.pk_x25519 == c->devices.active_device_keys().front().x25519_pub);
 }
 
 TEST_CASE("Devices - device keys", "[core][devices]") {
@@ -2603,12 +2627,13 @@ TEST_CASE(
 
     REQUIRE(c->devices.leave_group(await));
 
-    // Nobody was left in it, so it is deleted rather than told anything.
+    // Nobody was left in it, so it is deleted rather than told anything, and is no group to see.
     auto sent = pushes(*net);
     REQUIRE(sent.size() == 1);
     auto [stored, deleted] = pushed(*sent[0]);
     CHECK(stored.empty());
     CHECK(deleted == nlohmann::json::array({"B1"}));
+    CHECK(c->devices.membership(await).others.empty());
 }
 
 TEST_CASE(
@@ -2648,6 +2673,111 @@ TEST_CASE(
     CHECK(pushes(*net).empty());
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+}
+
+namespace {
+// The record of device `id` that a group message carries, as `reader` -- one of its recipients --
+// reads it.
+device::Info record_in(Devices& reader, std::span<const std::byte> message, const device::Id& id) {
+    auto plaintext = TestHelper::decrypt_device_data(reader, message);
+    oxenc::bt_dict_consumer btdc{to_string_view(plaintext)};
+    REQUIRE(btdc.skip_until("D"));
+    auto devs = btdc.consume_dict_consumer();
+    REQUIRE(devs.skip_until(std::string_view{reinterpret_cast<const char*>(id.data()), id.size()}));
+    auto rec = devs.consume_dict_consumer();
+    device::Info info{};
+    info.seqno = rec.require<int64_t>("#");
+    rec.skip_until("X");
+    auto X = rec.consume_span<std::byte, 32>();
+    std::ranges::copy(X, info.pk_x25519.begin());
+    info.description = rec.maybe<std::string_view>("d").value_or(""sv);
+    return info;
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - what a device says of itself goes with it from group to group",
+        "[core][devices][membership]") {
+    Linking l;
+    device::Info described{};
+    described.description = "Alice's tablet";
+    described.type = device::Type::Session_Android;
+    described.version = {1, 2, 3};
+    l.applicant->devices.update_info(described, await);
+    TestHelper::finish_fetch(*l.applicant);
+
+    // A group of its own: the first record of it carries the description.
+    l.applicant->devices.start_group(await);
+    auto own = record_in(
+            l.applicant->devices,
+            l.applicant->devices.build_device_group_message().message,
+            l.applicant_id());
+    CHECK(own.description == "Alice's tablet");
+    CHECK(own.seqno == 1);
+
+    // The account's other group, which the user chooses: leave this one, then join that.
+    l.show_group();
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Forked);
+    REQUIRE(l.applicant->devices.leave_group(await));
+    l.ask(in(10min), "L1");
+    REQUIRE(!l.events.added.empty());
+    CHECK(l.events.added.back().device.description == "Alice's tablet");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    auto held = l.state_of_applicant();
+    CHECK(held.description == "Alice's tablet");
+    CHECK(held.type == device::Type::Session_Android);
+    CHECK(held.version == std::array<int, 3>{1, 2, 3});
+}
+
+TEST_CASE(
+        "Devices - a forged record of this device's own is overtaken by its next push",
+        "[core][devices]") {
+    Linking l;
+    device::Info described{};
+    described.description = "the real one";
+    l.applicant->devices.update_info(described, await);
+    l.admit();
+    auto id = l.applicant_id();
+    auto [core_self, _] = l.core->devices.device_info(await);
+    auto mine = [&] { return l.applicant->devices.devices(true, false, false, id).at(id); };
+    auto held = mine();
+
+    // A seed holder who knows this device's keys writes a record for it at the seqno the group
+    // holds, saying something else.  Whichever of two such records has the higher digest wins the
+    // merge; the held one's is made the lowest there is, so that the forged one is the winner.
+    TestHelper::on_loop(*l.applicant, [&] {
+        return l.applicant->database().conn().prepared_exec(
+                "UPDATE devices SET digest = zeroblob(8) WHERE unique_id = ?", id);
+    });
+    auto forged = held;
+    forged.description = "forged";
+    TestHelper::receive_device_group_message(
+            l.applicant->devices,
+            TestHelper::encrypt_device_data(
+                    l.core->devices, {{core_self.id, core_self}, {id, forged}}));
+    REQUIRE(mine().description == "forged");
+    CHECK(mine().seqno == held.seqno);
+
+    // Merged like anyone's, but nothing of it goes into what this device publishes: its next push
+    // carries its own record, past the forged one.
+    CHECK(l.applicant->devices.needs_push().device_group);
+    auto push = l.applicant->devices.build_device_group_message();
+    auto pushed = record_in(l.core->devices, push.message, id);
+    CHECK(pushed.description == "the real one");
+    CHECK(pushed.seqno == held.seqno + 1);
+    CHECK(pushed.pk_x25519 == l.applicant->devices.active_device_keys().front().x25519_pub);
+
+    // Which the group takes, and so does this device once the swarm has it.
+    TestHelper::deliver_device_message(*l.core, push.message, in(10min), "G2");
+    CHECK(l.state_of_applicant().description == "the real one");
+    l.applicant->devices.mark_device_group_pushed(push, "G2");
+    CHECK(mine().description == "the real one");
+    CHECK(mine().seqno == held.seqno + 1);
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
 }
 
 TEST_CASE(

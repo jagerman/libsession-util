@@ -7,7 +7,6 @@ CREATE TABLE devices_new (
     unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 16),
     state INTEGER NOT NULL CHECK(state >= 0 AND state <= 4),
     seqno INTEGER NOT NULL DEFAULT 1,
-    pushed_seqno INTEGER,
     broadcast_needed INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),
@@ -44,13 +43,16 @@ CREATE TABLE device_link_requests_new (
 --
 -- A device id keeps its first 16 bytes, which are as random as the rest of it: our own, here and
 -- in `globals`, and those of devices that asked to join.
+--
+-- What this device describes itself as now lives in `globals` instead, and is not carried over
+-- from its row: an application sets it at every start, through `update_info`.
 INSERT INTO devices_new (
-        id, unique_id, state, seqno, pushed_seqno, broadcast_needed, timestamp, kicked_timestamp,
-        device_type, description, version, pubkey_mlkem768, pubkey_x25519)
+        id, unique_id, state, seqno, broadcast_needed, timestamp, kicked_timestamp, device_type,
+        description, version, pubkey_mlkem768, pubkey_x25519)
     SELECT
         id, substr(unique_id, 1, 16), CASE state WHEN 3 THEN 4 ELSE state END, seqno,
-        pushed_seqno, broadcast_needed, timestamp, kicked_timestamp, device_type, description,
-        version, pubkey_mlkem768, pubkey_x25519
+        broadcast_needed, timestamp, kicked_timestamp, device_type, description, version,
+        pubkey_mlkem768, pubkey_x25519
     FROM devices;
 
 UPDATE globals SET value = substr(value, 1, 16) WHERE key = 'device_unique_id';

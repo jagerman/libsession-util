@@ -14,8 +14,9 @@ CREATE TABLE devices (
     -- most authoritative because merging compares (state, seqno) as a row value -- see
     -- device::State.
     state INTEGER NOT NULL CHECK(state >= 0 AND state <= 4),
+    -- For our own row, that of the record the swarm holds for us (0 for none yet), which the next
+    -- record we publish counts on from: our row mirrors the swarm, and is never what we publish.
     seqno INTEGER NOT NULL DEFAULT 1,
-    pushed_seqno INTEGER,         -- seqno of the last confirmed device group push; NULL = never pushed
     broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),  -- when the device was removed, or left
