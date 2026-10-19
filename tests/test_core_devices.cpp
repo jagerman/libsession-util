@@ -4180,3 +4180,108 @@ TEST_CASE(
     REQUIRE(answer_fetch(l.core, *net) == 1);
     CHECK(pushes(*net).size() == 1);
 }
+
+namespace {
+
+// Admits `c`, another device of the account, to `l`'s group through the existing device, and has
+// the applicant read the message that admitted it.
+void join(Linking& l, TempCore& c) {
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*c, *l.core).message, in(10min), "L-join");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    auto joined = l.core->devices.build_device_group_message().message;
+    TestHelper::deliver_device_message(*c, joined, in(10min), "G-join");
+    REQUIRE(c->devices.confirm_link(await));
+    TestHelper::deliver_device_message(*l.applicant, joined, in(10min), "G-join");
+}
+
+// A live record for a device of nobody's making but the caller's, with real keys to encrypt to.
+device::Info planted_record() {
+    TempCore planted;
+    auto keys = planted->devices.active_device_keys().front();
+    device::Info info{};
+    random::fill(info.id);
+    info.seqno = 1;
+    info.timestamp = std::chrono::floor<std::chrono::seconds>(clock_now_s());
+    info.type = device::Type::Session_Desktop;
+    info.description = "Planted";
+    info.state = device::State::Registered;
+    info.version = {1, 0, 0};
+    info.pk_x25519 = keys.x25519_pub;
+    info.pk_mlkem768 = keys.mlkem768_pub;
+    return info;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a removed device can add a device until the members' keys move on",
+        "[core][devices][removal][attack]") {
+    DeviceEventsRecorder third_events;
+    Linking l;
+    l.admit();
+    TempCore third{
+            core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
+            Linking::reporting_to(third_events)};
+    join(l, third);
+
+    // The applicant is removed, and never hears of it: it still holds the seed, the group's
+    // identifier, and every member's device keys as they were.
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    TestHelper::deliver_device_message(
+            *third, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    auto known = l.applicant->devices.devices(true, true, true);
+    REQUIRE(known.size() == 3);
+
+    // A group message of its own making, registering a device of its own.
+    ScopedClockOffset later{1min};
+    auto planted = planted_record();
+    auto forged_group = known;
+    forged_group.emplace(planted.id, planted);
+    auto forged = TestHelper::encrypt_device_data(l.applicant->devices, forged_group);
+
+    // Nothing prevents it.  What answers it is that every member says so.
+    for (auto [member, events] :
+         {std::pair{&l.core, &l.events}, std::pair{&third, &third_events}}) {
+        TestHelper::deliver_device_message(**member, forged, in(10min), "F1");
+        CHECK((*member)->devices.devices().contains(planted.id));
+        CHECK(std::ranges::any_of(events->members, [&](const device::Info& i) {
+            return i.id == planted.id && i.state == device::State::Registered;
+        }));
+    }
+
+    // Two rotations each and the keys it knew are gone, so the same forgery reads as nothing to
+    // any of them.  It still says something, though: a message from their own group that they
+    // cannot read, carrying no removals at all, is the spec's "displaced" -- which a forger can
+    // therefore have any member conclude, by leaving `kicked` out.
+    for (auto* member : {&l.core, &third}) {
+        (*member)->devices.rotate_device_keys();
+        (*member)->devices.rotate_device_keys();
+    }
+    later.advance(Devices::DISPLACEMENT_GRACE + 1min);
+    auto again = TestHelper::encrypt_device_data(l.applicant->devices, forged_group);
+    for (auto* member : {&l.core, &third}) {
+        CHECK_THROWS_AS(
+                TestHelper::decrypt_device_data((*member)->devices, again),
+                device::decryption_failed);
+        TestHelper::deliver_device_message(**member, again, in(10min), "F2");
+        CHECK((*member)->devices.membership(await).membership == device::Membership::Displaced);
+    }
+}
+
+TEST_CASE(
+        "Devices - a message to our previous device key still reads, one to the key before not",
+        "[core][devices][rotation]") {
+    Linking l;
+    l.admit();
+    // Encrypted to the existing device's keys as they are now.
+    auto group = l.applicant->devices.devices(true, true, true);
+    auto message = TestHelper::encrypt_device_data(l.applicant->devices, group);
+
+    l.core->devices.rotate_device_keys();
+    CHECK_NOTHROW(TestHelper::decrypt_device_data(l.core->devices, message));
+
+    l.core->devices.rotate_device_keys();
+    CHECK_THROWS_AS(
+            TestHelper::decrypt_device_data(l.core->devices, message), device::decryption_failed);
+}
