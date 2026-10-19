@@ -4149,3 +4149,30 @@ TEST_CASE(
     CHECK(*l.applicant->devices.next_account_rotation() >
           clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
 }
+
+TEST_CASE(
+        "Devices - a change of ours fetches the group at once, and the push follows",
+        "[core][devices][push]") {
+    Linking l;
+    l.admit();
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    answer_upload(l.core, *net, true);
+    REQUIRE_FALSE(l.core->devices.needs_push().device_group);
+    REQUIRE_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+
+    SECTION("a removal") {
+        REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    }
+    SECTION("our own record") {
+        auto [self, registered] = l.core->devices.device_info(await);
+        self.description = "Renamed";
+        l.core->devices.update_info(self, await);
+    }
+
+    // Not waiting for the swarm to send something, which a subscribed device would: the fetch
+    // that every push follows, asked for now.
+    REQUIRE(pushes(*net).empty());
+    REQUIRE(answer_fetch(l.core, *net) == 1);
+    CHECK(pushes(*net).size() == 1);
+}

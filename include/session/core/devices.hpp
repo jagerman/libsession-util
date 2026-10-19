@@ -661,7 +661,7 @@ class Devices final : detail::CoreComponent {
     std::vector<device::LinkRequest> incoming_link_requests(await_t);
 
     // Admits the requesting device to the group.  The acceptance reaches the other devices with the
-    // next group push, which happens once the next fetch completes.
+    // next group push, which follows a fetch this call asks for at once.
     //
     // For a request that `replaces` a device, the requesting device's record takes the place of the
     // one held, and the account key is rotated: a copy of the device as it was, still holding the
@@ -702,7 +702,7 @@ class Devices final : detail::CoreComponent {
     // no key to anything the group pushes from here on; this device's own keys rotate within
     // KEY_ROTATION_JITTER, as every member's do on learning of it.  The removal reaches the other
     // devices -- and, through the `kicked` list, the removed device itself -- with the next group
-    // push, which happens once the next fetch completes.
+    // push, which follows a fetch this call asks for at once.
     //
     // Answers false if the device is not in the group -- unknown, still only asking to join (which
     // is `ignore_request`), or already gone -- or this device is no longer in it either.  None of
@@ -893,6 +893,11 @@ class Devices final : detail::CoreComponent {
     // Points the rotation timer at the earlier of the two next rotations, or stops it.
     void _arm_rotation();
 
+    // Fetches the group now if a change of ours owes a push, so that the push following the fetch
+    // carries it: a device subscribed for pushes does not poll, and could otherwise hold the change
+    // until the swarm next had something for it.
+    void _push_soon();
+
     // Picks when the device keys made at `created` are to be rotated, and records it.
     sys_ms _schedule_device_rotation(std::chrono::sys_seconds created);
 
@@ -908,7 +913,8 @@ class Devices final : detail::CoreComponent {
   public:
     // Sets what this device describes itself as -- type, description, version and `extra` -- which
     // every record it publishes is built from, in this group or any it joins later.  If the
-    // device is registered, its group is owed a push carrying it.
+    // device is registered, its group is owed a push carrying it, which follows a fetch this call
+    // asks for at once.
     //
     // The id, seqno, timestamp, state and pk_* fields of the input value are ignored.
     //

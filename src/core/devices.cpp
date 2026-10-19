@@ -1112,6 +1112,7 @@ void Devices::_update_info(const device::Info& info) {
     encode_described(out, info, xit, info.extra.cend());
     auto encoded = std::move(out).str();
     core.globals.set(own_info_key, to_span<std::byte>(encoded));
+    _push_soon();
 }
 
 std::optional<device::GroupId> Devices::_group_id() {
@@ -2951,6 +2952,7 @@ bool Devices::_accept_request(int reqid) {
     _ended.insert(*row);
     _devices_changed = true;
     _flush_events();
+    _push_soon();
     return true;
 }
 
@@ -3313,6 +3315,7 @@ bool Devices::_remove_device(std::span<const std::byte, device::ID_SIZE> id) {
     log::info(cat, "Removed device {} from the group", oxenc::to_hex(id));
     _devices_changed = true;
     _flush_events();
+    _push_soon();
     return true;
 }
 
@@ -3757,6 +3760,13 @@ void Devices::_rotate_due_keys() {
         log::info(cat, "Device key rotation is due");
         rotate_device_keys();
     }
+}
+
+void Devices::_push_soon() {
+    // A fetch rather than the push itself: a push goes out only on top of what the swarm holds,
+    // which is what stops two devices answering the same update with duelling pushes.
+    if (core.network() && needs_push().device_group)
+        core._fetch({config::Namespace::Devices}, nullptr);
 }
 
 void Devices::_arm_rotation() {
