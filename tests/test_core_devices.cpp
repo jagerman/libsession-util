@@ -5042,3 +5042,126 @@ TEST_CASE(
     CHECK(done == 2);
     CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
 }
+
+namespace {
+
+// `message`'s outer dict with `key` added where it sorts, and signed again by `signer`'s account
+// key as its author would have: what a later version of the format might send.
+std::vector<std::byte> with_extra_key(
+        TempCore& signer, std::span<const std::byte> message, std::string_view key) {
+    oxenc::bt_dict_consumer in{message};
+    oxenc::bt_dict_producer out;
+    bool added = false;
+    auto add = [&] {
+        out.append(key, "from a later version");
+        added = true;
+    };
+    while (!in.is_finished() && in.key() != "~") {
+        if (!added && key < in.key())
+            add();
+        auto k = std::string{in.key()};
+        if (in.is_integer())
+            out.append(k, in.consume_integer<int64_t>());
+        else
+            out.append(k, in.consume_string_view());
+    }
+    if (!added)
+        add();
+    out.append_signature("~", [&](std::span<const std::byte> body) {
+        auto seed = signer->globals.account_seed();
+        return ed25519::sign(seed.ed25519_secret(), body);
+    });
+    return to_vector<std::byte>(std::move(out).str());
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a tombstone carrying a field from a later version is a removal all the same",
+        "[core][devices][wire]") {
+    Linking l;
+    l.admit();
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    join(l, third);
+
+    // The applicant's view of the group, the third device removed, written as a later version
+    // would write the tombstone.
+    auto group = l.applicant->devices.devices(true, true, true);
+    auto& gone = group.at(Linking::id_of(third));
+    gone.state = device::State::Kicked;
+    gone.kicked = std::chrono::floor<std::chrono::seconds>(clock_now_s());
+    auto plaintext = to_string(TestHelper::decrypt_device_data(
+            l.applicant->devices, TestHelper::encrypt_device_data(l.applicant->devices, group)));
+    auto plain = "d1:ri{}ee"_format(gone.kicked->time_since_epoch().count());
+    auto pos = plaintext.find(plain);
+    REQUIRE(pos != std::string::npos);
+    plaintext.replace(
+            pos,
+            plain.size(),
+            "d1:ri{}e1:z6:futuree"_format(gone.kicked->time_since_epoch().count()));
+
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_payload(l.applicant->devices, group, plaintext),
+            in(10min),
+            "G3");
+    auto held = l.core->devices.devices(true, true, true);
+    CHECK(held.at(Linking::id_of(third)).state == device::State::Kicked);
+}
+
+TEST_CASE(
+        "Devices - outer fields from a later version are carried by the signature and ignored",
+        "[core][devices][wire]") {
+    Linking l;
+    l.admit();
+
+    SECTION("in a group message") {
+        // The admission's push confirmed, so that the record below is one past what it carried.
+        push_from(l.core, "G1");
+        auto [self, registered] = l.core->devices.device_info(await);
+        self.description = "Renamed";
+        l.core->devices.update_info(self, await);
+        auto message =
+                with_extra_key(l.core, l.core->devices.build_device_group_message().message, "j");
+        TestHelper::deliver_device_message(*l.applicant, message, in(10min), "G2");
+        CHECK(l.applicant->devices.devices().at(self.id).description == "Renamed");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    }
+
+    SECTION("in a tombstone") {
+        TempCore keeper{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+        auto tombstone = with_extra_key(
+                keeper,
+                TestHelper::build_dissolution(*keeper, {*TestHelper::group_id(*l.applicant)}),
+                "j");
+        TestHelper::deliver_device_message(*l.applicant, tombstone, in(10min), "T1");
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+    }
+}
+
+TEST_CASE(
+        "Devices - a record's fields from a later version are kept and carried on",
+        "[core][devices][wire]") {
+    Linking l;
+    l.admit();
+    auto core_self = l.core->devices.device_info(await).first;
+
+    // The applicant, become a later version, describes itself with a field this one does not know.
+    auto newer = l.applicant->devices.device_info(await).first;
+    newer.seqno++;
+    newer.extra["zz"] = "future";
+    TestHelper::deliver_device_message(
+            *l.core,
+            TestHelper::encrypt_device_data(
+                    l.applicant->devices, {{core_self.id, core_self}, {newer.id, newer}}),
+            in(10min),
+            "G2");
+    auto held = l.core->devices.devices().at(newer.id);
+    REQUIRE(held.extra.contains("zz"));
+    CHECK(std::get<std::string>(held.extra.at("zz")) == "future");
+
+    // And the existing device's own next push says it on the applicant's behalf, unchanged.
+    auto pushed_payload = to_string(TestHelper::decrypt_device_data(
+            l.core->devices, l.core->devices.build_device_group_message().message));
+    CHECK(pushed_payload.find("2:zz6:future") != std::string::npos);
+}
