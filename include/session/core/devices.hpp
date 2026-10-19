@@ -279,12 +279,13 @@ namespace device {
                         ///< it may ask to join one, or start its own instead, which dissolves them.
         Waiting,        ///< Waiting on this device's own link request; see `outgoing_link_request`.
         Removed,  ///< Removed from its group by another device.  It can come back only under a new
-                  ///< device id.
+                  ///< device id, which `request_link` and `start_group` take for it.
         Displaced,  ///< Its group has moved on without it: a newer message from the group is one
                     ///< it cannot read, though nothing removed it.  Another device holds its place
                     ///< under its id -- a restored copy of it, admitted as a replacement, or
                     ///< someone holding a copy of its data who has rotated it out, which is an
-                    ///< attack.  Never dismissable.  It can come back only under a new device id.
+                    ///< attack.  Never dismissable.  It can come back only under a new device id,
+                    ///< which `request_link` and `start_group` take for it.
         Dissolved,  ///< Its group was dissolved: the user of another of the account's devices kept
                     ///< another group over it.  What it held of the group is forgotten and it has
                     ///< a new device id; it rejoins by asking to join the group that was kept, as
@@ -533,15 +534,17 @@ class Devices final : detail::CoreComponent {
     // that only its members can read it; the group must be one this device has seen in the swarm.
     // The account must already be restored here, and the device not in a group: an account has
     // only one, so there is no switching from one to another, only `leave_group` and then asking.
+    // A device `Removed` or `Displaced` asks as a new device: it takes a new device id, forgetting
+    // the group it is no longer in, as part of this call.
     //
     // It is admitted only once a group message admitting it has arrived *and* its user has
     // confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` -- or
     // `membership_changed` with what it sees if `expires` passes first.  Asking again replaces the
     // request, and its SAS, with a new one.
     //
-    // Fails with `err::already_registered` for a device in a group, `err::removed` for a device
-    // displaced from its group, `err::network_unavailable`, `err::unknown_group`, or
-    // `err::store_failed` -- the last worth retrying.  None of them leaves a request outstanding.
+    // Fails with `err::already_registered` for a device in a group, `err::network_unavailable`,
+    // `err::unknown_group`, or `err::store_failed` -- the last worth retrying.  None of them leaves
+    // a request outstanding, and none but the last comes after a new device id was taken.
     void request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb);
 
     // The request `request_link` made, while it is still waiting: stored by the swarm and not past
@@ -650,27 +653,16 @@ class Devices final : detail::CoreComponent {
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
-    // Gives a removed or displaced device a new identity, so that it can ask to join again: a
-    // removed id is spent, and can never rejoin the group that removed it, and a displaced one is
-    // another device's now.  A new device id and new device keys
-    // replace the old, and what it held of its old group -- its devices and its account keys
-    // included -- is forgotten, leaving it `GroupsVisible` or `NoGroup` like any device outside a
-    // group.  Its messages, the account's configs, and the groups it has seen in the swarm are
-    // kept.
-    //
-    // Answers false for a device that has been neither removed nor displaced.
-    void renew_device_identity(result_function<bool> cb);
-    bool renew_device_identity(await_t);
-
     // Starts a new device group with this device as its only member, and answers its identifier.
-    // For `NoGroup`, `Dissolved` and `GroupsVisible`.  Any group in the swarm is dissolved: an
-    // account has only one, and the user starting another over those in view is choosing it over
-    // them.  A device `Waiting` on a link request withdraws it.  The group starts with a newly
+    // For any device not in a group.  Any group in the swarm is dissolved: an account has only one,
+    // and the user starting another over those in view is choosing it over them -- the one a
+    // `Removed` or `Displaced` device was in included, which it leaves first, taking a new device
+    // id.  A device `Waiting` on a link request withdraws it.  The group starts with a newly
     // generated account key, whatever the device held before.
     //
-    // Fails with `err::already_registered` for a device already in a group, `err::removed` for one
-    // removed or displaced from its group, and `err::membership_unknown` before the first fetch of
-    // this run: starting a group is the user's decision, made from what the swarm holds.
+    // Fails with `err::already_registered` for a device already in a group, and
+    // `err::membership_unknown` before the first fetch of this run: starting a group is the user's
+    // decision, made from what the swarm holds.
     void start_group(result_function<device::GroupId> cb);
     device::GroupId start_group(await_t);
 
@@ -697,8 +689,9 @@ class Devices final : detail::CoreComponent {
     // about to wipe itself may get no second chance.  A device removed, displaced or dissolved has
     // nothing it may say to its group, and only forgets it.
     //
-    // The device keeps its device id, which the group it left now holds as departed: it cannot ask
-    // to join that same group again.  Answers false for a device in no group to leave.
+    // Leaving, the device takes a new device id and new device keys: the group it left holds the
+    // old id as departed, and the new one can ask to join any group, that one included, as a new
+    // device.  Answers false for a device in no group to leave.
     void leave_group(result_function<bool> cb);
     bool leave_group(await_t);
 
@@ -706,13 +699,16 @@ class Devices final : detail::CoreComponent {
     bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
     device::MembershipState _membership();
     device::GroupId _start_group();
-    bool _renew_device_identity();
+
+    // Removed from its group, or displaced from it: still holding the group, but no longer in it.
+    bool _cast_out();
 
     // Forgets everything of the group this device was in: its devices, its messages, its account
     // keys and its identifier.
     void _forget_group();
 
-    // Forgets the group and our requests, and replaces our device id and device keys with new ones.
+    // Forgets the group and our requests, and replaces our device id and device keys with new ones:
+    // what leaving a group, for whatever reason, always does.
     void _new_identity();
 
     bool _dissolve_group(const device::GroupId& group);

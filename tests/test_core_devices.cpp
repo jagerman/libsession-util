@@ -2588,10 +2588,13 @@ TEST_CASE(
     l.admit();
     auto group = *TestHelper::group_id(*l.core);
     auto* net = attach_mock_network(*l.applicant);
+    auto old_id = l.applicant_id();
 
     REQUIRE(l.applicant->devices.leave_group(await));
 
-    // Nothing of the group left, though the group itself is still there to see.
+    // Under a new identity, with nothing of the group left, though the group itself is still
+    // there to see.
+    CHECK(l.applicant_id() != old_id);
     CHECK(l.applicant->devices.devices(true, true, true).empty());
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
     CHECK(account_key_count(l.applicant) == 0);
@@ -2610,11 +2613,49 @@ TEST_CASE(
     REQUIRE_FALSE(farewell.empty());
     auto key_before = l.core->devices.active_account_keys().front().x25519_pub;
     TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G9");
-    CHECK(l.state_of_applicant().state == device::State::Left);
+    CHECK(l.core->devices.devices(true, true, true, old_id).at(old_id).state ==
+          device::State::Left);
     CHECK(l.core->devices.active_account_keys().front().x25519_pub != key_before);
 
     // Nothing more to leave.
     CHECK_FALSE(l.applicant->devices.leave_group(await));
+}
+
+TEST_CASE(
+        "Devices - a device that left a group can join it again, as a new device",
+        "[core][devices][membership][leave]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.core);
+    auto old_id = l.applicant_id();
+    auto* net = attach_mock_network(*l.applicant);
+    REQUIRE(l.applicant->devices.leave_group(await));
+    TestHelper::deliver_device_message(*l.core, pushed(*pushes(*net)[0]).first, in(10min), "G9");
+    REQUIRE(l.core->devices.devices(true, true, true, old_id).at(old_id).state ==
+            device::State::Left);
+
+    // The id it left under is spent there; the one it holds now has never been seen.
+    answer_upload(l.applicant, *net, true);
+    Asked got;
+    request_link(l.applicant, group, got);
+    auto request = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    auto prompts = l.events.added.size();
+    TestHelper::deliver_device_message(*l.core, request, (*got)->expires, "L2");
+    REQUIRE(l.events.added.size() == prompts + 1);
+    CHECK_FALSE(l.events.added.back().replaces);
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G10");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+
+    // Both: the departure of the old id, and the new one in the group.
+    auto held = l.core->devices.devices(true, true, true);
+    CHECK(held.at(old_id).state == device::State::Left);
+    CHECK(held.at(l.applicant_id()).state == device::State::Registered);
 }
 
 TEST_CASE(
@@ -2784,29 +2825,35 @@ TEST_CASE(
         "Devices - a removed device comes back under a new identity",
         "[core][devices][membership]") {
     Linking l;
-    CHECK_FALSE(l.core->devices.renew_device_identity(await));
-
     l.admit();
+    auto group = *TestHelper::group_id(*l.core);
     auto old_id = l.applicant_id();
     REQUIRE(l.core->devices.remove_device(old_id, await));
     TestHelper::deliver_device_message(
             *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
     REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
 
-    REQUIRE(l.applicant->devices.renew_device_identity(await));
+    // Asking again is all it takes: the new identity comes with the asking.
+    auto* net = attach_mock_network(*l.applicant);
+    Asked got;
+    request_link(l.applicant, group, got);
+    auto request = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
     CHECK(l.applicant_id() != old_id);
-    auto state = l.applicant->devices.membership(await);
-    CHECK(state.membership == device::Membership::GroupsVisible);
-    CHECK_FALSE(state.group);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Waiting);
 
     // Nothing of its old group left to carry into one it starts, or to mistake for the one it
     // joins -- its account keys included.
-    CHECK(l.applicant->devices.devices(true, true, true).empty());
+    auto held = l.applicant->devices.devices(true, true, true);
+    REQUIRE(held.size() == 1);
+    CHECK(held.begin()->first == l.applicant_id());
     CHECK_FALSE(TestHelper::group_id(*l.applicant));
     CHECK(account_key_count(l.applicant) == 0);
 
     // And joins again like any device asking: the new id is not the one the group removed.
-    l.ask(in(10min), "L2");
+    TestHelper::deliver_device_message(*l.core, request, (*got)->expires, "L2");
     REQUIRE(l.events.added.size() == 2);
     REQUIRE(l.core->devices.accept_request(l.events.added[1].id, await));
     REQUIRE(l.applicant->devices.confirm_link(await));
@@ -2965,11 +3012,25 @@ TEST_CASE(
     // It speaks for the group no longer: nothing pushed, nobody admitted or removed.
     CHECK_FALSE(l.applicant->devices.needs_push().device_group);
     CHECK_FALSE(l.applicant->devices.remove_device(Linking::id_of(l.core), await));
-    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) == err::removed);
 
-    // The way back is the removed device's: a new identity.
-    REQUIRE(l.applicant->devices.renew_device_identity(await));
-    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    // The way back is a removed device's: asking to join again, as a new device, which takes the
+    // new identity as part of the asking.
+    auto old_id = l.applicant_id();
+    auto* net = attach_mock_network(*l.applicant);
+    Asked got;
+    request_link(l.applicant, *TestHelper::group_id(*l.core), got);
+    auto request = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    CHECK(l.applicant_id() != old_id);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Waiting);
+
+    // Not under the id the copy now holds, so asking as a new device, not to replace it.
+    auto prompts = l.events.added.size();
+    TestHelper::deliver_device_message(*l.core, request, (*got)->expires, "L3");
+    REQUIRE(l.events.added.size() == prompts + 1);
+    CHECK_FALSE(l.events.added.back().replaces);
 }
 
 TEST_CASE(
@@ -3013,15 +3074,29 @@ TEST_CASE(
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 }
 
-TEST_CASE("Devices - a removed device cannot start a group", "[core][devices][membership]") {
+TEST_CASE(
+        "Devices - a removed device starts a group under a new identity",
+        "[core][devices][membership]") {
     Linking l;
     l.admit();
-    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    auto old_id = l.applicant_id();
+    auto theirs = *TestHelper::group_id(*l.core);
+    REQUIRE(l.core->devices.remove_device(old_id, await));
     TestHelper::deliver_device_message(
             *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
     REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
 
-    CHECK(failure_code([&] { l.applicant->devices.start_group(await); }) == err::removed);
+    // Out of the group it was removed from first, and so, under the rule for starting a group
+    // with others in view, dissolving it: nothing of that group comes along.
+    auto mine = l.applicant->devices.start_group(await);
+    CHECK(mine != theirs);
+    CHECK(l.applicant_id() != old_id);
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.others.empty());
+    auto devs = l.applicant->devices.devices(true, true, true);
+    REQUIRE(devs.size() == 1);
+    CHECK(devs.begin()->first == l.applicant_id());
 }
 
 TEST_CASE(

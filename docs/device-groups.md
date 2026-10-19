@@ -69,8 +69,7 @@ Call `membership()` at startup. Until the first fetch from the swarm completes i
 `Unknown`, because the swarm may have changed while the application was down. **Do not prompt from
 `Unknown`.** Wait for `membership_changed`, which fires when the first fetch makes the state known,
 and on every change after, except one made by your own call (asking to join, starting a group,
-dissolving one, leaving one, renewing the device's identity). Re-read `membership()` after making
-those calls.
+dissolving one, leaving one). Re-read `membership()` after making those calls.
 
 `membership()` returns the state, this device's group (when in one), and `others`: every other
 group in the swarm, newest first, each with its id and when it was last active (`last_seen`: when
@@ -82,9 +81,9 @@ its newest message was written, by the clock of the device that wrote it).
 | `NoGroup` | Not in a group, and no group is in the swarm. | "No existing device group was found. Start a new one, or bring one of your other devices online to link this one?" Start → `start_group`. Otherwise wait: the state changes when a group appears. |
 | `GroupsVisible` | Not in a group; groups it cannot read are in the swarm. | "Link to your existing devices" (see "Joining"). Less prominently, "Start a new device group instead" → `start_group`, with a warning that it **dissolves** the existing group (see "Starting a group"). |
 | `Waiting` | This device's link request is outstanding. | The waiting screen (see "Joining"). |
-| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Offer a way back: `renew_device_identity`, then join again. |
+| `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. |
 | `Forked` | In its group, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself; until it is answered, this device pushes nothing to its group. See "Forks". |
-| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer `renew_device_identity`, then join again. |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `GroupsVisible`. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
@@ -112,8 +111,9 @@ unchanged, and the next start (or the device screen) offers the choice again.
 2. **Ask.** `request_link(group, cb)`. It uploads the request and answers once the swarm has stored
    it, with the SAS and the deadline (10 minutes). Errors: `err::unknown_group` (no longer in the
    swarm), `err::network_unavailable`, `err::store_failed` (worth retrying), `err::already_registered`
-   (this device is in a group; there is no moving straight to another), `err::removed` (displaced:
-   renew the identity first).
+   (this device is in a group; there is no moving straight to another). From `Removed` or
+   `Displaced` the call first gives the device a new identity, forgetting the group it is no
+   longer in: the request then comes from a new device.
 3. **Show the waiting screen**, drawn from `outgoing_link_request()` every time it is opened: the 7
    emoji (21 extended), a countdown to `expires`, and a **"These match"** action. Tell the user to
    open Session on one of their existing devices, where a matching prompt will appear.
@@ -193,11 +193,11 @@ that joined or stopped being in the group, with its record as it now stands; use
 rather than for the list. It does not fire for this device's own `accept_request` or
 `remove_device`, nor for the devices of a group this device has just joined.
 
-To remove a device, call `remove_device(id)` behind a confirmation
-that makes its permanence clear: **a removed device can never rejoin under the same identity**. It
-can only come back by generating a new one (`renew_device_identity`) and being approved again, like
-a new device. `remove_device` answers false if the device is no longer in the group (or this one
-isn't), which is not an error. This device cannot remove itself.
+To remove a device, call `remove_device(id)` behind a confirmation that makes its permanence clear:
+**a removed device can never rejoin under the same identity**. It can only come back as a new
+device, under a new identity (which asking to join gives it), approved again like any other.
+`remove_device` answers false if the device is no longer in the group (or this one isn't), which is
+not an error. This device cannot remove itself.
 
 ## Forks and alerts
 
@@ -233,12 +233,13 @@ a device that started a group of its own by mistake months ago ("two months ago"
   restored this device elsewhere and approved the copy as a replacement, or someone with a copy of
   this device's data has taken its place. Say both: "Another device has taken this device's place
   in your device group. If you didn't restore it on another device, someone may have a copy of
-  this device's data." The device stops acting for the group by itself. The way back is
-  `renew_device_identity()`, then joining as a new device; the user should also remove the old
-  identity from one of their other devices if they don't recognise what now holds it.
-- **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back,
-  `renew_device_identity()` gives it a new identity; it then joins like any new device. Messages
-  and the account's configs are kept.
+  this device's data." The device stops acting for the group by itself. The way back is joining
+  again as a new device (`request_link`, which takes the new identity itself); the user should also
+  remove the old identity from one of their other devices if they don't recognise what now holds
+  it.
+- **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back, offer
+  to link it again (or to start a group); the call gives it a new identity, and it then joins like
+  any new device. Messages and the account's configs are kept.
 - **Dissolved** (`membership_changed(Dissolved)`). The user chose, on another device, to keep a
   different group, and this device's group is gone. Nothing is needed before joining again: the
   device already has a new identity, and its messages and the account's configs are kept. Offer to
@@ -246,10 +247,10 @@ a device that started a group of its own by mistake months ago ("two months ago"
 
 ## Starting a group
 
-`start_group()` creates a group with this device as its only member. It is valid from `NoGroup`,
-`Dissolved` and `GroupsVisible`. A device that was `Waiting` drops its request. It fails with
-`err::membership_unknown` before the first fetch, `err::already_registered` from a group, and
-`err::removed` for a removed or displaced device (which must `renew_device_identity` first).
+`start_group()` creates a group with this device as its only member. It is valid from any state
+outside a group. A device that was `Waiting` drops its request; one `Removed` or `Displaced` takes a
+new identity first, and the group it was in is then one in view like any other. It fails with
+`err::membership_unknown` before the first fetch, and `err::already_registered` from a group.
 
 From `GroupsVisible` (or anywhere else with groups in `others`), starting a group **dissolves every
 group in view**: an account has only one, and the user is choosing the new group over them. Their
@@ -271,8 +272,10 @@ its user's.
 - **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join.
 
 A device that was removed, displaced or dissolved just forgets the group; it has nothing it may tell
-it. `leave_group` answers false if there is no group to leave. A device cannot ask to join a group
-while it is in one (`err::already_registered`): leaving comes first.
+it. Leaving gives the device a new identity, as joining the group again would need anyway: it can
+ask to join any group afterwards, the one it left included. `leave_group` answers false if there is
+no group to leave. A device cannot ask to join a group while it is in one
+(`err::already_registered`): leaving comes first.
 
 ## Do not
 

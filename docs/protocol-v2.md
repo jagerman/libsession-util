@@ -192,10 +192,11 @@ message is left unchanged rather than removed, a removal must be stated in this 
 all.
 
 A tombstone and a live record for one device ID cannot coexist, so a device that is removed and
-later rejoins the group must take a new device ID, with new device keys to go with it.  It also
-leaves behind the old group's account keys, as any device leaving a group does (see "Leaving a
-group"); its message history, the account seed and configs are all still valid, and are
-kept.  It then asks to join as any device outside a group does.
+later rejoins the group must take a new device ID, with new device keys to go with it.  It does so
+as part of asking to join (or of starting a group): what it held of the group it was removed from
+is forgotten at the same time, its account keys included, as for any device leaving a group (see
+"Leaving a group").  Its message history, the account seed and configs are all still valid, and
+are kept.  It then asks as any device outside a group does.
 
 The removed device is not among the message recipients and cannot decrypt the payload; see
 "Announcing removals" below.
@@ -437,8 +438,8 @@ rotation guarantees one.
 A displaced device alerts its user, as a possible attack, and stops acting for the group: it pushes
 nothing, admits and removes nobody, and pushes no departure if it leaves the group, since a
 departure under its ID would now apply to the device holding it.  It can come back only under a new
-device ID, as a removed device does.  Reading a message from the group again, as new as the one
-that displaced it, undoes this.
+device ID, which it takes, as a removed device does, as part of asking to join again.  Reading a
+message from the group again, as new as the one that displaced it, undoes this.
 
 A holder of the account seed can forge a message carrying the group's identifier, and so cause this
 alert, as it can forge a `kicked` entry to cause a removal alert.  Neither gives it anything: the
@@ -810,6 +811,13 @@ counting and encrypting to a device that is gone, and when its user, forked, cho
 group.  A device in a group cannot ask to join another: an account has only one group, so there is
 no moving from one to another.  It leaves its group first, and then asks as any device outside a
 group does.
+
+Leaving a group, for whatever reason -- leaving it as above, being removed or displaced from it and
+then asking to join or starting a group, having it dissolved -- always means a new device ID, with
+new device keys.  A record of the device in a group it left can then never meet one under its new
+ID, in that group or any other, so its next record starts again at `seq` 1 with nothing held for it,
+and coming back to the group it left is asking to join as a new device: the old ID is spent there,
+as a departed one.
 
 Only a member in good standing tells its group that it is leaving.  A removed device's departure
 could not lower its removal, and a displaced device's would be taken as the departure of whichever

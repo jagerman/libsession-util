@@ -1498,9 +1498,10 @@ void Devices::receive_device_group_message(
     }
     bool admitting = accepted.has_value();
 
-    // Still holding a group it was removed from, which must not mix into the one admitting it.
-    if (admitting && ours && *ours != theirs)
-        _forget_group();
+    // Asking is only ever from outside a group -- one removed or displaced from its group took a
+    // new identity, forgetting it, before it asked -- or from inside this one, replacing a record
+    // it lost track of.
+    assert(!admitting || !ours || *ours == theirs);
 
     auto c = conn();
     SQLite::Transaction tx{c.sql};
@@ -1688,7 +1689,10 @@ bool Devices::_leave_group() {
             log::warning(cat, "Leaving the device group without telling it: no network");
     }
 
-    _forget_group();
+    // Under a new id, as any device leaving its group: a record of ours in the group left can then
+    // never meet one in the next, and asking to join the same group again is asking as a new
+    // device.
+    _new_identity();
     log::info(cat, "Left the device group");
 
     _devices_changed = true;
@@ -1927,11 +1931,8 @@ void Devices::_request_link(
     // network cannot be attached without one.
     if (!core.network())
         throw session::error{err::network_unavailable, "Cannot request a link: no network"};
-    if (_displaced())
-        throw session::error{
-                err::removed,
-                "Another device holds this device's place; it must ask under a new device id"};
-    if (_device_info().second)
+    bool cast_out = _cast_out();
+    if (!cast_out && _device_info().second)
         throw session::error{
                 err::already_registered,
                 "This device is in a group; it must leave it before asking to join another"};
@@ -1943,6 +1944,11 @@ void Devices::_request_link(
     if (!link_x25519)
         throw session::error{
                 err::unknown_group, "Cannot request a link: no such group is in the swarm"};
+
+    // Its id is spent in the group that removed it, and another device's in the one it was
+    // displaced from: it can only ask as a new device, whichever group it asks.
+    if (cast_out)
+        _new_identity();
 
     auto req = _build_link_request(group, *link_x25519);
     OutgoingLinkRequest sent{.sas = req.sas, .expires = clock_now_s() + LINK_REQUEST_TTL};
@@ -2808,14 +2814,6 @@ void Devices::_rebaseline_membership() {
         _reported_membership = m;
 }
 
-void Devices::renew_device_identity(result_function<bool> cb) {
-    async([this] { return _renew_device_identity(); }, std::move(cb));
-}
-
-bool Devices::renew_device_identity(await_t) {
-    return jq().call_get([this] { return _renew_device_identity(); });
-}
-
 void Devices::_forget_group() {
     assert(on_loop());
     auto c = conn();
@@ -2859,18 +2857,11 @@ void Devices::_note_read(sys_ms t) {
     }
 }
 
-bool Devices::_renew_device_identity() {
-    assert(on_loop());
-    if (!_displaced() && !conn().prepared_maybe_get<int>(
-                                 "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
-                                 self_id,
-                                 static_cast<int>(device::State::Kicked)))
-        return false;
-
-    _new_identity();
-    _rebaseline_membership();
-    _flush_events();
-    return true;
+bool Devices::_cast_out() {
+    return _displaced() || conn().prepared_maybe_get<int>(
+                                   "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
+                                   self_id,
+                                   static_cast<int>(device::State::Kicked));
 }
 
 void Devices::_new_identity() {
@@ -2917,12 +2908,11 @@ device::GroupId Devices::_start_group() {
             throw session::error{err::already_registered, "This device is already in a group"};
         case device::Membership::Removed:
         case device::Membership::Displaced:
-            // Its tables still hold the group it is no longer in, which a group started from them
-            // would carry on as its own members.
-            throw session::error{
-                    err::removed,
-                    "This device is no longer in its group; it must rejoin under a new device id "
-                    "before starting one"};
+            // Leaving the group it is no longer in, as any leaving does, under a new id -- after
+            // which that group is one in view like any other.
+            _new_identity();
+            state = _membership();
+            break;
         case device::Membership::Waiting: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
         case device::Membership::GroupsVisible:
