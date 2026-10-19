@@ -4,7 +4,8 @@ This is the guide for an application that wants to support several devices on on
 linking a new device, approving one, listing and removing devices, and handling the situations
 that can go wrong. It describes *what to call and when*. The protocol behind it is in
 `docs/protocol-v2.md`; the exact signatures and their full documentation are in
-`include/session/core/devices.hpp` and `include/session/core/callbacks.hpp`.
+`include/session/core/devices.hpp`, `include/session/core/callbacks.hpp` and (for the emoji)
+`include/session/core/link_sas.hpp`.
 
 ## The one rule: the application is dumb
 
@@ -62,10 +63,13 @@ application, `core::callbacks` for one using `Core` directly. It must outlive th
 through its dispatcher, onto your thread; `Core` calls them on its own event loop. Either way a
 handler must not block and must not throw.
 
-Everything else is on `devices`: `client.core.devices` for a `Client` application. Each call has a
-handler form, which takes a `result_function` and answers on the dispatcher or loop, and an
+Everything else is on `devices`: `client.core.devices` for a `Client` application. Most calls have
+a handler form, which takes a `result_function` and answers on the dispatcher or loop, and an
 `await` form, which blocks the calling thread. Network operations (`request_link`) have only the
-handler form. Failures carry an `Error` whose `code` is one of `core::err::*`.
+handler form. Two are neither: `devices()` and `device_id()` are plain synchronous calls, safe from
+any thread, which read the database directly. Failures carry an `Error` whose `code` is one of
+`core::err::*`. The other plain calls in `devices.hpp` -- building and marking pushes, rotating
+and listing keys -- are Core's own machinery, and not for an application.
 
 At startup, and whenever the user changes them, describe this device with `update_info`: its
 `type` (e.g. `device::Type::Session_CLI`), a short `description`, and its `version`. That is what
@@ -103,6 +107,12 @@ its newest message was written, by the clock of the device that wrote it).
 while all of the account's devices were offline for 30 days, and starting a group in that case
 forks the account. An application that really does want to start a group automatically can call
 `start_device_group` without asking, but that is its choice, not libsession's.
+
+On a restored account, say at the "Start a new one" choice what it costs: **messages sent to the
+account before this restore cannot be recovered on this device** unless one of the account's other
+devices comes back online and links it. They were encrypted to keys that only those devices hold,
+and the recovery phrase does not bring those keys back. If the user has no other device, that is
+how it is; if they do, bringing it online and linking is the better choice.
 
 There is no "link later" call. If the user dismisses the prompt, do nothing: the state is
 unchanged, and the next start (or the device screen) offers the choice again.
@@ -201,7 +211,8 @@ Request ids are counters for this run only. Never persist or display them.
 
 ## The device list
 
-`devices(true, false, true)` gives every device that is or was in the group, by id. `state` says
+`devices(true, false, true)` gives every device that is or was in the group, by id. It is a plain
+synchronous call, safe from any thread, so a list can be drawn from it directly. `state` says
 which:
 
 - `Registered`: in the group. Show its description, type, version and `timestamp` (when it last
@@ -216,6 +227,15 @@ Redraw on `devices_replaced`. `device_membership_changed` comes first, once for 
 that joined or stopped being in the group, with its record as it now stands; use it for a notice
 rather than for the list. It does not fire for this device's own `accept_request` or
 `remove_device`, nor for the devices of a group this device has just joined.
+
+**Show an addition prominently**, as a notice the user will see rather than a line in a list: "A
+new device was added to your account: *Alice's laptop*". It is the one event the user must not
+miss. Anyone holding the account's recovery phrase -- a removed device included -- can add a device
+of their own, and the design answers that by telling the user rather than by preventing it. Offer,
+with the notice, what to do about a device they don't recognise: remove it (`remove_device`); and if
+the recovery phrase itself may be in someone else's hands, start afresh from a device they trust --
+`leave_group`, then `start_device_group`, which dissolves the old group (see "Starting a group") --
+and treat the recovery phrase as compromised.
 
 To remove a device, call `remove_device(id)` behind a confirmation that makes its permanence clear:
 **a removed device can never rejoin under the same identity**. It can only come back as a new

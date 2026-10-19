@@ -201,6 +201,15 @@ are kept.  It then asks as any device outside a group does.
 The removed device is not among the message recipients and cannot decrypt the payload; see
 "Announcing removals" below.
 
+Removing a device does not stop it, or any other holder of the account seed, from publishing a
+group message of its own: one registering a device it controls, encrypted to the members' device
+public keys it knows.  The seed signs whatever its holder likes, and nothing in the protocol
+prevents that.  Device key rotation makes the knowledge go stale (see "Device key rotation"): once
+the members have rotated, nothing encrypted to the keys it knew is readable by any of them.  Beyond
+that the defence is notification, not prevention: every member tells its user of a device added to
+the group, and the user decides what to do about one they do not recognise -- remove it, or, if the
+seed itself is compromised, start afresh from a device they trust.
+
 #### Which removals a message carries
 
 A tombstone is there to tell devices that were offline when the removal or departure happened: a
@@ -222,9 +231,8 @@ tombstone, and has only the fact that it can no longer read its group's messages
 ### Device data encryption
 
 When a client creates or makes any update to the above (which generally should only consist of
-changes to its own "unique-client-id" sub-object) it then encodes and encrypts the config update
-(using libsession's config diff + update mechanism) using a random `key_base` value for the
-encryption.
+changes to its own `unique-client-identifier` record) it then encodes the whole of it -- every group
+message is a snapshot of the group, not a diff -- and encrypts it using a random `key_base` value.
 
 Only the device that makes a change pushes for it, and does so at once: it fetches the namespace,
 so that what it pushes is built on what the swarm holds, and pushes straight after rather than at
@@ -256,36 +264,41 @@ as:
 
 ```json
     {
+        "": "G",
+        "@": "...encrypted 8-byte group identifier...",
         "A": "pubkey...",   // ephemeral X25519 pubkey
-        "ciphertexts": "[ct123...][ct456...][ct789...][ctabc...]"],
-        "group": "...encrypted 8-byte group identifier...",
-        "keys": "[abc123...][def456...][789aaa...][888bbb...]],
-        "kicked": "[k123...][k456...][k789...][kabc...]",
-        "link_x25519": "...the group's current account X25519 pubkey...",
-        "payload": "...encrypted payload...",
-        "time": 1777777777123,  // when the author wrote it, unix milliseconds
-        "signature": "...above data signed with long-term account key...",
+        "C": "[ct123...][ct456...][ct789...][ctabc...]",
+        "K": "[abc123...][def456...][789aaa...][888bbb...]",
+        "X": "...the group's current account X25519 pubkey...",
+        "d": "...encrypted payload...",
+        "k": "[k123...][k456...][k789...][kabc...]",
+        "t": 1777777777123,  // when the author wrote it, unix milliseconds
+        "~": "...above data signed with long-term account key...",
     }
 ```
 
-where:
-- `payload` contains the encrypted payload the device needs, using xchacha20-poly1305 encryption
-  with the random base key, `key_base`.
+where, under the names the rest of this document uses for them:
+- `d`, the `payload`, contains the encrypted payload the device needs, using xchacha20-poly1305
+  encryption with the random base key, `key_base`.
 - `A` is a single ephemeral X25519 key used for symmetric encryption keys
-- `group` identifies which of the account's device groups the message belongs to; see "Group
-  identifier" below.
-- `kicked` announces removals to devices that can no longer read the payload; see "Announcing
-  removals" below.
-- `link_x25519` is the X25519 half of the group's current account key (see "Account keys"), to which
-  a device asking to join the group encrypts its link request (see "Initiating a device link").  Only
-  members hold the matching secret, so only they can read requests.  The ML-KEM half is not
-  published here: it would add over a kilobyte to every group message, to protect a short-lived
-  request whose contents -- a device's public keys and description -- are of little use to anyone
-  recording it for a future quantum attack.
-- `time` is when the message was written, by its author's clock, in unix milliseconds.  It is
-  covered by the signature, so unlike the timestamp the swarm reports for a stored message -- which
-  nothing binds to the message, and which a storage server can set to anything -- it cannot be
-  changed by anyone without the account seed.  Wherever a device needs a group message's age, it
+- `@`, the `group`, identifies which of the account's device groups the message belongs to; see
+  "Group identifier" below.
+- `k`, the `kicked` list, announces removals to devices that can no longer read the payload; see
+  "Announcing removals" below.  It carries no more removals than the payload does (see "Which
+  removals a message carries"), and is left out altogether when that is none.
+- `X`, the `link_x25519`, is the X25519 half of the group's current account key (see "Account
+  keys"), to which a device asking to join the group encrypts its link request (see "Initiating a
+  device link").  Only members hold the matching secret, so only they can read requests.  The
+  ML-KEM half is not published here: it would add over a kilobyte to every group message, to
+  protect a request that lives 10 minutes.  Someone recording requests today for a future quantum
+  computer could recover from one the requesting device's description, type and version, and its
+  device public keys: metadata tying that device to the account.  That is all.  It gives no access
+  to any message, past or future: the keys a request carries are public keys, and nothing in it
+  decrypts anything.
+- `t`, the `time`, is when the message was written, by its author's clock, in unix milliseconds.
+  It is covered by the signature, so unlike the timestamp the swarm reports for a stored message --
+  which nothing binds to the message, and which a storage server can set to anything -- it cannot
+  be changed by anyone without the account seed.  Wherever a device needs a group message's age, it
   uses this and never the swarm's timestamp: to tell whether it has been displaced (see "Displaced
   devices"), for when a group was last active, and for which of a group's messages carries its
   current `link_x25519`.  A message without `time` is invalid, and one whose `time` is more than 10
@@ -293,16 +306,19 @@ where:
   clock skew, and believed, it would outrank every honest message from the group until the
   reader's clock caught up.  The swarm's expiry, by contrast, is still what says how long a group's
   message stays stored.
-- `ciphertexts` is a packed binary value of N×4×1088 bytes where each 1088 byte segment contains an
-  ML-KEM768 ciphertext for one of the accounts devices.  When the number of devices is not a
-  multiple of 4, the unused slots are filled with random data.
-- `keys` are the encrypted values of `key_base`, encrypted for each device using xchacha20 (NB: this
-  stage of encryption does *not* include poly1305 authentication) with a unique device key
+- `C`, the `ciphertexts`, is a packed binary value of 4⌈N/4⌉×1088 bytes, for the N devices the
+  message is encrypted to, where each 1088 byte segment contains an ML-KEM768 ciphertext for one of
+  them.  When the number of devices is not a multiple of 4, the unused slots are filled with random
+  data.
+- `K`, the `keys`, are the encrypted values of `key_base`, encrypted for each device using xchacha20
+  (NB: this stage of encryption does *not* include poly1305 authentication) with a unique device key
   (described below).  Each entry is 34 bytes: a 2-byte device key index followed by the 32-byte
-  encrypted key.  Like `ciphertext`, this is always a multiple of 4 entries (i.e. 4×34 bytes), with
-  random noise used for unused slots.  The keys here must be in the same order as `ciphertexts`: that is, the 3rd
-  1088-byte slice of ciphertexts is the ciphertext for the device whose encrypted value is the 3rd
-  32-byte slice of `keys`.
+  encrypted key.  Like `ciphertexts`, this is always a multiple of 4 entries (i.e. 4×34 bytes),
+  with random noise used for unused slots.  The entries here must be in the same order as
+  `ciphertexts`: that is, the 3rd 1088-byte slice of `ciphertexts` is the ciphertext for the device
+  whose encrypted value is the 3rd 34-byte entry of `keys`.
+- `""` is the message type tag (see "Linked device configuration"), and `~` the signature, by the
+  account's long-term key, over everything before it.
 
 Actual encryption is performed as follows:
 
@@ -693,9 +709,10 @@ attempt pays that for every one of its ~2^42 tries.
 ### Device link request handling
 
 Upon receiving a device link request in namespace 21 that it can decrypt and whose signature is
-valid, an existing (linked) device must display to the user a screen with the new device details, asking for confirmation of the new linked
-device.  This information should generally consist of the device type, description, and version,
-time the request was made, and the short authentication string.
+valid, an existing (linked) device must display to the user a screen with the new device details,
+asking for confirmation of the new linked device.  This information should generally consist of the
+device type, description, and version, time the request was made, and the short authentication
+string.
 
 In some circumstances, additional information might also need to be confirmed or requested:
 
@@ -958,6 +975,10 @@ lowest seed breaking a tie.
 Account public keys consist of a pair of public keys: an ML-KEM-768 pubkey, and a X25519 pubkey.  We
 effectively follow the fundamentals of the draft X-Wing construction, but with some small
 modifications as needed for the specifics of Session message construction.
+
+The secret halves live only on the account's devices, shared through the device group and never
+derived from the account seed.  Losing every device that holds them loses everything encrypted to
+them, and restoring the account from its recovery phrase cannot bring that back.
 
 Account public keys are stored in an account's namespace -21, which is a public "outbox" that only
 the account owner can upload to, and anyone can fetch from.  This mechanism is used by other clients
