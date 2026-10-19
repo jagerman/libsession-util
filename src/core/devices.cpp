@@ -1638,43 +1638,64 @@ void Devices::receive_device_group_message(
         _member_changes.insert(_member_changes.end(), members.begin(), members.end());
 }
 
-void Devices::_leave_group() {
+void Devices::leave_group(result_function<bool> cb) {
+    async([this] { return _leave_group(); }, std::move(cb));
+}
+
+bool Devices::leave_group(await_t) {
+    return jq().call_get([this] { return _leave_group(); });
+}
+
+bool Devices::_leave_group() {
     assert(on_loop());
-    auto c = conn();
+    if (!_group_id() && !core.globals.get_integer(dissolved_key))
+        return false;
 
-    std::vector<std::string> messages;
-    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
-        messages.push_back(std::move(hash));
+    // Only a member in good standing speaks for the group.  A removed device's departure could not
+    // lower its removal, and a displaced one's would be taken as the departure of whichever device
+    // now holds its id there.
+    if (_member()) {
+        auto c = conn();
+        std::vector<std::string> messages;
+        for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+            messages.push_back(std::move(hash));
 
-    // A departure for the members left, so they stop encrypting to us and rotate to a key we do not
-    // hold, pushed as an ordinary group message: so it replaces the old group's messages as any
-    // push does.  With nobody left, the messages are only deleted: nothing could read them, and
-    // devices elsewhere would go on alerting about a group nobody is in.
-    std::vector<SwarmStore> stores;
-    if (c.prepared_get<int>(
-                "SELECT count(*) FROM devices WHERE state = ? AND unique_id != ?",
-                static_cast<int>(device::State::Registered),
-                self_id) > 0) {
-        c.prepared_exec(
-                "UPDATE devices SET state = ?, kicked_timestamp = ? WHERE unique_id = ?",
-                static_cast<int>(device::State::Left),
-                epoch_seconds(clock_now_s()),
-                self_id);
-        stores.push_back(
-                {.ns = config::Namespace::Devices,
-                 .data = encrypt_device_data(devices(true, true, true)),
-                 .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+        // A departure for the members left, so they stop encrypting to us and rotate to a key we
+        // do not hold, pushed as an ordinary group message: so it replaces the group's messages as
+        // any push does.  With nobody left, the messages are only deleted: nothing could read
+        // them, and devices elsewhere would go on seeing a group nobody is in.
+        std::vector<SwarmStore> stores;
+        if (c.prepared_get<int>(
+                    "SELECT count(*) FROM devices WHERE state = ? AND unique_id != ?",
+                    static_cast<int>(device::State::Registered),
+                    self_id) > 0) {
+            c.prepared_exec(
+                    "UPDATE devices SET state = ?, kicked_timestamp = ? WHERE unique_id = ?",
+                    static_cast<int>(device::State::Left),
+                    epoch_seconds(clock_now_s()),
+                    self_id);
+            stores.push_back(
+                    {.ns = config::Namespace::Devices,
+                     .data = encrypt_device_data(devices(true, true, true)),
+                     .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             DEVICE_GROUP_TTL)});
+        }
+        if (core.network())
+            core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
+                if (!results)
+                    log::warning(cat, "Could not leave the device group cleanly");
+            });
+        else
+            log::warning(cat, "Leaving the device group without telling it: no network");
     }
-    if (core.network())
-        core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
-            if (!results)
-                log::warning(cat, "Could not leave the old device group cleanly");
-        });
-    else
-        log::warning(cat, "Leaving the old device group without telling it: no network");
 
     _forget_group();
     log::info(cat, "Left the device group");
+
+    _devices_changed = true;
+    _rebaseline_membership();
+    _flush_events();
+    return true;
 }
 
 bool Devices::_record_group(const SwarmMessage& msg) {

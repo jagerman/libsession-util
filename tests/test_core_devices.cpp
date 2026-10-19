@@ -2544,6 +2544,110 @@ TEST_CASE(
     CHECK(pushes(*net).empty());
     CHECK_FALSE(l.applicant->devices.outgoing_link_request(await));
     CHECK(own_state(l.applicant) == device::State::Registered);
+
+    // Its user choosing the other group: leave, then ask.
+    REQUIRE(l.applicant->devices.leave_group(await));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
+    got.reset();
+    request_link(l.applicant, other, got);
+    CHECK(own_state(l.applicant) == device::State::Pending);
+    answer_upload(l.applicant, *net, true);  // the departure from the group it left
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    CHECK(got->has_value());
+}
+
+TEST_CASE(
+        "Devices - a device leaving its group tells it, and forgets it",
+        "[core][devices][membership][leave]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.core);
+    auto* net = attach_mock_network(*l.applicant);
+
+    REQUIRE(l.applicant->devices.leave_group(await));
+
+    // Nothing of the group left, though the group itself is still there to see.
+    CHECK(l.applicant->devices.devices(true, true, true).empty());
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(account_key_count(l.applicant) == 0);
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::GroupsVisible);
+    REQUIRE(state.others.size() == 1);
+    CHECK(state.others[0].id == group);
+    // Its own doing, so not news to it.
+    CHECK(l.applicant_events.membership.back() == device::Membership::InGroup);
+
+    // And the group hears of the departure, from a message it can read and the leaver will not
+    // again, and moves to an account key the leaver does not hold.
+    auto sent = pushes(*net);
+    REQUIRE(sent.size() == 1);
+    auto [farewell, deleted] = pushed(*sent[0]);
+    REQUIRE_FALSE(farewell.empty());
+    auto key_before = l.core->devices.active_account_keys().front().x25519_pub;
+    TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G9");
+    CHECK(l.state_of_applicant().state == device::State::Left);
+    CHECK(l.core->devices.active_account_keys().front().x25519_pub != key_before);
+
+    // Nothing more to leave.
+    CHECK_FALSE(l.applicant->devices.leave_group(await));
+}
+
+TEST_CASE(
+        "Devices - a device leaving a group of its own deletes it",
+        "[core][devices][membership][leave]") {
+    TempCore c;
+    TestHelper::deliver_device_message(
+            *c, c->devices.build_device_group_message().message, in(10min), "B1");
+    auto* net = attach_mock_network(*c);
+
+    REQUIRE(c->devices.leave_group(await));
+
+    // Nobody was left in it, so it is deleted rather than told anything.
+    auto sent = pushes(*net);
+    REQUIRE(sent.size() == 1);
+    auto [stored, deleted] = pushed(*sent[0]);
+    CHECK(stored.empty());
+    CHECK(deleted == nlohmann::json::array({"B1"}));
+}
+
+TEST_CASE(
+        "Devices - a device no longer in good standing leaves without a word",
+        "[core][devices][membership][leave]") {
+    Linking l;
+    l.admit();
+
+    SECTION("displaced") {
+        // A copy of it admitted in its place, as in "a device whose place another has taken".
+        TempCore copy{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+        TestHelper::set_device_id(*copy, l.applicant_id());
+        ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+        TestHelper::deliver_device_message(
+                *l.core, TestHelper::build_link_request(*copy, *l.core).message, in(10min), "L2");
+        REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G2");
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Displaced);
+    }
+    SECTION("removed") {
+        REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G2");
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
+    }
+
+    // A departure under its id would now apply to another device, or could not undo its removal.
+    auto* net = attach_mock_network(*l.applicant);
+    REQUIRE(l.applicant->devices.leave_group(await));
+    CHECK(pushes(*net).empty());
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::GroupsVisible);
 }
 
 TEST_CASE(

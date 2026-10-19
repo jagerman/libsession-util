@@ -66,7 +66,8 @@ Call `membership()` at startup. Until the first fetch from the swarm completes i
 `Unknown`, because the swarm may have changed while the application was down. **Do not prompt from
 `Unknown`.** Wait for `membership_changed`, which fires when the first fetch makes the state known,
 and on every change after, except one made by your own call (asking to join, starting a group,
-renewing the device's identity). Re-read `membership()` after making those calls.
+dissolving one, leaving one, renewing the device's identity). Re-read `membership()` after making
+those calls.
 
 `membership()` returns the state, this device's group (when in one), and `others`: every other
 group in the swarm, newest first, each with its id and when it was last active (`last_seen`: when
@@ -215,6 +216,9 @@ a device that started a group of its own by mistake months ago ("two months ago"
   the user confirms, say plainly what is lost: **messages that reached the other group's devices
   only, encrypted to keys no device of this group holds, cannot be recovered afterwards** unless
   another device still holds those keys.
+- **Use the other group:** `leave_group()`, then join the other group as a new device does (see
+  "Joining"), with the emoji confirmation. Devices still in this group are forked in turn and
+  prompted the same way.
 
 `dissolve_group` answers false if the group is no longer in view, or this device is no longer
 `Forked`; re-read `membership()` and redraw.
@@ -251,6 +255,21 @@ new device group instead" choice, and say what is lost: **messages that reached 
 devices only, encrypted to keys this device does not hold, cannot be recovered afterwards** unless
 another device still holds those keys. This device is not alerted about anything: the choice was
 its user's.
+
+## Leaving a group
+
+`leave_group()` takes this device out of its group and forgets the group, leaving it `NoGroup` or
+`GroupsVisible`. Call it:
+
+- **On logout, or when the user clears the app's data**, before wiping anything. The group is told
+  the device has gone, so it stops listing it and encrypting to it; otherwise it stays in every
+  other device's list until someone removes it by hand. The departure is attempted once, at once,
+  and not reported on, since a device about to wipe itself may get no second chance.
+- **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join.
+
+A device that was removed, displaced or dissolved just forgets the group; it has nothing it may tell
+it. `leave_group` answers false if there is no group to leave. A device cannot ask to join a group
+while it is in one (`err::already_registered`): leaving comes first.
 
 ## Do not
 

@@ -10,7 +10,6 @@
 #include <oxen/quic/timer_id.hpp>
 #include <session/clock.hpp>
 #include <session/sodium_array.hpp>
-#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -293,8 +292,9 @@ namespace device {
         Forked,     ///< In a group, while another group is in the swarm and no tombstone names
                     ///< this one: the account has forked, and an account can have only one group.
                     ///< Nothing has been decided, so the device pushes nothing until its user
-                    ///< decides to keep this group, dissolving the others
-                    ///< (`Devices::dissolve_group`).
+                    ///< decides: to keep this group, dissolving the others
+                    ///< (`Devices::dissolve_group`), or to leave it for another
+                    ///< (`Devices::leave_group`, then `Devices::request_link`).
     };
 
     /// A device group in the swarm other than this device's own.
@@ -519,7 +519,7 @@ class Devices final : detail::CoreComponent {
     // accept, and answers once the swarm has stored it.  The request is encrypted to that group, so
     // that only its members can read it; the group must be one this device has seen in the swarm.
     // The account must already be restored here, and the device not in a group: an account has
-    // only one, so there is no switching from one to another.
+    // only one, so there is no switching from one to another, only `leave_group` and then asking.
     //
     // It is admitted only once a group message admitting it has arrived *and* its user has
     // confirmed the SAS through `confirm_link`, and then hears `membership_changed(InGroup)` -- or
@@ -625,7 +625,8 @@ class Devices final : detail::CoreComponent {
     // Answers false if the device is not in the group -- unknown, still only asking to join (which
     // is `ignore_request`), or already gone -- or this device is no longer in it either.  None of
     // those is an error: each can happen between a device list being drawn and the user acting on
-    // it.  Passing this device's own id is an error (std::invalid_argument).
+    // it.  Passing this device's own id is an error (std::invalid_argument): a device leaves
+    // through `leave_group`.
     void remove_device(device::Id id, result_function<bool> cb);
     bool remove_device(std::span<const std::byte, device::ID_SIZE> id, await_t);
 
@@ -671,6 +672,22 @@ class Devices final : detail::CoreComponent {
     // (std::invalid_argument).
     void dissolve_group(device::GroupId group, result_function<bool> cb);
     bool dissolve_group(const device::GroupId& group, await_t);
+
+    // Leaves this device's group, which it then forgets -- its devices, its account keys and its
+    // identifier -- leaving the device `NoGroup` or `GroupsVisible`.  For logging out or clearing
+    // the device's data, and for a `Forked` device whose user chooses the other group: leave, then
+    // `request_link` to it.  See "Leaving a group".
+    //
+    // A member in good standing tells its group: a departure is pushed to the other members, so
+    // that they stop encrypting to it and move to an account key it does not hold, or the group's
+    // messages are deleted if it had no other.  Attempted once, now, and not reported on: a device
+    // about to wipe itself may get no second chance.  A device removed, displaced or dissolved has
+    // nothing it may say to its group, and only forgets it.
+    //
+    // The device keeps its device id, which the group it left now holds as departed: it cannot ask
+    // to join that same group again.  Answers false for a device in no group to leave.
+    void leave_group(result_function<bool> cb);
+    bool leave_group(await_t);
 
   private:
     bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
@@ -765,9 +782,9 @@ class Devices final : detail::CoreComponent {
     // for the user's confirmation.
     bool _asking();
 
-    // Leaves the group this device is in: a departure pushed to the group's other members, or its
-    // messages deleted if it had none, and the group forgotten.
-    void _leave_group();
+    // What `leave_group` does once on the loop: a departure (or the group's deletion) only from a
+    // member in good standing, then `_forget_group`.  False with no group to leave.
+    bool _leave_group();
 
     bool _confirm_link();
 

@@ -796,9 +796,16 @@ had heard of: joining it was the user's later choice.
 
 ### Leaving a group
 
-A device in a group cannot ask to join another: an account has only one group, so there is no
-moving from one to another.  It leaves its group first, and then asks as any device outside a group
-does.  A device leaving its group:
+A device leaves its group when its data is about to be cleared, so that the group does not go on
+counting and encrypting to a device that is gone, and when its user, forked, chooses the other
+group.  A device in a group cannot ask to join another: an account has only one group, so there is
+no moving from one to another.  It leaves its group first, and then asks as any device outside a
+group does.
+
+Only a member in good standing tells its group that it is leaving.  A removed device's departure
+could not lower its removal, and a displaced device's would be taken as the departure of whichever
+device now holds its ID; a device removed, displaced or dissolved only forgets its group.  A member
+in good standing leaving its group:
 
 - If it was the group's only member, deletes the group's messages from the swarm.  No device is left
   to read them, and other devices would otherwise go on seeing a group that nobody is in.
