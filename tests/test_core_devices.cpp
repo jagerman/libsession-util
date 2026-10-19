@@ -5165,3 +5165,56 @@ TEST_CASE(
             l.core->devices, l.core->devices.build_device_group_message().message));
     CHECK(pushed_payload.find("2:zz6:future") != std::string::npos);
 }
+
+TEST_CASE(
+        "Devices - an account key pruned takes the devices it reached with it",
+        "[core][devices][rotation]") {
+    Linking l;
+    l.admit();
+    push_from(l.core, "G1");
+    auto key = account_key(l.core);
+    auto recipients_of = [&](const std::array<std::byte, 32>& pub) {
+        return l.core->database().conn().prepared_get<int>(
+                "SELECT count(*) FROM device_account_key_recipients r"
+                " JOIN device_account_keys k ON k.id = r.key WHERE k.pubkey_x25519 = ?",
+                pub);
+    };
+    auto rows = [&] {
+        return l.core->database().conn().prepared_get<int>(
+                "SELECT count(*) FROM device_account_key_recipients");
+    };
+    REQUIRE(recipients_of(key) == 2);
+
+    // Rotated away, and kept for as long as contacts may still encrypt to it; then gone, and what
+    // it reached gone with it.
+    l.core->devices.rotate_account_keys();
+    auto before = rows();
+    ScopedClockOffset later{Devices::ACCOUNT_KEY_RETENTION + 2s};
+    l.core->devices.active_account_keys();
+    CHECK(account_key_count(l.core) == 1);
+    CHECK(rows() == before - 2);
+}
+
+TEST_CASE(
+        "Devices - a key rotated by a device with a slow clock is not the link key at once",
+        "[core][devices][rotation]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.core);
+    push_from(l.core, "G1");
+    auto previous = account_key(l.core);
+    REQUIRE(TestHelper::seen_group(*l.core, group)->first == previous);
+
+    // The applicant's clock is ten minutes behind: it rotates, and its push is written as of then.
+    ScopedClockOffset slow{-10min};
+    l.applicant->devices.rotate_account_keys();
+    auto rotated = account_key(l.applicant);
+    TestHelper::deliver_device_message(*l.core, push_from(l.applicant, "G2"), in(10min), "G2");
+
+    // The existing device takes the new key as current, being the newest made -- but the link key
+    // it holds for the group is the one in the group's newest message by `t`, which is still its
+    // own.  Joining devices go on encrypting to the previous key, which is retained and honoured,
+    // until a push dated later than that one says otherwise.
+    CHECK(account_key(l.core) == rotated);
+    CHECK(TestHelper::seen_group(*l.core, group)->first == previous);
+}
