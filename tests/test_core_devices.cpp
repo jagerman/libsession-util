@@ -2658,6 +2658,127 @@ TEST_CASE(
     CHECK(held.at(l.applicant_id()).state == device::State::Registered);
 }
 
+namespace {
+int pending_pushes(TempCore& c) {
+    return c->database().conn().prepared_get<int>("SELECT count(*) FROM device_pending_pushes");
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a departure made without a network goes once there is one",
+        "[core][devices][membership][leave]") {
+    Linking l;
+    l.admit();
+    auto old_id = l.applicant_id();
+
+    // Built, and kept, though nothing of the group is left to build it from again.
+    REQUIRE(l.applicant->devices.leave_group(await));
+    CHECK(pending_pushes(l.applicant) == 1);
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+
+    SECTION("at the next fetch, and again until the swarm has it") {
+        auto* net = attach_mock_network(*l.applicant);
+        TestHelper::finish_fetch(*l.applicant);
+        REQUIRE(pushes(*net).size() == 1);
+        auto [farewell, deleted] = pushed(*pushes(*net)[0]);
+        REQUIRE_FALSE(farewell.empty());
+
+        answer_upload(l.applicant, *net, false);
+        CHECK(pending_pushes(l.applicant) == 1);
+        TestHelper::finish_fetch(*l.applicant);
+        REQUIRE(pushes(*net).size() == 1);
+        answer_upload(l.applicant, *net, true);
+        CHECK(pending_pushes(l.applicant) == 0);
+
+        // Nothing more to send.
+        TestHelper::finish_fetch(*l.applicant);
+        CHECK(pushes(*net).empty());
+
+        TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G9");
+        CHECK(l.core->devices.devices(true, true, true, old_id).at(old_id).state ==
+              device::State::Left);
+    }
+
+    SECTION("after a restart") {
+        restart_applicant(l);
+        auto* net = attach_mock_network(*l.applicant);
+        TestHelper::finish_fetch(*l.applicant);
+        REQUIRE(pushes(*net).size() == 1);
+        auto [farewell, deleted] = pushed(*pushes(*net)[0]);
+        TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G9");
+        CHECK(l.core->devices.devices(true, true, true, old_id).at(old_id).state ==
+              device::State::Left);
+    }
+
+    SECTION("not once the group it was for has expired from the swarm") {
+        ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1min};
+        auto* net = attach_mock_network(*l.applicant);
+        TestHelper::finish_fetch(*l.applicant);
+        CHECK(pushes(*net).empty());
+        CHECK(pending_pushes(l.applicant) == 0);
+    }
+}
+
+TEST_CASE(
+        "Devices - a departure is stored in the same commit as the leaving",
+        "[core][devices][membership][leave]") {
+    Linking l;
+    l.admit();
+    auto old_id = l.applicant_id();
+    auto group = *TestHelper::group_id(*l.applicant);
+    auto sql = [&](const std::string& query) {
+        TestHelper::on_loop(
+                *l.applicant, [&] { return l.applicant->database().conn().prepared_exec(query); });
+    };
+
+    // Forgetting the group made to fail, after the departure is built, as an interruption there
+    // would leave things.
+    sql("CREATE TRIGGER interrupted BEFORE DELETE ON devices BEGIN SELECT RAISE(ABORT, 'x'); END");
+    CHECK_THROWS(l.applicant->devices.leave_group(await));
+    sql("DROP TRIGGER interrupted");
+
+    // None of it, then: no departure waiting to go for a group still held.
+    CHECK(pending_pushes(l.applicant) == 0);
+    CHECK(TestHelper::group_id(*l.applicant) == group);
+    CHECK(l.applicant_id() == old_id);
+    CHECK(own_state(l.applicant) == device::State::Registered);
+
+    // And all of it, done again.
+    REQUIRE(l.applicant->devices.leave_group(await));
+    CHECK(pending_pushes(l.applicant) == 1);
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(l.applicant_id() != old_id);
+}
+
+TEST_CASE(
+        "Devices - a dissolution made without a network goes once there is one",
+        "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+    // Nothing of its own owed, so that the push the fetch sends below is the dissolution's.
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G0");
+
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+    CHECK(pending_pushes(l.core) == 1);
+
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    REQUIRE(pushes(*net).size() == 1);
+    auto [tombstone, deleted] = pushed(*pushes(*net)[0]);
+    CHECK(deleted == nlohmann::json::array({"B1"}));
+    answer_upload(l.core, *net, true);
+    CHECK(pending_pushes(l.core) == 0);
+
+    TestHelper::deliver_device_message(*other, tombstone, in(10min), "T1");
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+}
+
 TEST_CASE(
         "Devices - a device leaving a group of its own deletes it",
         "[core][devices][membership][leave]") {

@@ -1646,59 +1646,71 @@ bool Devices::_leave_group() {
     if (!_group_id() && !core.globals.get_integer(dissolved_key))
         return false;
 
+    // Outside the transaction, which it would otherwise nest inside; a crash after it leaves only a
+    // spare device key.
+    rotate_device_keys();
+
     // Only a member in good standing speaks for the group.  A removed device's departure could not
     // lower its removal, and a displaced one's would be taken as the departure of whichever device
     // now holds its id there.
-    if (_member()) {
+    bool member = _member();
+    auto devs = member ? devices(true, true, true) : device::map{};
+
+    // The departure and the leaving commit together.  Queued alone, a crash before the leaving
+    // would leave us sending a departure for a group we go on acting in, under an id the group
+    // then holds as departed.
+    device::Id id;
+    {
         auto c = conn();
-        std::vector<std::string> messages;
-        for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
-            messages.push_back(std::move(hash));
+        SQLite::Transaction tx{c.sql};
+        if (member)
+            _queue_departure(devs);
 
-        // A departure for the members left, so they stop encrypting to us and rotate to a key we
-        // do not hold, pushed as an ordinary group message: so it replaces the group's messages as
-        // any push does.  With nobody left, the messages are only deleted: nothing could read
-        // them, and devices elsewhere would go on seeing a group nobody is in.
-        std::vector<SwarmStore> stores;
-        if (c.prepared_get<int>(
-                    "SELECT count(*) FROM devices WHERE state = ? AND unique_id != ?",
-                    static_cast<int>(device::State::Registered),
-                    self_id) > 0) {
-            c.prepared_exec(
-                    "UPDATE devices SET state = ?, kicked_timestamp = ? WHERE unique_id = ?",
-                    static_cast<int>(device::State::Left),
-                    epoch_seconds(clock_now_s()),
-                    self_id);
-            stores.push_back(
-                    {.ns = config::Namespace::Devices,
-                     .data = encrypt_device_data(devices(true, true, true)),
-                     .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             DEVICE_GROUP_TTL)});
-        } else {
-            // Nobody left in it, so not a group to see in the swarm, beside one joined next.
-            auto ours = std::span<const std::byte>{_group_id()->value};
-            c.prepared_exec("DELETE FROM device_groups WHERE group_id = ?", ours);
-            c.prepared_exec("DELETE FROM device_group_messages WHERE group_id = ?", ours);
-        }
-        if (core.network())
-            core._swarm_push(std::move(stores), std::move(messages), [](auto results) {
-                if (!results)
-                    log::warning(cat, "Could not leave the device group cleanly");
-            });
-        else
-            log::warning(cat, "Leaving the device group without telling it: no network");
+        // Under a new id, as any device leaving its group: a record of ours in the group left can
+        // then never meet one in the next, and asking to join the same group again is asking as a
+        // new device.
+        id = _forget_identity();
+        tx.commit();
     }
-
-    // Under a new id, as any device leaving its group: a record of ours in the group left can then
-    // never meet one in the next, and asking to join the same group again is asking as a new
-    // device.
-    _new_identity();
+    _adopt_identity(id);
     log::info(cat, "Left the device group");
+    _send_pending_pushes();
 
     _devices_changed = true;
     _rebaseline_membership();
     _flush_events();
     return true;
+}
+
+void Devices::_queue_departure(device::map& devs) {
+    auto c = conn();
+    bool others = std::ranges::any_of(devs, [this](const auto& d) {
+        return d.first != self_id && d.second.state == device::State::Registered;
+    });
+
+    std::vector<std::string> messages;
+    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        messages.push_back(std::move(hash));
+
+    // A departure for the members left, so they stop encrypting to us and rotate to a key we do
+    // not hold, pushed as an ordinary group message: so it replaces the group's messages as any
+    // push does.  With nobody left, the messages are only deleted: nothing could read them, and
+    // devices elsewhere would go on seeing a group nobody is in.
+    std::optional<std::vector<std::byte>> departure;
+    if (others) {
+        auto& self = devs.at(self_id);
+        self.state = device::State::Left;
+        self.kicked = clock_now_s();
+        departure = encrypt_device_data(devs);
+    } else {
+        // Nobody left in it, so not a group to see in the swarm, beside one joined next.
+        auto ours = std::span<const std::byte>{_group_id()->value};
+        c.prepared_exec("DELETE FROM device_groups WHERE group_id = ?", ours);
+        c.prepared_exec("DELETE FROM device_group_messages WHERE group_id = ?", ours);
+    }
+
+    // Complete in itself, so nothing about sending it needs the group about to be forgotten.
+    _queue_push(std::move(departure), std::move(messages));
 }
 
 bool Devices::_record_group(const SwarmMessage& msg) {
@@ -1821,24 +1833,87 @@ void Devices::_dissolve(
                 obsolete.push_back(std::move(hash));
             _mark_dissolved(group, t);
         }
+
+        // Never renewed, and never among what a group push deletes: it is there to tell the
+        // dissolved group's devices that are online now, and lapses with the messages it replaced.
+        _queue_push(_build_dissolution(groups, t), std::move(obsolete));
         tx.commit();
     }
-
-    // Never renewed, and never among what a group push deletes: it is there to tell the dissolved
-    // group's devices that are online now, and lapses with the messages it replaced.
-    std::vector<SwarmStore> stores;
-    stores.push_back(
-            {.ns = config::Namespace::Devices,
-             .data = _build_dissolution(groups, t),
-             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
-    if (core.network())
-        core._swarm_push(std::move(stores), std::move(obsolete), [](auto results) {
-            if (!results || results->empty() || !results->front().stored)
-                log::warning(cat, "Could not publish a device group's dissolution");
-        });
-    else
-        log::warning(cat, "Not publishing a device group's dissolution: no network");
     log::info(cat, "Dissolved {} other device group(s)", groups.size());
+    _send_pending_pushes();
+}
+
+void Devices::_queue_push(
+        std::optional<std::vector<std::byte>> message, std::vector<std::string> obsolete) {
+    if (!message && obsolete.empty())
+        return;
+    oxenc::bt_list_producer hashes;
+    for (const auto& h : obsolete)
+        hashes.append(h);
+    auto encoded = std::move(hashes).str();
+    conn().prepared_exec(
+            "INSERT INTO device_pending_pushes (message, obsolete, created_at) VALUES (?, ?, ?)",
+            message ? std::optional{std::span<const std::byte>{*message}} : std::nullopt,
+            to_span<std::byte>(encoded),
+            epoch_seconds(clock_now_s()));
+}
+
+void Devices::_send_pending_pushes() {
+    assert(on_loop());
+    auto c = conn();
+    c.prepared_exec(
+            "DELETE FROM device_pending_pushes WHERE created_at <= ?",
+            epoch_seconds(clock_now_s() - DEVICE_GROUP_TTL));
+    if (!core.network())
+        return;
+
+    struct Pending {
+        int64_t row;
+        std::optional<std::vector<std::byte>> message;
+        std::vector<std::string> obsolete;
+    };
+    // Read out before any is sent: an answer can come back within the send, and delete its row.
+    std::vector<Pending> pending;
+    for (auto [row, has_message, message, obsolete] :
+         c.prepared_results<int64_t, int, sqlite::blob, sqlite::blob>(
+                 "SELECT id, message IS NOT NULL, IFNULL(message, X''), obsolete"
+                 " FROM device_pending_pushes ORDER BY id")) {
+        if (_pending_in_flight.contains(row))
+            continue;
+        auto& p = pending.emplace_back();
+        p.row = row;
+        if (has_message)
+            p.message.emplace(message.begin(), message.end());
+        oxenc::bt_list_consumer hashes{std::span<const std::byte>{obsolete}};
+        while (!hashes.is_finished())
+            p.obsolete.push_back(hashes.consume_string());
+    }
+
+    for (auto& p : pending) {
+        _pending_in_flight.insert(p.row);
+        bool storing = p.message.has_value();
+        std::vector<SwarmStore> stores;
+        if (storing)
+            stores.push_back(
+                    {.ns = config::Namespace::Devices,
+                     .data = std::move(*p.message),
+                     .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             DEVICE_GROUP_TTL)});
+        core._swarm_push(
+                std::move(stores),
+                std::move(p.obsolete),
+                [this, alive = std::weak_ptr<int>{_alive}, row = p.row, storing](
+                        std::optional<std::vector<SwarmStoreResult>> results) {
+                    if (alive.expired())
+                        return;
+                    _pending_in_flight.erase(row);
+                    if (!results || (storing && (results->empty() || !results->front().stored))) {
+                        log::warning(cat, "A pending device group push was not stored; will retry");
+                        return;
+                    }
+                    conn().prepared_exec("DELETE FROM device_pending_pushes WHERE id = ?", row);
+                });
+    }
 }
 
 void Devices::_delete_from_swarm(std::vector<std::string> hashes, std::string_view what) {
@@ -1880,15 +1955,34 @@ void Devices::receive_dissolution(std::span<const std::byte> data) {
     // device.  The dissolutions we remember go with it: they were made in our group's favour, or
     // learned while in it, and the user has since chosen otherwise -- kept, one of them could undo
     // the very group chosen.
-    if (auto ours = _group_id(); ours && std::ranges::find(named, *ours) != named.end()) {
+    //
+    // All of it in one commit with the groups it marks dissolved, so that no crash leaves this
+    // device holding a group the tombstone named, or forgotten from it but not told it is
+    // Dissolved.
+    auto ours = _group_id();
+    bool dissolved = ours && std::ranges::find(named, *ours) != named.end();
+    if (dissolved) {
         log::warning(cat, "This device's group was dissolved by another of the account's devices");
-        _new_identity();
-        core.globals.set(dissolved_key, int64_t{1});
-        _devices_changed = true;
+        // Before the transaction, which it would otherwise nest inside.
+        rotate_device_keys();
     }
 
-    for (const auto& group : named)
-        _mark_dissolved(group, t);
+    std::optional<device::Id> id;
+    {
+        auto c = conn();
+        SQLite::Transaction tx{c.sql};
+        if (dissolved) {
+            id = _forget_identity();
+            core.globals.set(dissolved_key, int64_t{1});
+        }
+        for (const auto& group : named)
+            _mark_dissolved(group, t);
+        tx.commit();
+    }
+    if (id) {
+        _adopt_identity(*id);
+        _devices_changed = true;
+    }
 }
 
 bool Devices::_names_us_kicked(std::span<const std::byte> data) {
@@ -2870,16 +2964,25 @@ void Devices::_new_identity() {
     rotate_device_keys();
 
     device::Id id;
-    random::fill(id);
     {
         auto c = conn();
         SQLite::Transaction tx{c.sql};
-        _forget_group();
-        core.globals.set(dev_key, std::span<const std::byte>{id});
-        _forget_own_requests();
+        id = _forget_identity();
         tx.commit();
     }
+    _adopt_identity(id);
+}
 
+device::Id Devices::_forget_identity() {
+    device::Id id;
+    random::fill(id);
+    _forget_group();
+    core.globals.set(dev_key, std::span<const std::byte>{id});
+    _forget_own_requests();
+    return id;
+}
+
+void Devices::_adopt_identity(const device::Id& id) {
     log::info(cat, "Replaced device id {} with {}", self_id, id);
     self_id = id;
     _reqid_by_row.clear();
@@ -3201,6 +3304,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     // on top of everything this fetch merged.  A local change made between fetches waits for the
     // next one, which is what stops two devices answering the same update with duelling pushes.
     push_device_group();
+    _send_pending_pushes();
 }
 
 void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool /*is_final*/) {

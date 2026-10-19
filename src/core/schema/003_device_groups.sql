@@ -148,6 +148,13 @@ CREATE TABLE device_dissolved_groups (
     dissolved_at INTEGER NOT NULL
 ) STRICT;
 
+CREATE TABLE device_pending_pushes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    message BLOB,
+    obsolete BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE device_own_requests (
     id INTEGER PRIMARY KEY NOT NULL,
     group_id BLOB NOT NULL CHECK(length(group_id) == 8),

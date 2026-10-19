@@ -142,6 +142,21 @@ CREATE TABLE device_dissolved_groups (
     dissolved_at INTEGER NOT NULL
 ) STRICT;
 
+-- Pushes that outlive the state they were built from: a departure from a group this device has
+-- left, and a dissolution of another group.  Each row is the complete upload, written in the same
+-- transaction as the decision it announces, so that nothing the device forgets afterwards -- a
+-- group it left above all -- is needed to send it, and a push that fails, or never got to go before
+-- the device stopped, goes at the next fetch instead.  Deleted once the swarm confirms it, or unsent
+-- once it is older than a group message lives, when what it would replace has expired anyway.
+CREATE TABLE device_pending_pushes (
+    -- AUTOINCREMENT because a push in flight names its row, and a row dropped meanwhile must not
+    -- hand that id to a new one.
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    message BLOB,           -- the message to store, if any
+    obsolete BLOB NOT NULL, -- bt-encoded list of the swarm hashes to delete with it
+    created_at INTEGER NOT NULL
+) STRICT;
+
 -- The link requests this device has sent, so that a group message admitting it can be matched to
 -- the request it accepted.  A device can ask more than once -- again after a request seemed to go
 -- unanswered, say -- and any of them may be the one accepted, possibly after its deadline here has

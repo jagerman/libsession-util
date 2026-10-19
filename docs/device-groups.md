@@ -267,8 +267,11 @@ its user's.
 
 - **On logout, or when the user clears the app's data**, before wiping anything. The group is told
   the device has gone, so it stops listing it and encrypting to it; otherwise it stays in every
-  other device's list until someone removes it by hand. The departure is attempted once, at once,
-  and not reported on, since a device about to wipe itself may get no second chance.
+  other device's list until someone removes it by hand. The departure is attempted at once, and
+  retried after each fetch while the app is still running (and after a restart) until the swarm
+  has it; it is not reported on. On logout or clearing data the app then wipes the database, and
+  the departure with it, so it gets whatever that first attempt achieved: call `leave_group` while
+  the network is still up, and give it a moment before wiping if you can.
 - **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join.
 
 A device that was removed, displaced or dissolved just forgets the group; it has nothing it may tell

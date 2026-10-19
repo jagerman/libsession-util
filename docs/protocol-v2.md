@@ -830,6 +830,15 @@ in good standing leaving its group:
   remaining members stop encrypting to it.  Being a departure rather than a removal, it does not
   appear in the `kicked` list.
 
+The device builds that push under its old ID and stores it as a complete upload -- the message to
+store, if any, with the hashes it deletes -- in the same commit that forgets the group and takes the
+new ID, so that no interruption leaves one without the other.  It keeps the push until the swarm
+confirms it: sent at once if it can be, and again after each fetch until it has gone, including
+after a restart.  Nothing about sending it needs the group the device has since forgotten.  One
+older than a group message lives is dropped unsent, since by then the messages of the group it was
+for have expired anyway.  A tombstone dissolving a group (see "Dissolving a group") is kept and
+sent the same way.
+
 Either way it leaves all of the group behind -- its devices, its messages, and its account keys --
 and a group it joins next brings its own, all of which arrive with the message admitting it.  A
 group's account keys never carry into another: they would be handed to the new group's members in
