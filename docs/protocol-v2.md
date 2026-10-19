@@ -720,6 +720,9 @@ on a device that can see what it is choosing between.  There are two ways to it:
 - **Starting a group while others are in view.**  A device outside a group that starts one, while
   groups it could have asked to join are in the swarm, is choosing its new group over them, and
   dissolves them.
+- **Completing a join while others are in view.**  A device that sees more than one group and asks
+  to join one is choosing it over the rest, and once it is admitted -- the user having confirmed
+  the SAS -- it dissolves them.
 - **Keeping its own group when forked** (see "Forks"), over the other group in view.
 
 A device never dissolves a group of its own accord.  One that comes back to an empty swarm pushes
@@ -750,8 +753,7 @@ dissolves anything new.  It comes back as a new device, under a new ID, by askin
 starting a group -- which, like any start with groups in view, dissolves them.
 
 A device outside any group that sees more than one may join any of them, the most recently active
-being the natural choice.  Once it has, it is forked as well, and its user settles the rest as any
-member's can.
+being the natural choice; the rest are dissolved once the join completes.
 
 ### Dissolving a group
 

@@ -107,8 +107,11 @@ unchanged, and the next start (or the device screen) offers the choice again.
 1. **Choose.** In `GroupsVisible`, take the group from `membership().others`. Usually there is
    exactly one: use it without asking, and without showing its emoji. If there are several, the
    account has forked: offer the most recently active (the first in `others`) by default, with the
-   others listed by emoji, creation time and last activity. Whichever it joins, the account's
-   devices in a group are prompted to settle the rest (`Forked`).
+   others listed by emoji, creation time and last activity. **Joining one dissolves the rest** once
+   the link completes: their devices become `Dissolved` and have to link to the chosen group. Say
+   so at the choice, with what is lost: messages that reached those groups' devices only,
+   encrypted to keys the chosen group's devices do not hold, cannot be recovered afterwards unless
+   another device still holds those keys.
 2. **Ask.** `request_link(group, cb)`. It uploads the request and answers once the swarm has stored
    it, with the SAS and the deadline (10 minutes). Errors: `err::unknown_group` (no longer in the
    swarm), `err::network_unavailable`, `err::store_failed` (worth retrying), `err::already_registered`
@@ -220,8 +223,9 @@ a device that started a group of its own by mistake months ago ("two months ago"
   only, encrypted to keys no device of this group holds, cannot be recovered afterwards** unless
   another device still holds those keys.
 - **Use the other group:** `leave_group()`, then join the other group as a new device does (see
-  "Joining"), with the emoji confirmation. Devices still in this group are forked in turn and
-  prompted the same way.
+  "Joining"), with the emoji confirmation. Completing that join dissolves this group, so its other
+  devices become `Dissolved` and link to the other group in turn; the same warning about what is
+  lost applies, the other way round.
 
 `dissolve_group` answers false if the group is no longer in view, or this device is no longer
 `Forked`; re-read `membership()` and redraw.

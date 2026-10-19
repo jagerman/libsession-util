@@ -433,6 +433,10 @@ class Devices final : detail::CoreComponent {
     // messages again then dissolves it again.
     void _dissolve(std::span<const device::GroupId> groups, std::vector<std::string> obsolete = {});
 
+    // Dissolves every group in the swarm but `kept`, which the user has chosen: by starting it, or
+    // by completing a join to it.
+    void _dissolve_all_but(const device::GroupId& kept);
+
     // Deletes `hashes` from the swarm, once and without reporting back; `what` names them in logs.
     void _delete_from_swarm(std::vector<std::string> hashes, std::string_view what);
 

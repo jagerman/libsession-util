@@ -2243,6 +2243,45 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - joining one of several groups dissolves the rest", "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+
+    // Another group on the account, which the existing device sees too: forked.
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    auto b1 = other->devices.build_device_group_message().message;
+    TestHelper::deliver_device_message(*l.core, b1, in(10min), "B1");
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+
+    // The new device sees both, and the user picks the existing device's.
+    TestHelper::deliver_device_message(*l.applicant, b1, in(10min), "B1");
+    auto ours = l.show_group();
+    REQUIRE(l.applicant->devices.membership(await).others.size() == 2);
+    auto* net = attach_mock_network(*l.applicant);
+    l.admit();
+
+    // Completing the join is the choice of that group over the other.
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.group == ours);
+    CHECK(state.others.empty());
+    auto sent = dissolutions(*net);
+    REQUIRE(sent.size() == 1);
+    auto [tombstone, deleted] = pushed(*sent[0]);
+    CHECK(deleted == nlohmann::json::array({"B1"}));
+
+    // Which the other group's device, and the existing device it forked, both hear of.
+    TestHelper::deliver_device_message(*other, tombstone, in(10min), "T1");
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+    TestHelper::deliver_device_message(*l.core, tombstone, in(10min), "T1");
+    CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(l.core->devices.membership(await).others.empty());
+    CHECK(theirs != ours);
+}
+
+TEST_CASE(
         "Devices - a dissolution the user has since undone is not done again",
         "[core][devices][dissolve]") {
     Linking l;

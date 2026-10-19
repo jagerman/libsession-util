@@ -1625,10 +1625,12 @@ void Devices::receive_device_group_message(
 
     tx.commit();
 
-    // Being admitted, every member is new to us, and none of them is news.
+    // Being admitted, every member is new to us, and none of them is news.  And joining is the
+    // user's choice of this group over any other in view, as starting one would have been.
     if (admitting) {
         _forget_own_requests();
         core.globals.erase(dissolved_key);
+        _dissolve_all_but(theirs);
     } else
         _member_changes.insert(_member_changes.end(), members.begin(), members.end());
 }
@@ -1841,6 +1843,17 @@ void Devices::_dissolve(
     }
     log::info(cat, "Dissolved {} other device group(s)", groups.size());
     _send_pending_pushes();
+}
+
+void Devices::_dissolve_all_but(const device::GroupId& kept) {
+    std::vector<device::GroupId> others;
+    for (auto group : conn().prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>>(
+                 "SELECT group_id FROM device_groups WHERE group_id != ? AND expires_at > ?",
+                 std::span<const std::byte>{kept.value},
+                 epoch_seconds(clock_now_s())))
+        others.push_back(device::GroupId{group});
+    if (!others.empty())
+        _dissolve(others);
 }
 
 void Devices::_queue_push(
@@ -3005,8 +3018,7 @@ device::GroupId Devices::start_group(await_t) {
 
 device::GroupId Devices::_start_group() {
     assert(on_loop());
-    auto state = _membership();
-    switch (state.membership) {
+    switch (_membership().membership) {
         case device::Membership::Unknown:
             throw session::error{
                     err::membership_unknown,
@@ -3020,7 +3032,6 @@ device::GroupId Devices::_start_group() {
             // Leaving the group it is no longer in, as any leaving does, under a new id -- after
             // which that group is one in view like any other.
             _new_identity();
-            state = _membership();
             break;
         case device::Membership::Waiting: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
@@ -3033,21 +3044,16 @@ device::GroupId Devices::_start_group() {
     _forget_group();
     _forget_own_requests();
 
-    // The account can have only one group, and the user starting this one with others in view is
-    // choosing it over them.  Not news to this device, which is making the choice.
-    if (!state.others.empty()) {
-        std::vector<device::GroupId> others;
-        for (const auto& other : state.others)
-            others.push_back(other.id);
-        _dissolve(others);
-    }
-
     _mark_group_owed();
     establish_group();
     auto group = _group_id();
     if (!group)
         throw std::logic_error{"Started a group but it has no identifier"};
     log::info(cat, "Started a new device group");
+
+    // The account can have only one group, and the user starting this one with others in view is
+    // choosing it over them.  Not news to this device, which is making the choice.
+    _dissolve_all_but(*group);
 
     _devices_changed = true;
     _rebaseline_membership();
