@@ -4624,3 +4624,202 @@ TEST_CASE(
         CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dropped);
     }
 }
+
+namespace {
+
+// The tombstone carried by the newest dissolution `net` has seen sent.
+std::vector<std::byte> latest_tombstone(MockNetwork& net) {
+    auto sent = dissolutions(net);
+    REQUIRE(!sent.empty());
+    return pushed(*sent.back()).first;
+}
+
+int dissolved_count(TempCore& c) {
+    return c->database().conn().prepared_get<int>("SELECT count(*) FROM device_dissolved_groups");
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - two forked devices dissolving each other at once both end dissolved",
+        "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    auto* net = attach_mock_network(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto* other_net = attach_mock_network(*other);
+    auto ours = *TestHelper::group_id(*l.core);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    TestHelper::deliver_device_message(
+            *other, l.core->devices.build_device_group_message().message, in(10min), "A1");
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+    REQUIRE(other->devices.membership(await).membership == device::Membership::Forked);
+
+    // Each user keeps their own, before either device has heard of the other's choice.
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+    REQUIRE(other->devices.dissolve_group(ours, await));
+    auto from_core = latest_tombstone(*net);
+    auto from_other = latest_tombstone(*other_net);
+    auto sent = dissolutions(*net).size();
+    auto other_sent = dissolutions(*other_net).size();
+
+    TestHelper::deliver_device_message(*l.core, from_other, in(10min), "T2");
+    TestHelper::deliver_device_message(*other, from_core, in(10min), "T1");
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Dissolved);
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+
+    // And nothing more: neither tells the other again.
+    CHECK(dissolutions(*net).size() == sent);
+    CHECK(dissolutions(*other_net).size() == other_sent);
+    CHECK_FALSE(l.core->devices.dissolve_group(theirs, await));
+
+    // What is left is to start again, and to ask to join that.
+    auto mine = l.core->devices.start_device_group(await);
+    CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
+    TestHelper::deliver_device_message(
+            *other, l.core->devices.build_device_group_message().message, in(10min), "A2");
+    while (!pushes(*other_net).empty())
+        answer_upload(other, *other_net, true);
+    Asked got;
+    request_link(other, mine, got);
+    answer_upload(other, *other_net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+    CHECK(other->devices.membership(await).membership == device::Membership::Requesting);
+}
+
+TEST_CASE(
+        "Devices - a join to a revived group is undone when a kept group's device returns",
+        "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    auto* net = attach_mock_network(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+
+    // Everything lapses.  The dissolved group's device, never told, is back first, and a new
+    // device that never saw any of it joins the only group in the swarm.
+    ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1h};
+    TempCore joiner{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *joiner, other->devices.build_device_group_message().message, in(10min), "B2");
+    REQUIRE(joiner->devices.membership(await).membership == device::Membership::DeviceGroupVisible);
+    TestHelper::deliver_device_message(
+            *other, TestHelper::build_link_request(*joiner, *other).message, in(10min), "L1");
+    auto asked = other->devices.incoming_link_requests(await);
+    REQUIRE(asked.size() == 1);
+    REQUIRE(other->devices.accept_request(asked[0].id, await));
+    auto admitted = other->devices.build_device_group_message().message;
+    TestHelper::deliver_device_message(*joiner, admitted, in(10min), "B3");
+    REQUIRE(joiner->devices.confirm_link(await));
+    REQUIRE(joiner->devices.membership(await).membership == device::Membership::InGroup);
+
+    // Then a device of the group that was kept returns, and remembers.
+    TestHelper::deliver_device_message(*l.core, admitted, in(10min), "B3");
+    auto tombstone = latest_tombstone(*net);
+    TestHelper::deliver_device_message(*joiner, tombstone, in(10min), "T2");
+    TestHelper::deliver_device_message(*other, tombstone, in(10min), "T2");
+    CHECK(joiner->devices.membership(await).membership == device::Membership::Dissolved);
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+}
+
+TEST_CASE(
+        "Devices - starting a group from dissolved dissolves the group that was kept",
+        "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    auto* net = attach_mock_network(*l.core);
+    auto ours = *TestHelper::group_id(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_dissolution(*other, {ours}), in(10min), "T1");
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Dissolved);
+    REQUIRE(l.core->devices.membership(await).others.size() == 1);
+
+    // Starting one after all is choosing it over the group in view, the one that was kept.
+    l.core->devices.start_device_group(await);
+    auto state = l.core->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.others.empty());
+    TestHelper::deliver_device_message(*other, latest_tombstone(*net), in(10min), "T2");
+    CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
+}
+
+TEST_CASE(
+        "Devices - a dissolution interrupted partway leaves the device as it was",
+        "[core][devices][dissolve]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.applicant);
+    auto old_id = l.applicant_id();
+    auto sql = [&](const std::string& query) {
+        TestHelper::on_loop(
+                *l.applicant, [&] { return l.applicant->database().conn().prepared_exec(query); });
+    };
+    TempCore keeper{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    auto tombstone = TestHelper::build_dissolution(*keeper, {group});
+
+    // Forgetting the group made to fail, as an interruption there would leave things.
+    sql("CREATE TRIGGER interrupted BEFORE DELETE ON devices BEGIN SELECT RAISE(ABORT, 'x'); END");
+    TestHelper::deliver_device_message(*l.applicant, tombstone, in(10min), "T1");
+    sql("DROP TRIGGER interrupted");
+
+    // None of it, then: still in the group, under its id, and nothing marked dissolved.
+    CHECK(TestHelper::group_id(*l.applicant) == group);
+    CHECK(l.applicant_id() == old_id);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(dissolved_count(l.applicant) == 0);
+
+    // And all of it, the tombstone read again.
+    TestHelper::deliver_device_message(*l.applicant, tombstone, in(10min), "T1");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+    CHECK(l.applicant_id() != old_id);
+    CHECK(dissolved_count(l.applicant) == 1);
+}
+
+TEST_CASE(
+        "Devices - a dissolution stored but not deleted from the swarm is not tried again",
+        "[core][devices][dissolve]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    auto* net = attach_mock_network(*l.core);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.core, other->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.core->devices.dissolve_group(theirs, await));
+    REQUIRE(pending_pushes(l.core) == 1);
+
+    // The swarm stores the tombstone and fails the delete that follows it.
+    auto answered = answer_requests(
+            *net,
+            [](const MockNetwork::SentRequest& r) {
+                return r.request.endpoint == "sequence" && push_requests(r).size() == 2;
+            },
+            [](MockNetwork::SentRequest& r) {
+                nlohmann::json results = nlohmann::json::array(
+                        {{{"code", 200}, {"body", {{"hash", "T1"}}}},
+                         {{"code", 500}, {"body", "failed"}}});
+                r.callback(true, false, 200, {}, nlohmann::json{{"results", results}}.dump());
+            },
+            1);
+    REQUIRE(answered == 1);
+    TestHelper::drain(*l.core);
+
+    // A known gap, pinned as it stands: the push counts as done once its store is, so the dissolved
+    // group's message stays in the swarm, deleted by nobody, until it lapses.
+    CHECK(pending_pushes(l.core) == 0);
+    TestHelper::finish_fetch(*l.core);
+    CHECK(dissolutions(*net).empty());
+}
