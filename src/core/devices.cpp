@@ -1161,12 +1161,37 @@ device::GroupId Devices::_group_of(std::span<const std::byte> message) {
 }
 
 std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) {
+    auto records = carried_records(devices, clock_now_s());
+
+    // Fetch account key seeds for inclusion in the payload.
+    std::vector<AccountKeySeed> acc_keys;
+    for (auto [seed, created, rotated] :
+         conn().prepared_results<sqlite::blobn<32>, int64_t, std::optional<int64_t>>(
+                 "SELECT seed, created, rotated FROM device_account_keys"
+                 " ORDER BY rotated DESC NULLS FIRST, created DESC")) {
+        auto& k = acc_keys.emplace_back();
+        std::memcpy(k.seed.data(), seed.data(), 32);
+        k.created = created;
+        k.rotated = rotated;
+    }
+
+    // The current account key's X25519 half, published outside the payload so that a device asking
+    // to join can encrypt its request to the group: only members hold the secret half.
+    if (acc_keys.empty() || acc_keys.front().rotated)
+        throw std::logic_error{"Cannot build a device group message without a current account key"};
+    auto link_x25519 = keys_from_seed<AccountKeys>(acc_keys.front().seed).x25519_pub;
+
+    return _encrypt_group_payload(records, link_x25519, encode_group_payload(records, acc_keys));
+}
+
+std::vector<std::byte> Devices::_encrypt_group_payload(
+        std::span<const device::Info* const> records,
+        const std::array<std::byte, 32>& link_x25519,
+        std::string payload) {
     cleared_b32 a;
     random::fill(a);
 
     auto A = x25519::scalarmult_base(a);
-
-    auto records = carried_records(devices, clock_now_s());
 
     // Who can read this, which is not the same as who appears in it.  A kicked device is written
     // into the payload -- a tombstone carrying when it was kicked is how every other device learns
@@ -1272,25 +1297,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     cleared_b32 key_base;
     random::fill(key_base);
 
-    // Fetch account key seeds for inclusion in the payload.
-    std::vector<AccountKeySeed> acc_keys;
-    for (auto [seed, created, rotated] :
-         conn().prepared_results<sqlite::blobn<32>, int64_t, std::optional<int64_t>>(
-                 "SELECT seed, created, rotated FROM device_account_keys"
-                 " ORDER BY rotated DESC NULLS FIRST, created DESC")) {
-        auto& k = acc_keys.emplace_back();
-        std::memcpy(k.seed.data(), seed.data(), 32);
-        k.created = created;
-        k.rotated = rotated;
-    }
-
-    // The current account key's X25519 half, published outside the payload so that a device asking
-    // to join can encrypt its request to the group: only members hold the secret half.
-    if (acc_keys.empty() || acc_keys.front().rotated)
-        throw std::logic_error{"Cannot build a device group message without a current account key"};
-    auto link_x25519 = keys_from_seed<AccountKeys>(acc_keys.front().seed).x25519_pub;
-
-    auto plaintext_devices = encode_group_payload(records, acc_keys);
+    auto plaintext_devices = std::move(payload);
     // 2300 + 6400N: at least one bucket, so a payload smaller than the account key allowance still
     // pads up rather than down to nothing.
     auto buckets = std::max<size_t>(

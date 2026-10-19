@@ -510,6 +510,15 @@ class Devices final : detail::CoreComponent {
     // Encrypts the inner device data for all the members of the device group.
     std::vector<std::byte> encrypt_device_data(const device::map& devices);
 
+    // The group message carrying `payload`: encrypted to the live devices among `records` -- the
+    // records it carries -- announcing the removals among them in `kicked`, and publishing
+    // `link_x25519` as the group's link key.  What `encrypt_device_data` does once the payload is
+    // built.
+    std::vector<std::byte> _encrypt_group_payload(
+            std::span<const device::Info* const> records,
+            const std::array<std::byte, 32>& link_x25519,
+            std::string payload);
+
     // Processes a single incoming device group ("G") message.  `data` is the full raw message bytes
     // including the outer bt-dict wrapper with the "" type key.
     //

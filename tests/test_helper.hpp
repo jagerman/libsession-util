@@ -614,6 +614,16 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
             core::Devices& d, const core::device::map& devices) {
         return d.encrypt_device_data(devices);
     }
+    // The same with a payload of the caller's making, encrypted to the devices `devices` lists as
+    // live, under the current account key as the link key.
+    static std::vector<std::byte> encrypt_device_payload(
+            core::Devices& d, const core::device::map& devices, std::string payload) {
+        std::vector<const core::device::Info*> records;
+        for (const auto& [id, info] : devices)
+            records.push_back(&info);
+        return d._encrypt_group_payload(
+                records, d.active_account_keys().front().x25519_pub, std::move(payload));
+    }
     static std::vector<std::byte> decrypt_device_data(
             core::Devices& d, std::span<const std::byte> data) {
         return d.decrypt_device_data(data);
