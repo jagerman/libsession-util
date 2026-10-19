@@ -4285,3 +4285,239 @@ TEST_CASE(
     CHECK_THROWS_AS(
             TestHelper::decrypt_device_data(l.core->devices, message), device::decryption_failed);
 }
+
+namespace {
+
+// `c`'s group push, built and taken as stored by the swarm under `hash`.
+std::vector<std::byte> push_from(TempCore& c, const std::string& hash) {
+    auto push = c->devices.build_device_group_message();
+    c->devices.mark_device_group_pushed(push, hash);
+    return push.message;
+}
+
+// Each device pushes in turn and every other reads it, twice over, so that each has read
+// everything the others hold.
+void exchange(const std::vector<TempCore*>& cores) {
+    int n = 0;
+    for (int round = 0; round < 2; round++)
+        for (auto* from : cores) {
+            auto hash = "X" + std::to_string(n++);
+            auto message = push_from(*from, hash);
+            for (auto* to : cores)
+                if (to != from)
+                    TestHelper::deliver_device_message(**to, message, in(10min), hash);
+        }
+}
+
+// What `c` holds of the group, by what decides a merge: every live record and tombstone.
+using View = std::map<
+        device::Id,
+        std::tuple<
+                device::State,
+                int64_t,
+                std::optional<std::chrono::sys_seconds>,
+                std::array<std::byte, 32>>>;
+View view(TempCore& c) {
+    View out;
+    for (const auto& [id, info] : c->devices.devices(true, true, true)) {
+        if (info.state == device::State::Registered)
+            out[id] = {info.state, info.seqno, std::nullopt, info.pk_x25519};
+        else if (info.state == device::State::Kicked || info.state == device::State::Left)
+            out[id] = {info.state, 0, info.kicked, {}};
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - an admission and a removal made at once by different members converge",
+        "[core][devices][convergence]") {
+    Linking l;
+    l.admit();
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    join(l, third);
+    TempCore fourth{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    exchange({&l.core, &l.applicant, &third});
+
+    // The existing device admits a fourth while the applicant removes the third, neither having
+    // heard of the other's change.
+    ScopedClockOffset later{1min};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*fourth, *l.core).message, in(10min), "L4");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    REQUIRE(l.applicant->devices.remove_device(Linking::id_of(third), await));
+    auto admitted = push_from(l.core, "P-A");
+    auto removed = push_from(l.applicant, "P-B");
+
+    TestHelper::deliver_device_message(*fourth, admitted, in(10min), "P-A");
+    REQUIRE(fourth->devices.confirm_link(await));
+    TestHelper::deliver_device_message(*l.core, removed, in(10min), "P-B");
+    TestHelper::deliver_device_message(*l.applicant, admitted, in(10min), "P-A");
+
+    // The new device could read only the admission -- the removal was encrypted to the devices its
+    // maker knew -- so it hears of the rest with the members' next pushes.
+    exchange({&l.core, &l.applicant, &fourth});
+    auto held = view(l.core);
+    CHECK(held.size() == 4);
+    CHECK(std::get<0>(held.at(Linking::id_of(third))) == device::State::Kicked);
+    CHECK(view(l.applicant) == held);
+    CHECK(view(fourth) == held);
+    CHECK(account_key(l.applicant) == account_key(l.core));
+    CHECK(account_key(fourth) == account_key(l.core));
+}
+
+TEST_CASE(
+        "Devices - two devices accepted before a push are admitted by that one push",
+        "[core][devices][convergence][linking]") {
+    Linking l;
+    TempCore second{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    l.ask();
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*second, *l.core).message, in(10min), "L2");
+    REQUIRE(l.events.added.size() == 2);
+    REQUIRE(l.core->devices.accept_request(l.events.added[0].id, await));
+    REQUIRE(l.core->devices.accept_request(l.events.added[1].id, await));
+
+    auto push = push_from(l.core, "G1");
+    auto carried = carried_ids(l.core->devices, push);
+    CHECK(carried.contains(l.applicant_id()));
+    CHECK(carried.contains(Linking::id_of(second)));
+
+    for (auto* asking : {&l.applicant, &second}) {
+        TestHelper::deliver_device_message(**asking, push, in(10min), "G1");
+        REQUIRE((*asking)->devices.confirm_link(await));
+        CHECK((*asking)->devices.membership(await).membership == device::Membership::InGroup);
+    }
+    auto devs = l.core->devices.devices();
+    CHECK(devs.size() == 3);
+    CHECK(devs.contains(l.applicant_id()));
+    CHECK(devs.contains(Linking::id_of(second)));
+}
+
+TEST_CASE(
+        "Devices - a request accepted by two members at once admits the device once",
+        "[core][devices][convergence][linking]") {
+    DeviceEventsRecorder asking_events;
+    Linking l;
+    l.admit();
+    TempCore asking{
+            core::predefined_seed{std::span<const std::byte, 32>{l.seed}},
+            Linking::reporting_to(asking_events)};
+    auto request = TestHelper::build_link_request(*asking, *l.core);
+    TestHelper::deliver_device_message(*l.core, request.message, in(10min), "L2");
+    TestHelper::deliver_device_message(*l.applicant, request.message, in(10min), "L2");
+    REQUIRE(l.applicant_events.added.size() == 1);
+    auto at_core = l.events.added.back().id;
+    auto at_applicant = l.applicant_events.added.back().id;
+
+    // Both members accept before either has heard of the other's acceptance.
+    REQUIRE(l.core->devices.accept_request(at_core, await));
+    REQUIRE(l.applicant->devices.accept_request(at_applicant, await));
+    auto from_core = push_from(l.core, "P-A");
+    auto from_applicant = push_from(l.applicant, "P-B");
+
+    TestHelper::deliver_device_message(*asking, from_core, in(10min), "P-A");
+    REQUIRE(asking->devices.confirm_link(await));
+    TestHelper::deliver_device_message(*asking, from_applicant, in(10min), "P-B");
+    TestHelper::deliver_device_message(*l.core, from_applicant, in(10min), "P-B");
+    TestHelper::deliver_device_message(*l.applicant, from_core, in(10min), "P-A");
+
+    auto asking_id = Linking::id_of(asking);
+    CHECK(asking->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(view(l.core) == view(l.applicant));
+    CHECK(view(asking) == view(l.core));
+    CHECK(std::ranges::count_if(
+                  view(l.core), [&](const auto& v) { return v.first == asking_id; }) == 1);
+
+    // Neither is told its prompt ended: each closed it itself, by accepting, and hearing of the
+    // other's acceptance afterwards is not a second ending.
+    auto ended = [](const DeviceEventsRecorder& e, int reqid) {
+        return std::ranges::count_if(e.ended, [&](const auto& x) { return x.first == reqid; });
+    };
+    CHECK(ended(l.events, at_core) == 0);
+    CHECK(ended(l.applicant_events, at_applicant) == 0);
+}
+
+TEST_CASE(
+        "Devices - a device removed by two members at once is removed once",
+        "[core][devices][convergence][removal]") {
+    Linking l;
+    l.admit();
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    join(l, third);
+    exchange({&l.core, &l.applicant, &third});
+
+    // Both remove it, and both rotate as they do, neither having heard of the other's.
+    ScopedClockOffset later{1min};
+    auto gone = Linking::id_of(third);
+    REQUIRE(l.core->devices.remove_device(gone, await));
+    later.advance(30s);
+    REQUIRE(l.applicant->devices.remove_device(gone, await));
+    auto from_core = push_from(l.core, "P-A");
+    auto from_applicant = push_from(l.applicant, "P-B");
+    TestHelper::deliver_device_message(*l.core, from_applicant, in(10min), "P-B");
+    TestHelper::deliver_device_message(*l.applicant, from_core, in(10min), "P-A");
+
+    // One key, settled by the merge; one removal, at the later of the two times; and nothing
+    // owed, nor any early rotation, since the current key reached neither the removed device.
+    CHECK(account_key(l.core) == account_key(l.applicant));
+    CHECK(view(l.core) == view(l.applicant));
+    CHECK(std::get<0>(view(l.core).at(gone)) == device::State::Kicked);
+    for (auto* member : {&l.core, &l.applicant}) {
+        CHECK_FALSE((*member)->devices.needs_push().device_group);
+        CHECK(*(*member)->devices.next_account_rotation() >
+              clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
+    }
+}
+
+TEST_CASE(
+        "Devices - a member away across an admission learns of it from the new device alone",
+        "[core][devices][convergence][linking]") {
+    Linking l;
+    l.admit();
+    exchange({&l.core, &l.applicant});
+
+    // The existing device admits a third while the applicant is away, and never pushes again.
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*third, *l.core).message, in(10min), "L3");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    TestHelper::deliver_device_message(*third, push_from(l.core, "G3"), in(10min), "G3");
+    REQUIRE(third->devices.confirm_link(await));
+
+    // What the applicant finds on its return is the new device's own push.
+    auto members_before = l.applicant_events.members.size();
+    TestHelper::deliver_device_message(*l.applicant, push_from(third, "G4"), in(10min), "G4");
+    CHECK(l.applicant->devices.devices().contains(Linking::id_of(third)));
+    REQUIRE(l.applicant_events.members.size() == members_before + 1);
+    CHECK(l.applicant_events.members.back().id == Linking::id_of(third));
+    CHECK(l.applicant_events.members.back().state == device::State::Registered);
+}
+
+TEST_CASE(
+        "Devices - five devices each read every other's push, and agree on the group",
+        "[core][devices][convergence]") {
+    Linking l;
+    l.admit();
+    std::vector<TempCore> more;
+    for (int i = 0; i < 3; i++)
+        more.emplace_back(core::predefined_seed{std::span<const std::byte, 32>{l.seed}});
+    for (auto& c : more)
+        join(l, c);
+
+    std::vector<TempCore*> all{&l.core, &l.applicant};
+    for (auto& c : more)
+        all.push_back(&c);
+    exchange(all);
+
+    auto held = view(l.core);
+    CHECK(held.size() == 5);
+    for (auto* from : all) {
+        auto message = from->core->devices.build_device_group_message().message;
+        for (auto* to : all)
+            if (to != from)
+                CHECK_NOTHROW(TestHelper::decrypt_device_data((*to)->devices, message));
+        CHECK(view(*from) == held);
+    }
+}
