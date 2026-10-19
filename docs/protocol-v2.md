@@ -226,6 +226,12 @@ changes to its own "unique-client-id" sub-object) it then encodes and encrypts t
 (using libsession's config diff + update mechanism) using a random `key_base` value for the
 encryption.
 
+Only the device that makes a change pushes for it.  One that merges another device's change -- an
+admission, a removal -- has nothing to relay: the message carrying it stays in the swarm until a
+push carrying its contents forward replaces it, and every member pushing on merging it would only
+put that many duplicates there at once.  The others push again on their own schedule (see
+"Account Key Rotation").
+
 Note that this random `key_base` value is different from regular config messages: regular config
 uses the account root key as the key_base so that other clients with the root key can derive the
 encryption key.  That does not work here, however, because this data is encrypted using relatively

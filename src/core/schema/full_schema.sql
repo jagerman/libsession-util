@@ -17,7 +17,10 @@ CREATE TABLE devices (
     -- For our own row, that of the record the swarm holds for us (0 for none yet), which the next
     -- record we publish counts on from: our row mirrors the swarm, and is never what we publish.
     seqno INTEGER NOT NULL DEFAULT 1,
-    broadcast_needed INTEGER NOT NULL DEFAULT 0,  -- 1 when a state transition (registered/removed) needs broadcasting
+    -- Nonzero while a state transition this device made (registered/removed) has yet to go out in
+    -- a push of ours: a generation, bumped each time one is owed, so that a confirmed push clears
+    -- it only if nothing was owed again while it was in flight.
+    broadcast_needed INTEGER NOT NULL DEFAULT 0,
     timestamp INTEGER NOT NULL,
     kicked_timestamp INTEGER CHECK(kicked_timestamp > 0),  -- when the device was removed, or left
     device_type TEXT NOT NULL, -- typically a/i/d (Android/iOS/Desktop), but can be anything

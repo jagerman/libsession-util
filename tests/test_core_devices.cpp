@@ -1034,7 +1034,8 @@ TEST_CASE("Devices - accepting a request admits the device, once", "[core][devic
     // of it.  Asked of the message rather than of needs_push(), which a fresh account's first push
     // already makes true whether or not anything was accepted.
     auto push = l.core->devices.build_device_group_message();
-    CHECK(std::ranges::find(push.broadcast, l.applicant_id()) != push.broadcast.end());
+    CHECK(std::ranges::any_of(
+            push.broadcast, [&](const auto& b) { return b.first == l.applicant_id(); }));
 
     CHECK_FALSE(l.core->devices.accept_request(id, await));
 }
@@ -3830,4 +3831,63 @@ TEST_CASE(
     CHECK_FALSE(l.applicant->devices.remove_device(self.id, await));
 
     CHECK_THROWS_AS(l.core->devices.remove_device(self.id, await), std::invalid_argument);
+}
+
+namespace {
+
+// Each of the pair's pushes confirmed and read by the other, so that neither owes anything.
+void settle(Linking& l) {
+    auto mine = l.applicant->devices.build_device_group_message();
+    l.applicant->devices.mark_device_group_pushed(mine, "S1");
+    TestHelper::deliver_device_message(*l.core, mine.message, in(10min), "S1");
+    auto theirs = l.core->devices.build_device_group_message();
+    l.core->devices.mark_device_group_pushed(theirs, "S2");
+    TestHelper::deliver_device_message(*l.applicant, theirs.message, in(10min), "S2");
+    REQUIRE_FALSE(l.core->devices.needs_push().device_group);
+    REQUIRE_FALSE(l.applicant->devices.needs_push().device_group);
+}
+
+bool carries_transition(const Devices::DeviceGroupPush& push, const device::Id& id) {
+    return std::ranges::any_of(push.broadcast, [&](const auto& b) { return b.first == id; });
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - merging another device's change owes no push of our own",
+        "[core][devices][push]") {
+    Linking l;
+    l.admit();
+    settle(l);
+
+    // The device that makes a change owes the push carrying it.
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *l.core, TestHelper::build_link_request(*third, *l.core).message, in(10min), "L2");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    REQUIRE(l.core->devices.needs_push().device_group);
+
+    // The message carrying it is in the swarm already, so the other member has nothing to relay.
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G3");
+    REQUIRE(l.applicant->devices.devices().size() == 3);
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+}
+
+TEST_CASE(
+        "Devices - a removal restated while its push is in flight is still owed after it",
+        "[core][devices][push]") {
+    Linking l;
+    l.admit();
+    // The removed device's view of the group, which it can push again whenever it likes.
+    auto revived = l.applicant->devices.build_device_group_message().message;
+
+    REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+    auto push = l.core->devices.build_device_group_message();
+    REQUIRE(carries_transition(push, l.applicant_id()));
+
+    // Brought back while the push is in flight, and the removal restated.
+    TestHelper::deliver_device_message(*l.core, revived, in(10min), "G2");
+    l.core->devices.mark_device_group_pushed(push, "G3");
+    CHECK(carries_transition(l.core->devices.build_device_group_message(), l.applicant_id()));
 }

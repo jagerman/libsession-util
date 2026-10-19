@@ -2073,8 +2073,14 @@ void Core::_swarm_push(
         std::vector<std::string> obsolete,
         std::function<void(std::optional<std::vector<SwarmStoreResult>>)> done) {
 
-    if (stores.empty() && obsolete.empty())
+    // A caller's bug: every caller has something to send by the time it gets here.  Logged as well
+    // as asserted, since the assert is gone from a release build; and `done` is not called either
+    // way, which is what the caller would see.
+    if (stores.empty() && obsolete.empty()) {
+        log::error(cat, "_swarm_push called with nothing to store and nothing to delete");
+        assert(false);
         return;
+    }
 
     auto now_ms = epoch_ms(clock_now_ms());
     auto pubkey_hex = globals.session_id_hex();

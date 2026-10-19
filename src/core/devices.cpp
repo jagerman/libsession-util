@@ -157,7 +157,7 @@ void Devices::establish_group() {
                VALUES (?1, ?2, 0, ?3, '', '', 0, ?4, ?5, 1)
                ON CONFLICT(unique_id) DO UPDATE SET
                    state = ?2,
-                   broadcast_needed = 1,
+                   broadcast_needed = broadcast_needed + 1,
                    pubkey_mlkem768 = ?4,
                    pubkey_x25519 = ?5)",
             self_id,
@@ -1354,19 +1354,18 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 // Ranked like every other merge: Kicked outranks Left outranks any live record, and between two
 // tombstones of one kind the later wins.  Every group message carries the group's recent
 // tombstones, so most of these restate what is already held, and only a real change returns a row.
+//
+// Owes no broadcast: the message it came in is already in the swarm, and stays there until a push
+// carrying it forward replaces it.  Relaying it would only have every member push at once.
 static const std::string TOMBSTONE_SQL =
         "INSERT INTO devices"
         " (unique_id, state, seqno, timestamp, device_type, description, version,"
         "  pubkey_mlkem768, pubkey_x25519, kicked_timestamp)"
         " VALUES (?2, ?3, 0, ?1, '', '', 0, zeroblob(1184), zeroblob(32), ?1)"
         " ON CONFLICT(unique_id) DO UPDATE SET"
-        "     state = excluded.state, kicked_timestamp = excluded.kicked_timestamp,"
-        "     broadcast_needed = CASE WHEN state = {} THEN 1 ELSE broadcast_needed END"
+        "     state = excluded.state, kicked_timestamp = excluded.kicked_timestamp"
         "   WHERE (excluded.state, excluded.kicked_timestamp) > (state, kicked_timestamp)"
-        " RETURNING id"_format(static_cast<int>(device::State::Registered));
-
-static const std::string REGISTER_DEVICE_SQL =
-        "UPDATE devices SET broadcast_needed = 1 WHERE id = ?";
+        " RETURNING id";
 
 // A device registered by a group message was admitted somewhere, so the request that asked for it
 // has been answered, whichever device answered it.
@@ -1417,7 +1416,8 @@ static void answer_replacements(
 //
 // Applies equally to a device that left: it holds the seed just the same.
 static const std::string REASSERT_TOMBSTONE_SQL =
-        "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = 1 WHERE unique_id = ?";
+        "UPDATE devices SET kicked_timestamp = ?, broadcast_needed = broadcast_needed + 1"
+        " WHERE unique_id = ?";
 
 void Devices::receive_device_group_message(
         std::span<const std::byte> data, const std::string& hash, bool confirmed) {
@@ -1636,7 +1636,6 @@ void Devices::receive_device_group_message(
 
         // Only on a state transition, not an update to a device already registered.
         if (!was_registered) {
-            c.prepared_exec(REGISTER_DEVICE_SQL, *dev_id);
             c.prepared_exec(ANSWER_REQUEST_SQL, *dev_id);
             if (id != self_id)
                 members.push_back(id);
@@ -2887,7 +2886,8 @@ bool Devices::_accept_request(int reqid) {
     // the rank rule would refuse to lower it anyway.
     bool admitted = replaces ? _replace_record(*row)
                              : c.prepared_maybe_get<int64_t>(
-                                        "UPDATE devices SET state = ?, broadcast_needed = 1"
+                                        "UPDATE devices SET state = ?,"
+                                        " broadcast_needed = broadcast_needed + 1"
                                         " WHERE id = ? AND state = ? RETURNING id",
                                         static_cast<int>(device::State::Registered),
                                         dev,
@@ -2933,7 +2933,8 @@ bool Devices::_replace_record(int64_t row) {
     info->digest = record_digest(*info);
     auto dev = upsert_device_info(c, *info);
     assert(dev);
-    c.prepared_exec(REGISTER_DEVICE_SQL, *dev);
+    c.prepared_exec(
+            "UPDATE devices SET broadcast_needed = broadcast_needed + 1 WHERE id = ?", *dev);
 
     log::info(cat, "Replacing the record of device {}; rotating the account key", info->id);
     rotate_account_keys();
@@ -3249,7 +3250,8 @@ bool Devices::_remove_device(std::span<const std::byte, device::ID_SIZE> id) {
         return false;
 
     if (!c.prepared_maybe_get<int64_t>(
-                "UPDATE devices SET state = ?, kicked_timestamp = ?, broadcast_needed = 1"
+                "UPDATE devices SET state = ?, kicked_timestamp = ?,"
+                " broadcast_needed = broadcast_needed + 1"
                 " WHERE unique_id = ? AND state = ? RETURNING id",
                 static_cast<int>(device::State::Kicked),
                 epoch_seconds(clock_now_s()),
@@ -3549,11 +3551,12 @@ void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string 
         c.prepared_exec(
                 "INSERT INTO device_group_merged (hash) VALUES (?) ON CONFLICT DO NOTHING", hash);
 
-    if (!push.broadcast.empty())
+    for (const auto& [id, generation] : push.broadcast)
         c.prepared_exec(
-                "UPDATE devices SET broadcast_needed = 0 WHERE unique_id IN ({})"_format(
-                        sqlite::placeholders(push.broadcast.size())),
-                sqlite::bind_each{push.broadcast});
+                "UPDATE devices SET broadcast_needed = 0"
+                " WHERE unique_id = ? AND broadcast_needed = ?",
+                id,
+                generation);
 
     if (!push.keys.empty())
         c.prepared_exec(
@@ -3671,9 +3674,9 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     // Read in the same breath as the payload, so that what the confirm clears is what the message
     // actually contains rather than whatever is owed by the time the swarm answers.
     auto c = conn();
-    for (auto id : c.prepared_results<sqlite::blob_guts<device::Id>>(
-                 "SELECT unique_id FROM devices WHERE broadcast_needed"))
-        push.broadcast.push_back(id);
+    for (auto [id, generation] : c.prepared_results<sqlite::blob_guts<device::Id>, int64_t>(
+                 "SELECT unique_id, broadcast_needed FROM devices WHERE broadcast_needed"))
+        push.broadcast.emplace_back(id, generation);
     for (auto [id, distributed] :
          c.prepared_results<int64_t, int>("SELECT id, distributed FROM device_account_keys")) {
         push.carried_keys.push_back(id);

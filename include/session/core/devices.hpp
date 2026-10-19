@@ -1018,8 +1018,10 @@ class Devices final : detail::CoreComponent {
         // What this message carries that was owed, so that confirming it clears exactly that and no
         // more.  A device kicked, or a key minted, while the push was in flight is not in these and
         // therefore stays owed -- it would otherwise be marked clean by a message it never reached.
-        std::vector<device::Id> broadcast;  // device ids whose transition it carries
-        std::vector<int64_t> keys;          // device_account_keys rows it distributes
+        // A transition is carried with the generation it had, since the same device can be owed
+        // again before the swarm answers: a removal restated meanwhile, say.
+        std::vector<std::pair<device::Id, int64_t>> broadcast;  // device ids and their generations
+        std::vector<int64_t> keys;  // device_account_keys rows it distributes
 
         // Every account key it carries, and the devices it is encrypted to: what confirming it
         // records as delivered (see `device_account_key_recipients`).
@@ -1064,7 +1066,8 @@ class Devices final : detail::CoreComponent {
     // device_group is true when this device is registered, neither displaced nor dropped (see
     // device::Membership), AND any of the following hold:
     //   - what we would publish for ourselves differs from what the swarm holds for us
-    //   - any device has a state transition (registered/removed) that needs broadcasting
+    //   - any device has a state transition (registered/removed) that this device made and has
+    //     yet to broadcast; one merged from another device's message is already out
     //   - any account key seed has not yet been distributed via a confirmed push
     //
     // account_pubkey is true when the current active account key has not yet been seen confirmed
