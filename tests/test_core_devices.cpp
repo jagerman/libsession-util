@@ -1978,6 +1978,24 @@ TEST_CASE(
           std::vector{device::Membership::NoGroup, device::Membership::GroupsVisible});
 }
 
+namespace {
+// Counted directly: active_account_keys() mints one when there are none.
+int account_key_count(TempCore& c) {
+    return c->database().conn().prepared_get<int>("SELECT count(*) FROM device_account_keys");
+}
+
+// The code a call failed with, or empty if it did not.
+template <typename F>
+std::string failure_code(F&& f) {
+    try {
+        f();
+    } catch (const session::error& e) {
+        return std::string{e.err().code};
+    }
+    return {};
+}
+}  // namespace
+
 TEST_CASE(
         "Devices - a second group alongside ours is alerted, until dismissed",
         "[core][devices][membership]") {
@@ -2052,6 +2070,100 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.core);
     CHECK(l.core->devices.membership(await).membership == device::Membership::CutOff);
     CHECK(l.events.membership.back() == device::Membership::CutOff);
+}
+
+TEST_CASE(
+        "Devices - a device whose group is dissolved leaves it behind, under a new id",
+        "[core][devices][dissolve]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.core);
+    auto old_id = l.applicant_id();
+
+    // Another of the account's devices, whose user chose to keep a group of its own.
+    TempCore keeper{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::deliver_device_message(
+            *l.applicant, TestHelper::build_dissolution(*keeper, {group}), in(10min), "T1");
+
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+    CHECK(l.applicant_events.membership.back() == device::Membership::Dissolved);
+    CHECK(l.applicant_id() != old_id);
+    CHECK(l.applicant->devices.devices(true, true, true).empty());
+    CHECK_FALSE(TestHelper::group_id(*l.applicant));
+    CHECK(account_key_count(l.applicant) == 0);
+    CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+
+    // The group's messages are nothing to it now, nor something it could join.
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    CHECK(l.applicant->devices.membership(await).others.empty());
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+
+    // Until it starts or joins a group.
+    l.applicant->devices.start_group(await);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+}
+
+TEST_CASE("Devices - a dissolved group is no longer one to join", "[core][devices][dissolve]") {
+    Linking l;
+    auto theirs = l.show_group();
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_group(*other);
+    auto second = *TestHelper::group_id(*other);
+    TestHelper::deliver_device_message(
+            *l.applicant, other->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.applicant->devices.membership(await).others.size() == 2);
+
+    // One tombstone, naming both.
+    TestHelper::deliver_device_message(
+            *l.applicant, TestHelper::build_dissolution(*other, {theirs, second}), in(10min), "T1");
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::NoGroup);
+    CHECK(state.others.empty());
+}
+
+TEST_CASE(
+        "Devices - a dissolved group seen again is dissolved again", "[core][devices][dissolve]") {
+    Linking l;
+    auto group = *TestHelper::group_id(*l.core);
+    auto* net = attach_mock_network(*l.applicant);
+    TempCore keeper{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+
+    // Written before the dissolution, but fetched after it.
+    auto leftover = l.core->devices.build_device_group_message().message;
+    ScopedClockOffset later{1min};
+    TestHelper::deliver_device_message(
+            *l.applicant, TestHelper::build_dissolution(*keeper, {group}), in(10min), "T1");
+    REQUIRE(l.applicant->devices.membership(await).others.empty());
+
+    // Something the dissolving device did not know to delete: deleted, and that is all.
+    TestHelper::deliver_device_message(*l.applicant, leftover, in(10min), "G-old");
+    auto sent = pushes(*net);
+    REQUIRE(sent.size() == 1);
+    auto reqs = push_requests(*sent[0]);
+    REQUIRE(reqs.size() == 1);
+    CHECK(reqs[0]["method"] == "delete");
+    CHECK(reqs[0]["params"]["messages"] == nlohmann::json::array({"G-old"}));
+
+    // A device of the group back after the tombstone has gone: told again, and its message deleted.
+    later.advance(1min);
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G-new");
+    CHECK(l.applicant->devices.membership(await).others.empty());
+    sent = pushes(*net);
+    REQUIRE(sent.size() == 2);
+    reqs = push_requests(*sent[1]);
+    REQUIRE(reqs.size() == 2);
+    CHECK(reqs[0]["method"] == "store");
+    CHECK(reqs[0]["params"]["namespace"] == 21);
+    CHECK(reqs[1]["method"] == "delete");
+    CHECK(reqs[1]["params"]["messages"] == nlohmann::json::array({"G-new"}));
+
+    // And what it published is a tombstone that dissolves the group for a device of it.
+    auto tombstone = to_vector<std::byte>(
+            oxenc::from_base64(reqs[0]["params"]["data"].get<std::string_view>()));
+    TestHelper::deliver_device_message(*l.core, tombstone, in(10min), "T2");
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Dissolved);
 }
 
 TEST_CASE(
@@ -2256,24 +2368,6 @@ TEST_CASE(
         CHECK(own_state(l.applicant) == device::State::Pending);
     }
 }
-
-namespace {
-// Counted directly: active_account_keys() mints one when there are none.
-int account_key_count(TempCore& c) {
-    return c->database().conn().prepared_get<int>("SELECT count(*) FROM device_account_keys");
-}
-
-// The code a call failed with, or empty if it did not.
-template <typename F>
-std::string failure_code(F&& f) {
-    try {
-        f();
-    } catch (const session::error& e) {
-        return std::string{e.err().code};
-    }
-    return {};
-}
-}  // namespace
 
 TEST_CASE(
         "Devices - a device can start a group alongside those already there",

@@ -31,10 +31,10 @@ Shared encrypted data (stored in namespace 21) is where all unique shared encryp
 stored, including keys usable for PFS and PQ.  Join handshakes (also stored in this namespace) will
 be used by a new device asking to join the encrypted device group.
 
-Both message types share the one namespace rather than being split across two: each is a bt-encoded
+The message types share the one namespace rather than being split across several: each is a bt-encoded
 dict whose `""` key carries a single-character type tag — `"G"` for a device group message, `"L"`
-for a link request — so a client distinguishes them from the message itself rather than from where
-it was stored.
+for a link request, `"T"` for a tombstone dissolving a group (see "Dissolving a group") — so a client
+distinguishes them from the message itself rather than from where it was stored.
 
 ### Inner device data
 
@@ -711,6 +711,53 @@ encrypted to its group.  Group messages leave the swarm only by expiring, which 
 of the group being offline for the whole TTL, or by being deleted by a holder of the account seed.
 This is always alerted, as a possible attack, whether or not the other group's identifier was
 dismissed.
+
+### Dissolving a group
+
+A group is dissolved by deleting its messages from the swarm, which any holder of the account seed
+can do, and publishing a **tombstone** naming it, so that the group's devices learn of it within a
+fetch.  It is resolution rather than permission: anyone with the seed could delete the messages
+without saying so.
+
+The tombstone is a bt-encoded dict in namespace 21:
+
+    {
+        "": "T",
+        "@": "...the dissolved groups' identifiers, encrypted...",
+        "A": "...ephemeral X25519 pubkey...",
+        "t": 1777777777123,
+        "~": "...above data signed with the long-term account key..."
+    }
+
+`@` is the 8-byte identifiers of the groups dissolved, one or more, concatenated and encrypted as
+one XChaCha20 stream with the key and nonce a group message's identifier uses (see "Group
+identifier"), from this message's own `A`.  The first is therefore encrypted exactly as a lone
+identifier would be; any seed holder can read them, and to anyone else they differ from one
+tombstone to the next.  `A` is generated for the tombstone and its secret half discarded, since
+nothing is encrypted to anyone: there is no payload and there are no recipients.  `t` is the time
+the tombstone was written, as in a group message (see "Device data encryption"), with the same limit
+on how far ahead of the reader's clock it may be.
+
+The tombstone is transient.  It is stored with the group messages' 30-day TTL and never renewed,
+and a group push never deletes it.  Its only job is to reach the dissolved group's devices that are
+online in the meantime; one offline for longer finds no message of its group at all.
+
+A device reading a tombstone that names its own group has been dissolved out of it.  It stops acting
+for the group, forgets everything of it -- its devices, its messages and its account keys -- and
+takes a new device ID, since nothing remains that the old one is any use for.  It may then ask to
+join the group that was kept, as any device outside a group does.  Its messages, the account's
+configs and the groups it has seen are kept, as for a removed device.  A tombstone naming any other
+group only stops the device counting that group among those in the swarm.
+
+Either way, the device remembers each identifier named as dissolved, with the tombstone's `t` (the
+newest, where several name it).  That memory is each device's own and kept for good, a few bytes a
+group, and it is what keeps a dissolved group dissolved without tombstones having to stay in the
+swarm forever: a device that later sees a group message carrying a dissolved identifier deletes it
+from the swarm, and if the message was written after the dissolution -- a device of that group that
+never heard of it, back after the tombstone expired, has pushed again -- publishes a new tombstone
+naming the group.  That device then rejoins the group that was kept.  In the time between, contacts
+may have encrypted to its group's account key, which cannot be helped.  A message written before
+the dissolution is only a leftover the dissolving device did not know of, and is just deleted.
 
 ### Leaving a group to join another
 

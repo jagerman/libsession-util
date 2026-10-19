@@ -121,6 +121,25 @@ CREATE TABLE device_groups (
     dismissed INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
+-- The swarm hashes of the group messages seen, every group's: what dissolving a group deletes from
+-- the swarm.  Kept until the swarm drops each message, after which there is nothing to delete.
+CREATE TABLE device_group_messages (
+    hash TEXT PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    expires_at INTEGER NOT NULL  -- unix seconds
+) STRICT;
+CREATE INDEX device_group_messages_group ON device_group_messages(group_id);
+
+-- The groups this device knows to be dissolved, by a tombstone it saw or one it published.  Never
+-- forgotten: a tombstone lives only as long as any message does, and this is what lets a device
+-- that sees a dissolved group in the swarm again dissolve it again.
+CREATE TABLE device_dissolved_groups (
+    group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
+    -- The signed time of the newest tombstone naming it, unix milliseconds: a message from the
+    -- group written later than this is the group back, where an older one is only left over.
+    dissolved_at INTEGER NOT NULL
+) STRICT;
+
 -- The link requests this device has sent, so that a group message admitting it can be matched to
 -- the request it accepted.  A device can ask more than once -- again after a request seemed to go
 -- unanswered, say -- and any of them may be the one accepted, possibly after its deadline here has

@@ -656,6 +656,13 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
+    // A tombstone dissolving `groups`, as `core` would publish it, without publishing it.
+    static std::vector<std::byte> build_dissolution(
+            core::Core& core, std::vector<core::device::GroupId> groups) {
+        return on_loop(
+                core, [&] { return core.devices._build_dissolution(groups, clock_now_ms()); });
+    }
+
     static std::optional<core::device::GroupId> group_id(core::Core& core) {
         return on_loop(core, [&] { return core.devices._group_id(); });
     }

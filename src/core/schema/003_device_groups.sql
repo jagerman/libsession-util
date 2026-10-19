@@ -135,6 +135,18 @@ CREATE TABLE device_groups (
     dismissed INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
+CREATE TABLE device_group_messages (
+    hash TEXT PRIMARY KEY NOT NULL,
+    group_id BLOB NOT NULL CHECK(length(group_id) == 8),
+    expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX device_group_messages_group ON device_group_messages(group_id);
+
+CREATE TABLE device_dissolved_groups (
+    group_id BLOB PRIMARY KEY NOT NULL CHECK(length(group_id) == 8),
+    dissolved_at INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE device_own_requests (
     id INTEGER PRIMARY KEY NOT NULL,
     group_id BLOB NOT NULL CHECK(length(group_id) == 8),

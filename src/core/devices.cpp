@@ -87,6 +87,9 @@ static device::GroupId new_group_id() {
 static constexpr auto read_at_key = "devices_group_read_at"sv;
 static constexpr auto displaced_key = "devices_group_displaced_at"sv;
 
+// Set when a tombstone named the group this device was in, until it joins or starts another.
+static constexpr auto dissolved_key = "devices_group_dissolved"sv;
+
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
         log::info(cat, "Loaded existing unique device id: {}", self_id);
@@ -974,19 +977,28 @@ namespace {
         return out;
     }
 
-    // Encrypts or decrypts a group identifier for a message's outer `@` (XChaCha20 being its own
+    // Encrypts or decrypts group identifiers for a message's outer `@` (XChaCha20 being its own
     // inverse): readable by any holder of the account seed, and different in every message to
-    // anyone else, the nonce coming from that message's A.
-    std::array<std::byte, 8> crypt_group_id(
-            std::span<const std::byte, 8> in,
+    // anyone else, the nonce coming from that message's A.  Several are one stream, so the first of
+    // them is encrypted exactly as a lone one would be.
+    void crypt_group_ids(
+            std::span<std::byte> out,
+            std::span<const std::byte> in,
             std::span<const std::byte, 32> A,
             std::span<const std::byte, 32> seed) {
         cleared_b32 key;
         hash::blake2b_pers(key, PERS_GROUP_ID_KEY, seed);
         std::array<std::byte, encryption::XCHACHA20_NONCEBYTES> nonce;
         hash::blake2b_pers(nonce, PERS_GROUP_ID_NONCE, A);
-        std::array<std::byte, 8> out;
         encryption::xchacha20_xor(out, in, nonce, key);
+    }
+
+    std::array<std::byte, 8> crypt_group_id(
+            std::span<const std::byte, 8> in,
+            std::span<const std::byte, 32> A,
+            std::span<const std::byte, 32> seed) {
+        std::array<std::byte, 8> out;
+        crypt_group_ids(out, in, A, seed);
         return out;
     }
 
@@ -1073,6 +1085,31 @@ std::optional<device::GroupId> Devices::_group_id() {
 
 void Devices::_set_group_id(const device::GroupId& id) {
     core.globals.set(group_id_key, std::span<const std::byte>{id.value});
+}
+
+void Devices::_verify_account_signature(oxenc::bt_dict_consumer& in, std::string_view what) {
+    in.require_signature("~", [&](std::span<const std::byte> body, std::span<const std::byte> sig) {
+        if (sig.size() != 64 ||
+            !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
+            throw std::runtime_error{"Invalid {}: signature verification failed"_format(what)};
+    });
+}
+
+sys_ms Devices::_signed_time(oxenc::bt_dict_consumer& in, std::string_view what) {
+    auto t = from_epoch_ms(in.require<int64_t>("t"));
+    _verify_account_signature(in, what);
+    if (auto ahead = t - clock_now_ms(); ahead > GROUP_MESSAGE_MAX_AHEAD)
+        throw std::runtime_error{"Ignoring {} dated {}s ahead of this device's clock"_format(
+                what, std::chrono::floor<std::chrono::seconds>(ahead).count())};
+    return t;
+}
+
+std::optional<sys_ms> Devices::_dissolved_at(const device::GroupId& group) {
+    if (auto at = conn().prepared_maybe_get<int64_t>(
+                "SELECT dissolved_at FROM device_dissolved_groups WHERE group_id = ?",
+                std::span<const std::byte>{group.value}))
+        return from_epoch_ms(*at);
+    return std::nullopt;
 }
 
 device::GroupId Devices::_group_of(std::span<const std::byte> message) {
@@ -1588,9 +1625,10 @@ void Devices::receive_device_group_message(
     tx.commit();
 
     // Being admitted, every member is new to us, and none of them is news.
-    if (admitting)
+    if (admitting) {
         _forget_own_requests();
-    else
+        core.globals.erase(dissolved_key);
+    } else
         _member_changes.insert(_member_changes.end(), members.begin(), members.end());
 }
 
@@ -1639,32 +1677,42 @@ void Devices::_leave_group() {
     log::info(cat, "Left the device group, to join another");
 }
 
-void Devices::_record_group(const SwarmMessage& msg) {
+bool Devices::_record_group(const SwarmMessage& msg) {
     oxenc::bt_dict_consumer in{msg.data};
     in.require<std::string_view>("");
     auto encrypted_id = in.require_span<std::byte, 8>("@");
     auto A = in.require_span<std::byte, 32>("A");
     auto X = in.require_span<std::byte, 32>("X");
-    auto t = from_epoch_ms(in.require<int64_t>("t"));
 
     // Checked even though only a seed holder could have encrypted the identifier: without the
     // signature a storage server could still replay one group's identifier with a link key of its
     // own, and have requests to join that group encrypted to it.
-    in.require_signature(
-            "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
-                if (sig.size() != 64 ||
-                    !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
-                    throw std::runtime_error{"Invalid device group message signature"};
-            });
+    auto t = _signed_time(in, "device group message");
 
-    if (auto ahead = t - clock_now_ms(); ahead > GROUP_MESSAGE_MAX_AHEAD)
-        throw std::runtime_error{
-                "Device group message is dated {}s ahead of this device's clock"_format(
-                        std::chrono::floor<std::chrono::seconds>(ahead).count())};
+    device::GroupId group;
+    {
+        auto seed = core.globals.account_seed();
+        group.value = crypt_group_id(encrypted_id, A, seed.seed());
+    }
 
-    auto seed = core.globals.account_seed();
-    auto group = crypt_group_id(encrypted_id, A, seed.seed());
-    conn().prepared_exec(
+    // A dissolved group stays dissolved: a message written since is a device of it that never
+    // heard, back after the tombstone expired, and has to be told again.  An older one is only a
+    // leftover the dissolving device did not know to delete.
+    if (auto dissolved = _dissolved_at(group)) {
+        std::vector<std::string> hashes;
+        if (!msg.hash.empty())
+            hashes.push_back(msg.hash);
+        if (t > *dissolved) {
+            log::warning(
+                    cat, "A dissolved device group is in the swarm again; dissolving it again");
+            _dissolve(std::span{&group, 1}, std::move(hashes));
+        } else
+            _delete_from_swarm(std::move(hashes), "a dissolved device group's message");
+        return false;
+    }
+
+    auto c = conn();
+    c.prepared_exec(
             "INSERT INTO device_groups (group_id, link_x25519, seen_at, expires_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(group_id) DO UPDATE SET"
@@ -1672,10 +1720,145 @@ void Devices::_record_group(const SwarmMessage& msg) {
             "       THEN excluded.link_x25519 ELSE link_x25519 END,"
             "   seen_at = MAX(seen_at, excluded.seen_at),"
             "   expires_at = MAX(expires_at, excluded.expires_at)",
-            std::span<const std::byte>{group},
+            std::span<const std::byte>{group.value},
             X,
             epoch_seconds(std::chrono::floor<std::chrono::seconds>(t)),
             epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.expiry)));
+
+    c.prepared_exec(
+            "DELETE FROM device_group_messages WHERE expires_at <= ?",
+            epoch_seconds(clock_now_s()));
+    if (!msg.hash.empty())
+        c.prepared_exec(
+                "INSERT INTO device_group_messages (hash, group_id, expires_at) VALUES (?, ?, ?)"
+                " ON CONFLICT DO NOTHING",
+                msg.hash,
+                std::span<const std::byte>{group.value},
+                epoch_seconds(std::chrono::floor<std::chrono::seconds>(msg.expiry)));
+    return true;
+}
+
+bool Devices::_mark_dissolved(const device::GroupId& group, sys_ms t) {
+    auto c = conn();
+    auto id = std::span<const std::byte>{group.value};
+    bool known = _dissolved_at(group).has_value();
+    c.prepared_exec(
+            "INSERT INTO device_dissolved_groups (group_id, dissolved_at) VALUES (?, ?)"
+            " ON CONFLICT(group_id) DO UPDATE SET"
+            "   dissolved_at = MAX(dissolved_at, excluded.dissolved_at)",
+            id,
+            epoch_ms(t));
+    c.prepared_exec("DELETE FROM device_groups WHERE group_id = ?", id);
+    c.prepared_exec("DELETE FROM device_group_messages WHERE group_id = ?", id);
+    return !known;
+}
+
+std::vector<std::byte> Devices::_build_dissolution(
+        std::span<const device::GroupId> groups, sys_ms t) {
+    std::vector<std::byte> ids;
+    for (const auto& g : groups)
+        ids.insert(ids.end(), g.value.begin(), g.value.end());
+
+    // Nothing is encrypted to anyone, so A is only what makes the encrypted ids differ from one
+    // tombstone to the next.
+    auto A = x25519::keypair().first;
+    std::vector<std::byte> encrypted(ids.size());
+    {
+        auto seed = core.globals.account_seed();
+        crypt_group_ids(encrypted, ids, A, seed.seed());
+    }
+
+    oxenc::bt_dict_producer o;
+    o.append("", "T");
+    o.append("@", std::span<const std::byte>{encrypted});
+    o.append("A", A);
+    o.append("t", epoch_ms(t));
+    o.append_signature("~", [seed = core.globals.account_seed()](std::span<const std::byte> body) {
+        return ed25519::sign(seed.ed25519_secret(), body);
+    });
+    return to_vector<std::byte>(std::move(o).str());
+}
+
+void Devices::_dissolve(
+        std::span<const device::GroupId> groups, std::vector<std::string> obsolete) {
+    assert(on_loop());
+    auto t = clock_now_ms();
+    {
+        auto c = conn();
+        SQLite::Transaction tx{c.sql};
+        for (const auto& group : groups) {
+            for (auto hash : c.prepared_results<std::string>(
+                         "SELECT hash FROM device_group_messages WHERE group_id = ?",
+                         std::span<const std::byte>{group.value}))
+                obsolete.push_back(std::move(hash));
+            _mark_dissolved(group, t);
+        }
+        tx.commit();
+    }
+
+    // Never renewed, and never among what a group push deletes: it is there to tell the dissolved
+    // group's devices that are online now, and lapses with the messages it replaced.
+    std::vector<SwarmStore> stores;
+    stores.push_back(
+            {.ns = config::Namespace::Devices,
+             .data = _build_dissolution(groups, t),
+             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+    if (core.network())
+        core._swarm_push(std::move(stores), std::move(obsolete), [](auto results) {
+            if (!results || results->empty() || !results->front().stored)
+                log::warning(cat, "Could not publish a device group's dissolution");
+        });
+    else
+        log::warning(cat, "Not publishing a device group's dissolution: no network");
+    log::info(cat, "Dissolved {} other device group(s)", groups.size());
+}
+
+void Devices::_delete_from_swarm(std::vector<std::string> hashes, std::string_view what) {
+    if (hashes.empty())
+        return;
+    if (core.network())
+        core._swarm_push({}, std::move(hashes), [what = std::string{what}](auto results) {
+            if (!results)
+                log::warning(cat, "Could not delete {} from the swarm", what);
+        });
+    else
+        log::warning(cat, "Not deleting {} from the swarm: no network", what);
+}
+
+void Devices::receive_dissolution(std::span<const std::byte> data) {
+    oxenc::bt_dict_consumer in{data};
+    in.require<std::string_view>("");
+    auto encrypted = in.require_span<std::byte>("@");
+    if (encrypted.empty() || encrypted.size() % sizeof(device::GroupId::value) != 0)
+        throw std::runtime_error{
+                "Invalid dissolution: {}-byte group list"_format(encrypted.size())};
+    auto A = in.require_span<std::byte, 32>("A");
+    auto t = _signed_time(in, "dissolution");
+
+    std::vector<std::byte> ids(encrypted.size());
+    {
+        auto seed = core.globals.account_seed();
+        crypt_group_ids(ids, encrypted, A, seed.seed());
+    }
+
+    auto ours = _group_id();
+    bool ours_dissolved = false;
+    for (size_t i = 0; i < ids.size(); i += sizeof(device::GroupId::value)) {
+        device::GroupId group;
+        std::memcpy(group.value.data(), ids.data() + i, group.value.size());
+        if (_mark_dissolved(group, t) && group == ours)
+            ours_dissolved = true;
+    }
+
+    // The user of another device kept another group over this one.  Nothing of this group is any
+    // use now, our id included: the way back is to ask to join the group that was kept, as a new
+    // device.
+    if (ours_dissolved) {
+        log::warning(cat, "This device's group was dissolved by another of the account's devices");
+        _new_identity();
+        core.globals.set(dissolved_key, int64_t{1});
+        _devices_changed = true;
+    }
 }
 
 bool Devices::_names_us_kicked(std::span<const std::byte> data) {
@@ -2052,13 +2235,7 @@ std::vector<std::byte> Devices::decrypt_device_data(std::span<const std::byte> e
     auto enc_key_raw = in.require_span<std::byte>("K");
     auto enc_devices = in.require_span<std::byte>("d");
 
-    in.require_signature(
-            "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
-                if (sig.size() != 64 ||
-                    !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
-                    throw std::runtime_error{
-                            "Invalid encrypted device message: signature verification failed"};
-            });
+    _verify_account_signature(in, "encrypted device message");
 
     in.finish();
 
@@ -2247,12 +2424,7 @@ void Devices::receive_link_request(
 
         // The group's link key is published, so anything could have encrypted to it; only a seed
         // holder could have signed.
-        pt.require_signature(
-                "~", [this](std::span<const std::byte> body, std::span<const std::byte> sig) {
-                    if (sig.size() != 64 ||
-                        !ed25519::verify(sig.first<64>(), core.globals.pubkey_ed25519(), body))
-                        throw std::runtime_error{"signature verification failed"};
-                });
+        _verify_account_signature(pt, "link request");
     } catch (const std::exception& e) {
         log::warning(cat, "Ignoring incoming link request: failed to parse: {}", e.what());
         return;
@@ -2559,15 +2731,8 @@ bool Devices::_ignore_request(int reqid, bool delete_from_swarm) {
 
     _ended.insert(*row);
 
-    if (delete_from_swarm) {
-        if (core.network())
-            core._swarm_push({}, {std::move(*ignored)}, [](auto results) {
-                if (!results)
-                    log::warning(cat, "Could not delete an ignored link request from the swarm");
-            });
-        else
-            log::warning(cat, "Not deleting an ignored link request from the swarm: no network");
-    }
+    if (delete_from_swarm)
+        _delete_from_swarm({std::move(*ignored)}, "an ignored link request");
     return true;
 }
 
@@ -2621,9 +2786,10 @@ device::MembershipState Devices::_membership() {
         default: {
             // Admitted after the request lapsed here, and waiting for the user to confirm it.
             auto newest = _newest_request();
-            out.membership = newest && newest->held ? device::Membership::Waiting
-                           : out.others.empty()     ? device::Membership::NoGroup
-                                                    : device::Membership::GroupsVisible;
+            out.membership = newest && newest->held                  ? device::Membership::Waiting
+                           : core.globals.get_integer(dissolved_key) ? device::Membership::Dissolved
+                           : out.others.empty()                      ? device::Membership::NoGroup
+                                                : device::Membership::GroupsVisible;
         }
     }
     return out;
@@ -2654,6 +2820,7 @@ void Devices::_forget_group() {
     core.globals.erase(group_id_key);
     core.globals.erase(read_at_key);
     core.globals.erase(displaced_key);
+    core.globals.erase(dissolved_key);
 }
 
 bool Devices::_displaced() {
@@ -2688,6 +2855,14 @@ bool Devices::_renew_device_identity() {
                                  static_cast<int>(device::State::Kicked)))
         return false;
 
+    _new_identity();
+    _rebaseline_membership();
+    _flush_events();
+    return true;
+}
+
+void Devices::_new_identity() {
+    assert(on_loop());
     // Before the transaction, which it would otherwise nest inside.
     rotate_device_keys();
 
@@ -2702,15 +2877,11 @@ bool Devices::_renew_device_identity() {
         tx.commit();
     }
 
-    log::info(cat, "Replaced removed device id {} with {}", self_id, id);
+    log::info(cat, "Replaced device id {} with {}", self_id, id);
     self_id = id;
     _reqid_by_row.clear();
     _row_by_reqid.clear();
     _ended.clear();
-
-    _rebaseline_membership();
-    _flush_events();
-    return true;
 }
 
 void Devices::start_group(result_function<device::GroupId> cb) {
@@ -2741,7 +2912,8 @@ device::GroupId Devices::_start_group() {
                     "before starting one"};
         case device::Membership::Waiting: _withdraw_own_request(); break;
         case device::Membership::NoGroup:
-        case device::Membership::GroupsVisible: break;
+        case device::Membership::GroupsVisible:
+        case device::Membership::Dissolved: break;
     }
 
     // Whatever it held before is no group's, the group starts with a fresh key, and an admission on
@@ -2984,10 +3156,12 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
             oxenc::bt_dict_consumer in{msg.data};
             auto type = in.require<std::string_view>("");
             if (type == "G") {
-                _record_group(msg);
-                receive_device_group_message(msg.data, msg.hash);
+                if (_record_group(msg))
+                    receive_device_group_message(msg.data, msg.hash);
             } else if (type == "L")
                 receive_link_request(msg.data, msg.hash, msg.expiry);
+            else if (type == "T")
+                receive_dissolution(msg.data);
             else
                 log::warning(cat, "Ignoring device message with unknown type '{}'", type);
         } catch (const std::exception& e) {
@@ -3086,10 +3260,11 @@ void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string 
     // Gone from the swarm, so stop naming them.  Scoped to what this message carried: one merged
     // while the push was in flight was not deleted and is not superseded by it.
     if (!push.obsolete.empty())
-        c.prepared_exec(
-                "DELETE FROM device_group_merged WHERE hash IN ({})"_format(
-                        sqlite::placeholders(push.obsolete.size())),
-                sqlite::bind_each{push.obsolete});
+        for (auto table : {"device_group_merged"sv, "device_group_messages"sv})
+            c.prepared_exec(
+                    "DELETE FROM {} WHERE hash IN ({})"_format(
+                            table, sqlite::placeholders(push.obsolete.size())),
+                    sqlite::bind_each{push.obsolete});
 
     // Our own message is now the newest snapshot, and the next push supersedes it in turn -- by the
     // same rule as everyone else's, since what makes a snapshot redundant is that its contents have

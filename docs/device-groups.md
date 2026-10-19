@@ -82,6 +82,7 @@ dismissed it here.
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Offer a way back: `renew_device_identity`, then join again. |
 | `CutOff` | This device's group has disappeared from the swarm while another group is there. | A critical alert; this may be an attack. Never dismissable. Offer to join one of `others`. |
 | `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer `renew_device_identity`, then join again. |
+| `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `GroupsVisible`. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
 while all of the account's devices were offline for 30 days, and starting a group in that case
@@ -215,6 +216,10 @@ isn't), which is not an error. This device cannot remove itself.
 - **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back,
   `renew_device_identity()` gives it a new identity; it then joins like any new device. Messages
   and the account's configs are kept.
+- **Dissolved** (`membership_changed(Dissolved)`). The user chose, on another device, to keep a
+  different group, and this device's group is gone. Nothing is needed before joining again: the
+  device already has a new identity, and its messages and the account's configs are kept. Offer to
+  link it to the group that was kept, an ordinary join with the emoji confirmation.
 
 ## Starting a group
 

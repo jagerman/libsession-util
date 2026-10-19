@@ -22,6 +22,10 @@
 #include "component.hpp"
 #include "swarm_message.hpp"
 
+namespace oxenc {
+class bt_dict_consumer;
+}  // namespace oxenc
+
 namespace session {
 class TestHelper;
 }  // namespace session
@@ -284,6 +288,11 @@ namespace device {
                     ///< under its id -- a restored copy of it, admitted as a replacement, or
                     ///< someone holding a copy of its data who has rotated it out, which is an
                     ///< attack.  Never dismissable.  It can come back only under a new device id.
+        Dissolved,  ///< Its group was dissolved: the user of another of the account's devices kept
+                    ///< another group over it.  What it held of the group is forgotten and it has
+                    ///< a new device id; it rejoins by asking to join the group that was kept, as
+                    ///< any device outside a group does, and stays Dissolved until it joins a
+                    ///< group or starts one.
     };
 
     /// A device group in the swarm other than this device's own.
@@ -380,10 +389,43 @@ class Devices final : detail::CoreComponent {
     // The identifier a group message carries, which needs only the account seed to read.
     device::GroupId _group_of(std::span<const std::byte> message);
 
-    // Notes a group message in `device_groups`, whether or not we can read it.  Throws on a bad
-    // signature, and on a signed time further ahead of our clock than GROUP_MESSAGE_MAX_AHEAD: the
-    // message is then not to be taken in at all.
-    void _record_group(const SwarmMessage& msg);
+    // Notes a group message in `device_groups`, and its hash in `device_group_messages`, whether or
+    // not we can read it, answering whether to take it in any further.  Not for a group we know to
+    // be dissolved: its message is deleted from the swarm instead, and the dissolution published
+    // again if the message is newer than it.  Throws, so that it is not taken in either, on a bad
+    // signature and on a signed time too far ahead (see `_signed_time`).
+    bool _record_group(const SwarmMessage& msg);
+
+    // Checks that the namespace-21 message `in` is reading was signed by the account, throwing if
+    // not.  `what` names it in the error.
+    void _verify_account_signature(oxenc::bt_dict_consumer& in, std::string_view what);
+
+    // The signed time `t` of the message `in` is reading, once its signature is checked.  Throws
+    // for a time further ahead of our clock than GROUP_MESSAGE_MAX_AHEAD.
+    sys_ms _signed_time(oxenc::bt_dict_consumer& in, std::string_view what);
+
+    // When `group` was dissolved, as the newest tombstone we have seen or published says; nullopt
+    // for a group not dissolved.
+    std::optional<sys_ms> _dissolved_at(const device::GroupId& group);
+
+    // Remembers `group` as dissolved at `t`, and stops counting it among the groups in the swarm.
+    // Answers whether it was news.
+    bool _mark_dissolved(const device::GroupId& group, sys_ms t);
+
+    // A tombstone ("T") naming `groups`, signed at `t`; see "Dissolving a group".
+    std::vector<std::byte> _build_dissolution(std::span<const device::GroupId> groups, sys_ms t);
+
+    // Dissolves `groups`, none of them ours: deletes from the swarm every message of theirs we know
+    // of, and `obsolete` with them, publishes a tombstone naming them, and remembers them as
+    // dissolved.  Best effort: without a network only the last happens, and seeing one of their
+    // messages again then dissolves it again.
+    void _dissolve(std::span<const device::GroupId> groups, std::vector<std::string> obsolete = {});
+
+    // Deletes `hashes` from the swarm, once and without reporting back; `what` names them in logs.
+    void _delete_from_swarm(std::vector<std::string> hashes, std::string_view what);
+
+    // Processes a tombstone ("T") message.  One naming our group dissolves this device out of it.
+    void receive_dissolution(std::span<const std::byte> data);
 
     // Records that this account owes a device group, for `establish_group()` to act on.  Called by
     // Globals when it generates an account, which is before this component has initialised -- hence
@@ -395,8 +437,8 @@ class Devices final : detail::CoreComponent {
     // Encrypts the inner device data for all the members of the device group.
     std::vector<std::byte> encrypt_device_data(const device::map& devices);
 
-    // Processes a single incoming device group ("D") or link request ("L") message.  `data` is the
-    // full raw message bytes including the outer bt-dict wrapper with the "" type key.
+    // Processes a single incoming device group ("G") message.  `data` is the full raw message bytes
+    // including the outer bt-dict wrapper with the "" type key.
     //
     // The group message takes the swarm hash as well, because merging one is what makes it
     // redundant: our next push carries its contents forward, and that is when it can be deleted.
@@ -638,6 +680,10 @@ class Devices final : detail::CoreComponent {
     // Forgets everything of the group this device was in: its devices, its messages, its account
     // keys and its identifier.
     void _forget_group();
+
+    // Forgets the group and our requests, and replaces our device id and device keys with new ones.
+    void _new_identity();
+
     bool _dismiss_group(const device::GroupId& group);
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
