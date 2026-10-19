@@ -8,7 +8,7 @@
 -- Table storing all the device group info
 CREATE TABLE devices (
     id INTEGER PRIMARY KEY NOT NULL,
-    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 32),
+    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 16),
 
     -- Membership rank: 0 unregistered, 1 pending, 2 registered, 3 left, 4 kicked.  Ordered least to
     -- most authoritative because merging compares (state, seqno) as a row value -- see

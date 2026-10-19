@@ -362,7 +362,7 @@ namespace {
     // Builds a device::Info from the fields of a devices table row (excluding the row id, changes,
     // and kicked_timestamp columns, which are not part of device::Info).
     device::Info fill_device_info(
-            std::span<const std::byte, 32> devid,
+            std::span<const std::byte, device::ID_SIZE> devid,
             int state,
             int seqno,
             int64_t timestamp,
@@ -402,7 +402,7 @@ namespace {
 
     // Upserts a device into the devices table and updates device_unknown extras.  Returns the row
     // id if the record was applied, nullopt if the guard rejected it as not newer.  info.id must be
-    // set to the 32-byte device id.
+    // set.
     //
     // The guard is `(state, seqno)` as a row value, not the seqno alone.  A state change is
     // invisible to the seqno -- state never goes on the wire, and is inferred from which message
@@ -506,7 +506,7 @@ device::map Devices::devices(
     for (auto [id, devid, state, seqno, timestamp, type, desc, ver, pk_ml, pk_x, kicked] :
          sqlite::IterableStatementWrapper<
                  int64_t,
-                 sqlite::blob_guts<std::array<std::byte, 32>>,
+                 sqlite::blob_guts<device::Id>,
                  int,
                  int,
                  int64_t,
@@ -744,7 +744,7 @@ namespace {
     // signature is what stops a request being forged by anyone who merely knows the group's link
     // key, which is published.
     std::string encode_link_request_plaintext(
-            std::span<const std::byte, 32> device_id,
+            std::span<const std::byte, device::ID_SIZE> device_id,
             const device::Info& info,
             std::span<const std::byte, 64> ed25519_secret) {
         oxenc::bt_dict_producer out;
@@ -816,7 +816,7 @@ namespace {
     // The device record a stored link request asks to have admitted.  Already verified when the
     // request was received.
     device::Info requested_record(
-            std::span<const std::byte, 32> id, std::span<const std::byte> encoded) {
+            std::span<const std::byte, device::ID_SIZE> id, std::span<const std::byte> encoded) {
         device::Info info;
         std::ranges::copy(id, info.id.begin());
         decode_one(info, oxenc::bt_dict_consumer{encoded}, device::State::Pending);
@@ -844,13 +844,13 @@ namespace {
 
         while (!devs.is_finished()) {
             auto in_id = devs.key();
-            if (in_id.size() != 32)
+            if (in_id.size() != device::ID_SIZE)
                 throw std::runtime_error{
-                        "Invalid encoded device data: unexpected {}-byte key in device dict (expected 32)"_format(
-                                in_id.size())};
+                        "Invalid encoded device data: unexpected {}-byte key in device dict (expected {})"_format(
+                                in_id.size(), device::ID_SIZE)};
 
-            std::array<std::byte, 32> id;
-            std::memcpy(id.data(), in_id.data(), 32);
+            device::Id id;
+            std::memcpy(id.data(), in_id.data(), id.size());
             auto [it, ins] = result.devices.try_emplace(id);
             if (!ins)
                 throw std::runtime_error{"Invalid encoded device data: duplicate device ids"};
@@ -950,7 +950,7 @@ namespace {
     std::array<std::byte, 16> kicked_entry(
             std::span<const std::byte, 32> A,
             std::span<const std::byte, 32> seed,
-            std::span<const std::byte, 32> device_id) {
+            std::span<const std::byte, device::ID_SIZE> device_id) {
         std::array<std::byte, 16> out;
         hash::blake2b_key_pers(out, A, PERS_KICKED, seed, device_id);
         return out;
@@ -959,7 +959,7 @@ namespace {
     // Device group payloads are null-padded to a multiple of this before encryption so that the
     // encrypted size reveals only which bucket the payload falls in, not what it contains.  A
     // bucket is four devices at a budget of 1600 bytes each, a deliberate overestimate of a
-    // ~1341-byte record, with the remainder of a bucket left for removal tombstones.
+    // ~1325-byte record, with the remainder of a bucket left for removal tombstones.
     constexpr size_t DEVICE_PAYLOAD_PADDING = 4 * 1600;
 
     // Added before the buckets: the account key list is carried by every payload whatever the
@@ -1053,7 +1053,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
         auto seed = core.globals.account_seed();
         group_id_enc = crypt_group_id(group_id->value, A, seed.seed());
 
-        std::vector<const std::array<std::byte, 32>*> removed;
+        std::vector<const device::Id*> removed;
         for (const auto& [id, info] : devices)
             if (info.state == device::State::Kicked)
                 removed.push_back(&id);
@@ -1285,7 +1285,7 @@ static const std::string ANSWER_REQUEST_SQL =
 static void answer_replacements(
         sqlite::Connection& c,
         int64_t dev_id,
-        std::span<const std::byte, 32> id,
+        std::span<const std::byte, device::ID_SIZE> id,
         const device::Info& record) {
     std::vector<int64_t> answered;
     for (auto [row, encoded] : c.prepared_results<int64_t, sqlite::blob>(
@@ -1443,7 +1443,7 @@ void Devices::receive_device_group_message(
     }
 
     bool departed = false;
-    std::vector<std::array<std::byte, 32>> members;
+    std::vector<device::Id> members;
     for (const auto& [id, info] : payload.devices) {
         if (info.state == device::State::Kicked || info.state == device::State::Left) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
@@ -2177,7 +2177,7 @@ void Devices::receive_link_request(
     std::string_view raw;
     try {
         oxenc::bt_dict_consumer pt{std::span<const std::byte>{*plaintext}};
-        auto in_id = pt.require_span<unsigned char, 32>("I");
+        auto in_id = pt.require_span<unsigned char, device::ID_SIZE>("I");
         std::memcpy(info.id.data(), in_id.data(), info.id.size());
 
         // Skip any unknown keys between "I" and "i"
@@ -2328,7 +2328,7 @@ std::vector<std::pair<int64_t, device::LinkRequest>> Devices::_read_link_request
                  sqlite::blob_guts<std::array<std::byte, 16>>,
                  sqlite::blob,
                  int,
-                 sqlite::blob_guts<std::array<std::byte, 32>>>(
+                 sqlite::blob_guts<device::Id>>(
                  "SELECT r.id, r.received_at, r.expires_at, r.status, r.sas_seed, r.info,"
                  "       r.replaces, d.unique_id"
                  "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
@@ -2436,7 +2436,7 @@ bool Devices::_replace_record(int64_t row) {
     auto c = conn();
     std::optional<device::Info> info;
     for (auto [record, id, seqno] :
-         c.prepared_results<sqlite::blob, sqlite::blob_guts<std::array<std::byte, 32>>, int64_t>(
+         c.prepared_results<sqlite::blob, sqlite::blob_guts<device::Id>, int64_t>(
                  "SELECT r.info, d.unique_id, d.seqno"
                  "  FROM device_link_requests r JOIN devices d ON d.id = r.device"
                  " WHERE r.id = ? AND d.state = ?",
@@ -2636,7 +2636,7 @@ bool Devices::_renew_device_identity() {
     // Before the transaction, which it would otherwise nest inside.
     rotate_device_keys();
 
-    std::array<std::byte, 32> id;
+    device::Id id;
     random::fill(id);
     {
         auto c = conn();
@@ -2723,15 +2723,15 @@ bool Devices::_dismiss_group(const device::GroupId& group) {
             .has_value();
 }
 
-void Devices::remove_device(std::array<std::byte, 32> id, result_function<bool> cb) {
+void Devices::remove_device(device::Id id, result_function<bool> cb) {
     async([this, id] { return _remove_device(id); }, std::move(cb));
 }
 
-bool Devices::remove_device(std::span<const std::byte, 32> id, await_t) {
+bool Devices::remove_device(std::span<const std::byte, device::ID_SIZE> id, await_t) {
     return jq().call_get([this, id] { return _remove_device(id); });
 }
 
-bool Devices::_remove_device(std::span<const std::byte, 32> id) {
+bool Devices::_remove_device(std::span<const std::byte, device::ID_SIZE> id) {
     assert(on_loop());
     if (std::ranges::equal(id, self_id))
         throw std::invalid_argument{"remove_device: cannot remove this device itself"};
@@ -2836,7 +2836,7 @@ void Devices::_arm_expiry(std::optional<std::chrono::sys_seconds> deadline) {
 std::optional<std::chrono::sys_seconds> Devices::_report_events(
         DeviceEvents& events,
         bool devices_changed,
-        std::span<const std::array<std::byte, 32>> member_changes,
+        std::span<const device::Id> member_changes,
         std::chrono::sys_seconds now) {
     // One handler throwing must not take the others' reports down with it.
     auto report = [](std::string_view which, auto&& call) {
@@ -3164,7 +3164,7 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     // Read in the same breath as the payload, so that what the confirm clears is what the message
     // actually contains rather than whatever is owed by the time the swarm answers.
     auto c = conn();
-    for (auto id : c.prepared_results<sqlite::blob_guts<std::array<std::byte, 32>>>(
+    for (auto id : c.prepared_results<sqlite::blob_guts<device::Id>>(
                  "SELECT unique_id FROM devices WHERE broadcast_needed"))
         push.broadcast.push_back(id);
     for (auto id :

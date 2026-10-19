@@ -617,7 +617,8 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 
     // Gives `core` another device's id, as a copy of that device's data would have it -- though
     // not its keys, which is what a copy that has since rotated them looks like.
-    static void set_device_id(core::Core& core, std::span<const std::byte, 32> id) {
+    static void set_device_id(
+            core::Core& core, std::span<const std::byte, core::device::ID_SIZE> id) {
         on_loop(core, [&] {
             std::ranges::copy(id, core.devices.self_id.begin());
             return 0;

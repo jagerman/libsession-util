@@ -37,9 +37,9 @@ TempCore restored_core() {
 TEST_CASE("Devices - identity", "[core][devices]") {
     TempCore c;
 
-    SECTION("device_id is 64-char hex") {
+    SECTION("device_id is the id in hex") {
         auto id = c->devices.device_id();
-        REQUIRE(id.size() == 64);
+        REQUIRE(id.size() == 2 * device::ID_SIZE);
         CHECK(std::all_of(id.begin(), id.end(), [](char ch) {
             return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
         }));
@@ -582,7 +582,7 @@ TEST_CASE("Devices - establishing the group", "[core][devices]") {
     }
 
     SECTION("it survives a restart, and does not happen twice") {
-        std::optional<std::array<std::byte, 32>> first_id;
+        std::optional<device::Id> first_id;
         int64_t first_seqno = 0;
         auto path = std::filesystem::temp_directory_path() /
                     fmt::format("{}.db", random::unique_id("test_estab", 7));
@@ -631,7 +631,7 @@ TEST_CASE("Devices - a removal cannot be undone by a message", "[core][devices]"
         TestHelper::receive_device_group_message(
                 c->devices, TestHelper::encrypt_device_data(c->devices, m));
     };
-    auto state_of = [&](const std::array<std::byte, 32>& id) {
+    auto state_of = [&](const device::Id& id) {
         auto devs = c->devices.devices(true, true, true);
         auto found = devs.find(id);
         REQUIRE(found != devs.end());
@@ -740,7 +740,7 @@ TEST_CASE("Devices - a tombstone for an unknown device is kept", "[core][devices
         TestHelper::receive_device_group_message(
                 c->devices, TestHelper::encrypt_device_data(c->devices, m));
     };
-    auto state_of = [&](const std::array<std::byte, 32>& id) {
+    auto state_of = [&](const device::Id& id) {
         auto devs = c->devices.devices(true, true, true);
         auto found = devs.find(id);
         REQUIRE(found != devs.end());
@@ -792,13 +792,13 @@ TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][device
         TestHelper::receive_device_group_message(
                 c->devices, TestHelper::encrypt_device_data(c->devices, m));
     };
-    auto state_of = [&](const std::array<std::byte, 32>& id) {
+    auto state_of = [&](const device::Id& id) {
         auto devs = c->devices.devices(true, true, true);
         auto found = devs.find(id);
         REQUIRE(found != devs.end());
         return found->second;
     };
-    auto tombstone = [&](const std::array<std::byte, 32>& id, device::State state, auto when) {
+    auto tombstone = [&](const device::Id& id, device::State state, auto when) {
         device::Info t{};
         t.id = id;
         t.state = state;
@@ -806,7 +806,7 @@ TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][device
         return t;
     };
 
-    std::array<std::byte, 32> id;
+    device::Id id;
     random::fill(id);
     auto t0 = clock_now_s() - 3h;
     auto t1 = clock_now_s() - 2h;
@@ -845,7 +845,7 @@ TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][device
     CHECK(state_of(id).kicked == t2);
 
     // A device that left cannot re-add itself any more than a removed one can.
-    std::array<std::byte, 32> leaver;
+    device::Id leaver;
     random::fill(leaver);
     deliver({{self.id, self}, {leaver, tombstone(leaver, device::State::Left, t1)}});
     device::Info returning{};
@@ -911,14 +911,14 @@ struct Linking {
         return out;
     }
 
-    static std::array<std::byte, 32> id_of(TempCore& c) {
+    static device::Id id_of(TempCore& c) {
         auto hex = c->devices.device_id();
-        std::array<std::byte, 32> id;
+        device::Id id;
         oxenc::from_hex(hex.begin(), hex.end(), reinterpret_cast<unsigned char*>(id.data()));
         return id;
     }
 
-    std::array<std::byte, 32> applicant_id() { return id_of(applicant); }
+    device::Id applicant_id() { return id_of(applicant); }
 
     // The applicant's request, as the existing device receives it.  Whole seconds, because that is
     // what the deadline is stored in, so a test can compare it exactly.
@@ -2761,7 +2761,7 @@ TEST_CASE(
         "Devices - only a device in the group can be removed, and only by another",
         "[core][devices][removal]") {
     Linking l;
-    std::array<std::byte, 32> unknown;
+    device::Id unknown;
     random::fill(unknown);
     CHECK_FALSE(l.core->devices.remove_device(unknown, await));
 

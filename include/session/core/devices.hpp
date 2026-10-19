@@ -35,6 +35,11 @@ class DeviceEvents;
 
 namespace device {
 
+    /// A device id: random bytes libsession generates for a device the first time it starts, and
+    /// again whenever it takes a new identity.  Never chosen by the application.
+    inline constexpr size_t ID_SIZE = 16;
+    using Id = std::array<std::byte, ID_SIZE>;
+
     enum class Type {
         Unknown,
         Session_iOS,
@@ -122,8 +127,8 @@ namespace device {
     };
 
     struct Info {
-        // Unique device id, in raw bytes.  Typically randomized during device initial setup.
-        std::array<std::byte, 32> id;
+        // Unique device id, in raw bytes.
+        Id id;
 
         // Device seqno.  Incremented on device key rotation and/or info updates.
         int64_t seqno;
@@ -197,7 +202,7 @@ namespace device {
         bool same_user_fields(const Info& other) const;
     };
 
-    using map = std::map<std::array<std::byte, 32>, Info>;
+    using map = std::map<Id, Info>;
 
     /// A link request this device saw, and what became of it.
     ///
@@ -333,7 +338,7 @@ class Devices final : detail::CoreComponent {
     bool _devices_changed = false;
     // Other devices admitted, removed or departed since the last flush, for
     // `device_membership_changed`.
-    std::vector<std::array<std::byte, 32>> _member_changes;
+    std::vector<device::Id> _member_changes;
     bool _fetched = false;
     device::Membership _reported_membership = device::Membership::Unknown;
     std::set<std::array<std::byte, 8>> _announced_groups;
@@ -355,7 +360,7 @@ class Devices final : detail::CoreComponent {
     std::optional<std::chrono::sys_seconds> _report_events(
             DeviceEvents& events,
             bool devices_changed,
-            std::span<const std::array<std::byte, 32>> member_changes,
+            std::span<const device::Id> member_changes,
             std::chrono::sys_seconds now);
 
     // Reads link requests with the device each came from.  `pending_only` restricts to those still
@@ -385,7 +390,7 @@ class Devices final : detail::CoreComponent {
     // a stored flag rather than doing the work there.
     void _mark_group_owed();
 
-    std::array<std::byte, 32> self_id;
+    device::Id self_id;
 
     // Encrypts the inner device data for all the members of the device group.
     std::vector<std::byte> encrypt_device_data(const device::map& devices);
@@ -433,8 +438,8 @@ class Devices final : detail::CoreComponent {
     std::string device_id() const;
 
     // Returns info for all registered and/or pending devices and/or unregistered devices for this
-    // account.  If `only_device` is non-empty it must be a 32-byte device id that is used to
-    // filter the results to just that one device.
+    // account.  If `only_device` is non-empty it must be a device id, and filters the results to
+    // just that one device.
     device::map devices(
             bool include_registered = true,
             bool include_pending = false,
@@ -584,8 +589,8 @@ class Devices final : detail::CoreComponent {
     // those is an error: each can happen between a device list being drawn and the user acting on
     // it.  Passing this device's own id is an error (std::invalid_argument): a device leaves a
     // group by joining another.
-    void remove_device(std::array<std::byte, 32> id, result_function<bool> cb);
-    bool remove_device(std::span<const std::byte, 32> id, await_t);
+    void remove_device(device::Id id, result_function<bool> cb);
+    bool remove_device(std::span<const std::byte, device::ID_SIZE> id, await_t);
 
     // Where this device stands, and which other groups are in the swarm.  What an application
     // prompts from at startup and draws its device screen from; read again on `membership_changed`
@@ -626,7 +631,7 @@ class Devices final : detail::CoreComponent {
     bool dismiss_group(const device::GroupId& group, await_t);
 
   private:
-    bool _remove_device(std::span<const std::byte, 32> id);
+    bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
     device::MembershipState _membership();
     device::GroupId _start_group();
     bool _renew_device_identity();
@@ -861,8 +866,8 @@ class Devices final : detail::CoreComponent {
         // What this message carries that was owed, so that confirming it clears exactly that and no
         // more.  A device kicked, or a key minted, while the push was in flight is not in these and
         // therefore stays owed -- it would otherwise be marked clean by a message it never reached.
-        std::vector<std::array<std::byte, 32>> broadcast;  // device ids whose transition it carries
-        std::vector<int64_t> keys;  // device_account_keys rows it distributes
+        std::vector<device::Id> broadcast;  // device ids whose transition it carries
+        std::vector<int64_t> keys;          // device_account_keys rows it distributes
 
         // Messages this one makes redundant: everything we had merged when it was built, whoever
         // wrote it.  A "G" is a snapshot of the whole group rather than one device's contribution,

@@ -1,10 +1,10 @@
 -- A device can now leave a group as well as be removed from one, so Left takes rank 3 and Kicked
--- moves up to 4.  Changing the CHECKs that pin that down means recreating `devices`, and with it
--- the two tables that reference it: migrations run with foreign keys on, so dropping the old parent
--- would cascade into the children's rows.
+-- moves up to 4, and device ids shrink from 32 bytes to 16.  Changing the CHECKs that pin that down
+-- means recreating `devices`, and with it the two tables that reference it: migrations run with
+-- foreign keys on, so dropping the old parent would cascade into the children's rows.
 CREATE TABLE devices_new (
     id INTEGER PRIMARY KEY NOT NULL,
-    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 32),
+    unique_id BLOB UNIQUE NOT NULL CHECK(length(unique_id) == 16),
     state INTEGER NOT NULL CHECK(state >= 0 AND state <= 4),
     seqno INTEGER NOT NULL DEFAULT 1,
     pushed_seqno INTEGER,
@@ -39,16 +39,21 @@ CREATE TABLE device_link_requests_new (
     replaces INTEGER NOT NULL DEFAULT 0 CHECK(replaces IN (0, 1))
 ) STRICT;
 
--- A digest is only recorded as a record is merged, so the next message to carry each device fills
--- it in.
+-- A migrated row has no digest, and gets one only when its seqno next changes: at an equal state
+-- and seqno, comparing against a NULL digest is NULL, which rejects the update.
+--
+-- A device id keeps its first 16 bytes, which are as random as the rest of it: our own, here and
+-- in `globals`, and those of devices that asked to join.
 INSERT INTO devices_new (
         id, unique_id, state, seqno, pushed_seqno, broadcast_needed, timestamp, kicked_timestamp,
         device_type, description, version, pubkey_mlkem768, pubkey_x25519)
     SELECT
-        id, unique_id, CASE state WHEN 3 THEN 4 ELSE state END, seqno, pushed_seqno,
-        broadcast_needed, timestamp, kicked_timestamp, device_type, description, version,
-        pubkey_mlkem768, pubkey_x25519
+        id, substr(unique_id, 1, 16), CASE state WHEN 3 THEN 4 ELSE state END, seqno,
+        pushed_seqno, broadcast_needed, timestamp, kicked_timestamp, device_type, description,
+        version, pubkey_mlkem768, pubkey_x25519
     FROM devices;
+
+UPDATE globals SET value = substr(value, 1, 16) WHERE key = 'device_unique_id';
 
 INSERT INTO device_unknown_new (device, key, bt_value)
     SELECT device, key, bt_value FROM device_unknown;
