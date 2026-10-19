@@ -619,6 +619,21 @@ void Devices::_update_info(const device::Info& info) {
 
 namespace {
 
+    // A message's per-device lists -- recipients, and the `kicked` list -- are padded to whole
+    // buckets of this many entries, and its payload is sized by the same buckets, so that what an
+    // outsider can measure says only which bucket a count falls in.
+    constexpr size_t DEVICES_PER_BUCKET = 4;
+
+    constexpr size_t whole_buckets(size_t n) {
+        return (n + DEVICES_PER_BUCKET - 1) / DEVICES_PER_BUCKET * DEVICES_PER_BUCKET;
+    }
+
+    // The most removal markers a message for a group of `live` devices carries: a bucket's worth,
+    // which keeps removal history the same share of the payload whatever the group's size.
+    constexpr size_t removal_marker_cap(size_t live) {
+        return whole_buckets(live);
+    }
+
     // Plain-old-data representation of a single account key seed entry as read from or written to
     // the "K" list in the device group plaintext payload.
     struct AccountKeySeed {
@@ -684,44 +699,59 @@ namespace {
             devout.append_bt(xit->first, xit->second);
     }
 
+    bool tombstoned(const device::Info& info) {
+        return info.state == device::State::Kicked || info.state == device::State::Left;
+    }
+
+    // What a message says about each device, in id order: every live record, and the most recent
+    // removals and departures that are newer than REMOVAL_MARKER_MAX_AGE, at most
+    // `removal_marker_cap` of them -- see "Which removals a message carries".  Pending and
+    // unregistered devices are in no group, so there is nothing to say about them.
+    //
+    // Only the message is pruned, never the table: a local row costs nothing, and forgetting one
+    // would lower its rank and let a stale message bring the device back.
+    std::vector<const device::Info*> carried_records(
+            const device::map& devices, std::chrono::sys_seconds now) {
+        std::vector<const device::Info*> out, markers;
+        for (const auto& [id, info] : devices) {
+            if (info.state == device::State::Registered)
+                out.push_back(&info);
+            else if (tombstoned(info) && *info.kicked > now - Devices::REMOVAL_MARKER_MAX_AGE)
+                markers.push_back(&info);
+        }
+
+        // Stable, so that a tie at the cut is settled by id, as the map has them.
+        std::ranges::stable_sort(
+                markers, std::ranges::greater{}, [](const device::Info* i) { return *i->kicked; });
+        if (auto cap = removal_marker_cap(out.size()); markers.size() > cap)
+            markers.resize(cap);
+
+        out.insert(out.end(), markers.begin(), markers.end());
+        std::ranges::sort(
+                out, {}, [](const device::Info* i) -> const device::Id& { return i->id; });
+        return out;
+    }
+
+    // `records` in id order, as `carried_records` gives them.
     std::string encode_group_payload(
-            const device::map& devices, std::span<const AccountKeySeed> acc_keys) {
+            std::span<const device::Info* const> records,
+            std::span<const AccountKeySeed> acc_keys) {
         oxenc::bt_dict_producer out;
 
         {
             auto devs = out.append_dict("D");
-            for (const auto& [id, info] : devices) {
+            for (const auto* info : records) {
+                std::string_view id_sv{
+                        reinterpret_cast<const char*>(info->id.data()), info->id.size()};
 
-                std::string_view id_sv{reinterpret_cast<const char*>(id.data()), id.size()};
-
-                if (info.state == device::State::Pending) {
-                    log::debug(
-                            cat,
-                            "Skipping pending device {} in device group data",
-                            oxenc::to_hex(id));
-                    continue;
-                } else if (
-                        info.state == device::State::Kicked || info.state == device::State::Left) {
-                    // A tombstone is how every other device learns that a device is gone, since a
-                    // record merely absent from a message means "unchanged" rather than "removed".
-                    //
-                    // TODO: we should stop writing devices gone a long time ago.  Pruning means
-                    // dropping them from *this payload* and never from the table -- the budget is
-                    // on what the message carries, a local row costs nothing, and forgetting one
-                    // would lower its rank and let a stale group resurrect the device.
-                    assert(info.kicked);
+                // A tombstone is how every other device learns that a device is gone, since a
+                // record merely absent from a message means "unchanged" rather than "removed".
+                if (tombstoned(*info))
                     devs.append_dict(id_sv).append(
-                            info.state == device::State::Left ? "l" : "r",
-                            info.kicked->time_since_epoch().count());
-                    continue;
-                } else if (info.state == device::State::Unregistered) {
-                    // Never in the group rather than removed from it, so there is nothing to say
-                    // about it: our own row before the group exists, and nothing else.
-                    log::debug(cat, "Skipping unregistered device {}", oxenc::to_hex(id));
-                    continue;
-                }
-
-                encode_device_info(devs.append_dict(id_sv), info);
+                            info->state == device::State::Left ? "l" : "r",
+                            info->kicked->time_since_epoch().count());
+                else
+                    encode_device_info(devs.append_dict(id_sv), *info);
             }
         }  // "D" dict closed here
 
@@ -975,7 +1005,7 @@ namespace {
     // encrypted size reveals only which bucket the payload falls in, not what it contains.  A
     // bucket is four devices at a budget of 1600 bytes each, a deliberate overestimate of a
     // ~1325-byte record, with the remainder of a bucket left for removal tombstones.
-    constexpr size_t DEVICE_PAYLOAD_PADDING = 4 * 1600;
+    constexpr size_t DEVICE_PAYLOAD_PADDING = DEVICES_PER_BUCKET * 1600;
 
     // Added before the buckets: the account key list is carried by every payload whatever the
     // device count, and is bounded by the rotation period and retention window -- at most 33
@@ -1040,19 +1070,17 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 
     auto A = x25519::scalarmult_base(a);
 
+    auto records = carried_records(devices, clock_now_s());
+
     // Who can read this, which is not the same as who appears in it.  A kicked device is written
     // into the payload -- a tombstone carrying when it was kicked is how every other device learns
     // it is gone -- but must not be given a key, which is the entire point of removing it.  A
     // pending device is in neither: it is not in the group until someone accepts it.
     std::vector<const device::Info*> recipients;
-    for (const auto& [id, info] : devices)
-        if (info.state == device::State::Registered)
-            recipients.push_back(&info);
+    for (const auto* info : records)
+        if (info->state == device::State::Registered)
+            recipients.push_back(info);
 
-    // Removals among the tombstones, announced to the devices removed, which have no key to read
-    // them from the payload.  Departures are left out: the device that left knows, and would read
-    // its own entry as a removal.  Padded to a multiple of 4 and shuffled, like the recipient
-    // lists, so that the length says only which bucket the removal count is in.
     // A group established before groups had identifiers gets one from whichever of its devices
     // pushes first, and the rest adopt it from that message.
     auto group_id = _group_id();
@@ -1063,17 +1091,20 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
     }
     std::array<std::byte, 8> group_id_enc;
 
+    // Removals among the tombstones carried, announced to the devices removed, which have no key to
+    // read them from the payload.  Departures are left out: the device that left knows, and would
+    // read its own entry as a removal.  Shuffled into whole buckets, like the recipient lists.
     std::vector<std::byte> kicked_raw;
     {
         auto seed = core.globals.account_seed();
         group_id_enc = crypt_group_id(group_id->value, A, seed.seed());
 
         std::vector<const device::Id*> removed;
-        for (const auto& [id, info] : devices)
-            if (info.state == device::State::Kicked)
-                removed.push_back(&id);
+        for (const auto* info : records)
+            if (info->state == device::State::Kicked)
+                removed.push_back(&info->id);
 
-        std::vector<size_t> slots((removed.size() + 3) / 4 * 4);
+        std::vector<size_t> slots(whole_buckets(removed.size()));
         std::iota(slots.begin(), slots.end(), 0);
         std::ranges::shuffle(slots, csrng);
 
@@ -1084,8 +1115,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
                     kicked_entry(A, seed.seed(), *removed[i]), kicked_raw.begin() + 16 * slots[i]);
     }
 
-    int padded_count = recipients.size();
-    padded_count = (padded_count + 3) / 4 * 4;
+    int padded_count = whole_buckets(recipients.size());
 
     auto indices = std::views::iota(0, padded_count);
 
@@ -1169,7 +1199,7 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
         throw std::logic_error{"Cannot build a device group message without a current account key"};
     auto link_x25519 = keys_from_seed<AccountKeys>(acc_keys.front().seed).x25519_pub;
 
-    auto plaintext_devices = encode_group_payload(devices, acc_keys);
+    auto plaintext_devices = encode_group_payload(records, acc_keys);
     // 2300 + 6400N: at least one bucket, so a payload smaller than the account key allowance still
     // pads up rather than down to nothing.
     auto buckets = std::max<size_t>(
@@ -1271,8 +1301,8 @@ std::vector<std::byte> Devices::encrypt_device_data(const device::map& devices) 
 // off the wire can be.
 //
 // Ranked like every other merge: Kicked outranks Left outranks any live record, and between two
-// tombstones of one kind the later wins.  Every group message carries every tombstone, so most of
-// these restate what is already held, and only a real change returns a row.
+// tombstones of one kind the later wins.  Every group message carries the group's recent
+// tombstones, so most of these restate what is already held, and only a real change returns a row.
 static const std::string TOMBSTONE_SQL =
         "INSERT INTO devices"
         " (unique_id, state, seqno, timestamp, device_type, description, version,"
@@ -1323,10 +1353,11 @@ static void answer_replacements(
 // the removed list and marking it for broadcast.
 //
 // Refusing the record locally is not enough: a device that never saw the removal -- offline at the
-// time, or having since pruned the tombstone -- has no reason to refuse it, and would go on
-// treating the device as a member and encrypting to it.  Nothing reconciles that afterwards, since
-// a record absent from a message means "unchanged" rather than "removed", so the two devices would
-// hold permanently different groups.  A tombstone propagates where a refusal does not.
+// time, or joined after messages stopped carrying the tombstone -- has no reason to refuse it, and
+// would go on treating the device as a member and encrypting to it.  Nothing reconciles that
+// afterwards, since a record absent from a message means "unchanged" rather than "removed", so the
+// two devices would hold permanently different groups.  A tombstone propagates where a refusal
+// does not.
 //
 // The timestamp is moved to now rather than left at the original removal, because retention keeps
 // the most recently removed: a tombstone left to age could be evicted while the device it names is
@@ -1460,7 +1491,7 @@ void Devices::receive_device_group_message(
     bool departed = false;
     std::vector<device::Id> members;
     for (const auto& [id, info] : payload.devices) {
-        if (info.state == device::State::Kicked || info.state == device::State::Left) {
+        if (tombstoned(info)) {
             // Whatever details we already hold are kept; only the state and the timestamp move.  A
             // device we have never heard of gets a bare tombstone -- see TOMBSTONE_SQL.
             assert(info.kicked);

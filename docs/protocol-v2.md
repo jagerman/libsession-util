@@ -153,9 +153,8 @@ Padding is therefore to a size of:
 
 where the 2300 covers the account key list and each 6400-byte bucket covers four devices at a
 budget of 1500 bytes per device record, the remainder of the bucket being available for removal
-tombstones (see "Removed devices").  A payload carries as many tombstones as fit without crossing
-into the next bucket, the most recently removed being kept; devices arrive at the same set from the
-same data.
+tombstones: a payload carries at most 4 of them for each bucket of live devices (see "Which removals
+a message carries").
 
 The budget is not enforced.  Records or account keys exceeding their allowance push the payload into
 the next bucket rather than being rejected.
@@ -191,6 +190,23 @@ kept.  It then asks to join as any device outside a group does.
 
 The removed device is not among the message recipients and cannot decrypt the payload; see
 "Announcing removals" below.
+
+#### Which removals a message carries
+
+A tombstone is there to tell devices that were offline when the removal or departure happened: a
+device that saw it already holds it, and keeps it for good.  Blocking the removed device from being
+merged back in is not what a tombstone in a message is for: once the members' device keys have
+rotated, a removed device can no longer produce a message any of them can read.
+
+So a message does not carry every tombstone ever made.  For a group with N live devices it carries
+the 4⌈N/4⌉ most recent -- removals and departures together, by their timestamps -- and none more
+than 6 months old.  The cap is the group's bucket of devices, so that removal history stays the
+same share of a payload whatever the group's size; a group that shrinks across a bucket boundary
+drops its oldest.  This prunes only what a message carries, never what a device holds: a tombstone
+left out of messages still decides every merge on a device that has it.
+
+A device offline for longer than that, or across more removals than the cap, is not told by a
+tombstone, and has only the fact that it can no longer read its group's messages to go by.
 
 ### Device data encryption
 
@@ -266,9 +282,9 @@ Actual encryption is performed as follows:
 2. Pad the ciphertexts as needed with random values of the same length to bring it up to the next
    multiple of 4 ciphertexts:
 
-        cᵢ = random(1088), 𝑖 ∈ {𝑁+1, ..., 𝑁⌈𝑁/4⌉}
+        cᵢ = random(1088), 𝑖 ∈ {𝑁+1, ..., 4⌈𝑁/4⌉}
 
-3. Generated a shuffled ordering over the 𝑁⌈𝑁/4⌉ elements (and store it; it will be used again in a
+3. Generated a shuffled ordering over the 4⌈𝑁/4⌉ elements (and store it; it will be used again in a
    later step), and build the final packed ciphertext value by concatenating all of the cᵢ values
    together in shuffled order:
 
@@ -325,7 +341,7 @@ Actual encryption is performed as follows:
 10. Pad the key list as needed with random values of the same length to bring it up to the next
     multiple of 4 ciphertexts:
 
-        dkᵢ || keyᵢ = random(2+32), 𝑖 ∈ {𝑁+1, ..., 𝑁⌈𝑁/4⌉}
+        dkᵢ || keyᵢ = random(2+32), 𝑖 ∈ {𝑁+1, ..., 4⌈𝑁/4⌉}
 
 11. All 4⌈𝑁/4⌉ keyᵢ values (i.e. real + dummy) are then packed in the same shuffled ordering used in
     step 3 into a packed `keys` value:
@@ -358,9 +374,10 @@ A removed device computes this value for its own device ID to detect its removal
 the group take removals from the tombstones in the payload and have no use for this field.  Without
 the root seed the entries are indistinguishable from random.
 
-The list is built from the removals among the tombstones the payload carries -- never from
-departures, since a device that left already knows, and would otherwise read its own departure as a
-removal -- recomputed for each message: the entries
+The list is built from the removals among the tombstones the payload carries, and so is bounded by
+the same cap (see "Which removals a message carries") -- never from departures, since a device that
+left already knows, and would otherwise read its own departure as a removal -- recomputed for each
+message: the entries
 cannot be recovered from a previous message, since a device ID cannot be derived from an entry and
 the value depends on that message's `A`.
 

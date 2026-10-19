@@ -812,6 +812,10 @@ class Devices final : detail::CoreComponent {
     // offline for longer than this loses the only record of what its group is.
     static constexpr auto DEVICE_GROUP_TTL = 30 * 24h;
 
+    // How long a group's messages go on carrying a removal or departure, for the devices that were
+    // away when it happened.  Only what a message carries: a device's own table keeps every one.
+    static constexpr auto REMOVAL_MARKER_MAX_AGE = std::chrono::months{6};
+
     // How long the swarm holds a link request, which is how long it can be answered.  Linking
     // needs the user at both devices at once, so a longer wait buys nothing.
     static constexpr auto LINK_REQUEST_TTL = 10min;

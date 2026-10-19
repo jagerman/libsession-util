@@ -10,6 +10,7 @@
 #include <session/core/error_codes.hpp>
 #include <session/core/globals.hpp>
 #include <session/xed25519.hpp>
+#include <set>
 #include <thread>
 
 #include "test_helper.hpp"
@@ -1406,7 +1407,7 @@ TEST_CASE(
     REQUIRE(l.events.replaced.size() == 1);
     CHECK(l.events.replaced[0].at(gone.id).state == device::State::Kicked);
 
-    // Every group message carries every tombstone.
+    // Every group message carries the group's recent tombstones.
     TestHelper::deliver_device_message(
             *l.core, TestHelper::encrypt_device_data(l.core->devices, group), in(10min), "G2");
     CHECK(l.events.replaced.size() == 1);
@@ -2740,6 +2741,139 @@ TEST_CASE(
             in(10min),
             "G2");
     CHECK(l.core->devices.active_account_keys().front().x25519_pub == before);
+}
+
+namespace {
+
+// The devices a group message says anything about, records and tombstones alike.
+std::set<device::Id> carried_ids(Devices& d, std::span<const std::byte> message) {
+    auto plaintext = TestHelper::decrypt_device_data(d, message);
+    oxenc::bt_dict_consumer btdc{to_string_view(plaintext)};
+    REQUIRE(btdc.skip_until("D"));
+    auto devs = btdc.consume_dict_consumer();
+    std::set<device::Id> ids;
+    while (!devs.is_finished()) {
+        auto key = devs.key();
+        REQUIRE(key.size() == device::ID_SIZE);
+        device::Id id;
+        std::memcpy(id.data(), key.data(), id.size());
+        ids.insert(id);
+        devs.consume_dict_data();
+    }
+    return ids;
+}
+
+size_t kicked_slots(std::span<const std::byte> message) {
+    oxenc::bt_dict_consumer outer{message};
+    return outer.skip_until("k") ? outer.consume_span<std::byte>().size() / 16 : 0;
+}
+
+device::Info tombstone(device::State state, std::chrono::sys_seconds when) {
+    device::Info t{};
+    random::fill(t.id);
+    t.state = state;
+    t.kicked = when;
+    return t;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Devices - a message carries only the most recent removal markers",
+        "[core][devices][removal]") {
+    TempCore c;
+    auto [self, registered] = c->devices.device_info(await);
+    REQUIRE(registered);
+    device::map group{{self.id, self}};
+
+    // Another device holding the account seed, to read the `kicked` list as a removed one would.
+    TempCore removed{core::predefined_seed{std::span<const std::byte, 32>{Linking::seed_of(c)}}};
+
+    // Removals and departures, the newest first.
+    std::vector<device::Info> markers;
+    for (int i = 0; i < 10; i++) {
+        auto& m = markers.emplace_back(tombstone(
+                i % 2 ? device::State::Left : device::State::Kicked,
+                std::chrono::floor<std::chrono::seconds>(clock_now_s()) - (i + 1) * 1h));
+        group.emplace(m.id, m);
+    }
+
+    // One bucket's worth for each bucket of live devices: 4 with only this one in the group, 8 with
+    // a fifth device.  Departures count towards it, though only removals are in `kicked`.
+    auto check = [&](size_t cap) {
+        auto message = TestHelper::encrypt_device_data(c->devices, group);
+        auto carried = carried_ids(c->devices, message);
+        for (size_t i = 0; i < markers.size(); i++) {
+            CHECK(carried.contains(markers[i].id) == (i < cap));
+            if (markers[i].state == device::State::Kicked) {
+                TestHelper::set_device_id(*removed, markers[i].id);
+                CHECK(TestHelper::names_us_kicked(*removed, message) == (i < cap));
+            }
+        }
+        CHECK(kicked_slots(message) == 4);
+    };
+
+    SECTION("one device") {
+        check(4);
+    }
+    SECTION("five devices") {
+        for (int i = 0; i < 4; i++) {
+            auto k = c->devices.rotate_device_keys();
+            device::Info other{};
+            random::fill(other.id);
+            other.seqno = 1;
+            other.timestamp = clock_now_s();
+            other.state = device::State::Registered;
+            other.pk_x25519 = k.x25519_pub;
+            other.pk_mlkem768 = k.mlkem768_pub;
+            group.emplace(other.id, other);
+        }
+        check(8);
+    }
+}
+
+TEST_CASE(
+        "Devices - an old removal leaves the group's messages but not this device",
+        "[core][devices][removal]") {
+    TempCore c;
+    auto k = c->devices.rotate_device_keys();
+    auto [self, registered] = c->devices.device_info(await);
+    REQUIRE(registered);
+
+    auto removal = tombstone(device::State::Kicked, clock_now_s());
+    TestHelper::receive_device_group_message(
+            c->devices,
+            TestHelper::encrypt_device_data(c->devices, {{self.id, self}, {removal.id, removal}}));
+    REQUIRE(carried_ids(c->devices, c->devices.build_device_group_message().message)
+                    .contains(removal.id));
+
+    ScopedClockOffset later{Devices::REMOVAL_MARKER_MAX_AGE + 1h};
+    auto message = c->devices.build_device_group_message().message;
+    CHECK_FALSE(carried_ids(c->devices, message).contains(removal.id));
+    CHECK(kicked_slots(message) == 0);
+
+    // Still held here, and still what stops the device coming back.
+    auto held = c->devices.devices(true, true, true, removal.id);
+    REQUIRE(held.size() == 1);
+    CHECK(held.begin()->second.state == device::State::Kicked);
+
+    auto returning = removal;
+    returning.state = device::State::Registered;
+    returning.kicked.reset();
+    returning.seqno = 5;
+    returning.timestamp = clock_now_s();
+    returning.pk_x25519 = k.x25519_pub;
+    returning.pk_mlkem768 = k.mlkem768_pub;
+    TestHelper::receive_device_group_message(
+            c->devices,
+            TestHelper::encrypt_device_data(
+                    c->devices, {{self.id, self}, {returning.id, returning}}));
+    CHECK(c->devices.devices(true, true, true, removal.id).begin()->second.state ==
+          device::State::Kicked);
+
+    // Restated as of now, so that the group's messages carry it again.
+    CHECK(carried_ids(c->devices, c->devices.build_device_group_message().message)
+                  .contains(removal.id));
 }
 
 TEST_CASE("Devices - a device that left is not told it was removed", "[core][devices][removal]") {
