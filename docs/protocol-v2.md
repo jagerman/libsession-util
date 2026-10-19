@@ -216,7 +216,8 @@ drops its oldest.  This prunes only what a message carries, never what a device 
 left out of messages still decides every merge on a device that has it.
 
 A device offline for longer than that, or across more removals than the cap, is not told by a
-tombstone, and has only the fact that it can no longer read its group's messages to go by.
+tombstone, and has only the fact that it can no longer read its group's messages to go by (see
+"Displaced devices").
 
 ### Device data encryption
 
@@ -392,9 +393,11 @@ entry is:
 
 where `seed` is the account root seed and `A` is the message's ephemeral X25519 pubkey.
 
-A removed device computes this value for its own device ID to detect its removal.  Devices still in
-the group take removals from the tombstones in the payload and have no use for this field.  Without
-the root seed the entries are indistinguishable from random.
+A removed device computes this value for its own device ID to detect its removal, and a device that
+cannot read a message from its group computes it for the removals it knows of, to tell whether it
+was displaced instead (see "Displaced devices").  Devices still in the group take removals from the
+tombstones in the payload and have no use for this field.  Without the root seed the entries are
+indistinguishable from random.
 
 The list is built from the removals among the tombstones the payload carries, and so is bounded by
 the same cap (see "Which removals a message carries") -- never from departures, since a device that
@@ -424,26 +427,52 @@ can read nothing after that.  If the real device rotates first, the copy is shut
 point; if the copy does, the real device must notice and say so.
 
 It can: while it is in the group, every message from the group is encrypted to it, so one carrying
-its group's identifier that it cannot decrypt, and that does not name it in `kicked`, means the
-group has moved on without it.  Such a message counts only if its `time` is more than 5 minutes past
-that of the newest message from the group the device *could* read.  The signed `time`, not the
-swarm's timestamp: otherwise a storage server could keep an old message the device was never able to
-read -- from before it joined, say -- and replay it under a later date to raise a false alert, or
-re-date a readable one far ahead to hide a real displacement.  Just after a device joins,
-a member may push a snapshot it built before fetching the admission, which leaves the new device
-out for no reason but timing, and the margin also absorbs the difference between the two devices'
-clocks.  It costs nothing in detection: every later message is unreadable too, and account key
-rotation guarantees one.
+its group's identifier that it cannot decrypt means the group has moved on without it.  The
+message's `kicked` list says why, as far as it can.  The device computes the entry for its own ID,
+and for every removed device it holds a tombstone for -- of any age, since it keeps them all --
+under the message's `A`:
+
+- Its own entry is there: it was **removed** (see "Announcing removals").
+- Its own is not, but the entry of a removal it already knew of is: it was **displaced**.  A message
+  carries its group's most recent removals, so one still carrying a removal from before the device
+  lost the group carries every removal made since, and the device's own would be among them.
+- There is no `kicked` list at all, and the device last read the group less than 6 months before
+  the message was written: also **displaced**.  The group has removed nobody in that time, so not
+  this device.
+- Otherwise -- a list of nothing it knows, or none after longer away than removals are carried --
+  it cannot tell whether it was removed, replaced, or only away too long, and is **dropped** (see
+  "Forks").
+
+How many removals since the device last read its group lose it the distinction is set by the cap
+on what a message carries (see "Which removals a message carries").  A group of N live devices
+carries its 4⌈N/4⌉ most recent removals and departures, so once that many have been made since the
+newest removal the device knows of, that removal is no longer carried, and with it goes the proof
+that the device's own would have been.
+
+A displacement or a drop counts only if the message's `time` is more than 5 minutes past that of the
+newest message from the group the device *could* read.  The signed `time`, not the swarm's
+timestamp: otherwise a storage server could keep an old message the device was never able to read
+-- from before it joined, say -- and replay it under a later date to raise a false alert, or re-date
+a readable one far ahead to hide a real displacement.  Just after a device joins, a member may push
+a snapshot it built before fetching the admission, which leaves the new device out for no reason
+but timing, and the margin also absorbs the difference between the two devices' clocks.  It costs
+nothing in detection: every later message is unreadable too, and account key rotation guarantees
+one.  A removal needs no margin: nothing written before the device joined names its ID, which is new
+to every group it joins (see "Removed devices").
 
 A displaced device alerts its user, as a possible attack, and stops acting for the group: it pushes
 nothing, admits and removes nobody, and pushes no departure if it leaves the group, since a
 departure under its ID would now apply to the device holding it.  It can come back only under a new
-device ID, which it takes, as a removed device does, as part of asking to join again.  Reading a
-message from the group again, as new as the one that displaced it, undoes this.
+device ID, which it takes, as a removed device does, as part of asking to join again.  A dropped
+device stops acting for the group in the same way, since it may have been displaced, and comes back
+the same way, but tells its user only that it is no longer in the group.  Reading a message from
+the group again, as new as the one that displaced or dropped it, undoes either.
 
-A holder of the account seed can forge a message carrying the group's identifier, and so cause this
-alert, as it can forge a `kicked` entry to cause a removal alert.  Neither gives it anything: the
-device stops acting for its group, rather than starting to trust anything new.
+A holder of the account seed can forge a message carrying the group's identifier, with whatever
+`kicked` list it likes.  With entries it makes up it can take the device no further than dropped; to
+have it displaced it must know the ID of a device removed before, and to have it removed, the
+device's own.  None of it gives the forger anything: the device stops acting for its group, rather
+than starting to trust anything new.
 
 ### Group identifier
 
@@ -754,7 +783,9 @@ away too long, or its group was dissolved and the tombstone saying so expired be
 Whichever it was, the account's group is now the other.  A dropped device pushes nothing, which
 would bring its group back beside that one, and decides nothing about the other group: it never
 dissolves anything new.  It comes back as a new device, under a new ID, by asking to join, or by
-starting a group -- which, like any start with groups in view, dissolves them.
+starting a group -- which, like any start with groups in view, dissolves them.  A device is dropped
+too by a message from its group that it cannot read and that cannot tell it why (see "Displaced
+devices").
 
 A device outside any group that sees more than one may join any of them, the most recently active
 being the natural choice; the rest are dissolved once the join completes.
@@ -827,17 +858,18 @@ group.  A device in a group cannot ask to join another: an account has only one 
 no moving from one to another.  It leaves its group first, and then asks as any device outside a
 group does.
 
-Leaving a group, for whatever reason -- leaving it as above, being removed or displaced from it and
-then asking to join or starting a group, having it dissolved -- always means a new device ID, with
-new device keys.  A record of the device in a group it left can then never meet one under its new
-ID, in that group or any other, so its next record starts again at `seq` 1 with nothing held for it,
-and coming back to the group it left is asking to join as a new device: the old ID is spent there,
-as a departed one.
+Leaving a group, for whatever reason -- leaving it as above, being removed, displaced or dropped
+from it and then asking to join or starting a group, having it dissolved -- always means a new
+device ID, with new device keys.  A record of the device in a group it left can then never meet one
+under its new ID, in that group or any other, so its next record starts again at `seq` 1 with
+nothing held for it, and coming back to the group it left is asking to join as a new device: the old
+ID is spent there, as a departed one.
 
 Only a member in good standing tells its group that it is leaving.  A removed device's departure
-could not lower its removal, and a displaced device's would be taken as the departure of whichever
-device now holds its ID; a device removed, displaced or dissolved only forgets its group.  A member
-in good standing leaving its group:
+could not lower its removal, a displaced device's would be taken as the departure of whichever
+device now holds its ID, and a dropped device's would bring back a group gone from the swarm, or
+come from a device that may have been displaced; a device removed, displaced, dropped or dissolved
+only forgets its group.  A member in good standing leaving its group:
 
 - If it was the group's only member, deletes the group's messages from the swarm.  No device is left
   to read them, and other devices would otherwise go on seeing a group that nobody is in.

@@ -622,7 +622,9 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 
     // Whether a group message's `kicked` list names `core`'s device.
     static bool names_us_kicked(core::Core& core, std::span<const std::byte> message) {
-        return on_loop(core, [&] { return core.devices._names_us_kicked(message); });
+        return on_loop(core, [&] {
+            return core.devices._unreadable_verdict(message) == core::device::Membership::Removed;
+        });
     }
 
     // A link request as `request_link` builds it, asking to join `member`'s group, without the

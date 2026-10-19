@@ -3460,6 +3460,108 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a message from our group we cannot read says what became of us by its removals",
+        "[core][devices][membership][removal]") {
+    Linking l;
+    l.admit();
+    auto now = std::chrono::floor<std::chrono::seconds>(clock_now_s());
+
+    // A removal the applicant knows of, from a message it could read.
+    auto known = tombstone(device::State::Kicked, now - 1h);
+    auto group = l.core->devices.devices(true, true, true);
+    group.emplace(known.id, known);
+    TestHelper::deliver_device_message(
+            *l.applicant, TestHelper::encrypt_device_data(l.core->devices, group), in(10min), "G1");
+    REQUIRE(l.applicant->devices.devices(false, false, true).contains(known.id));
+
+    // The group gone on without the applicant, carrying `removed` -- as any holder of the seed
+    // could write it.
+    auto core_self = l.core->devices.device_info(await).first;
+    auto without = [&](std::vector<device::Info> removed) {
+        device::map m{{core_self.id, core_self}};
+        for (auto& r : removed)
+            m.emplace(r.id, r);
+        return TestHelper::encrypt_device_data(l.core->devices, m);
+    };
+    auto membership = [&] { return l.applicant->devices.membership(await).membership; };
+
+    SECTION("naming it: removed, however soon after what it last read") {
+        auto ours = tombstone(device::State::Kicked, now);
+        ours.id = l.applicant_id();
+        TestHelper::deliver_device_message(*l.applicant, without({known, ours}), in(10min), "G2");
+        CHECK(membership() == device::Membership::Removed);
+    }
+
+    SECTION("with a removal it knew of and not its own: displaced") {
+        ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+        TestHelper::deliver_device_message(*l.applicant, without({known}), in(10min), "G2");
+        CHECK(membership() == device::Membership::Displaced);
+    }
+
+    SECTION("with no removal at all") {
+        SECTION("having read the group lately: displaced") {
+            ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+            TestHelper::deliver_device_message(*l.applicant, without({}), in(10min), "G2");
+            CHECK(membership() == device::Membership::Displaced);
+        }
+        SECTION("not for longer than removals are carried: dropped") {
+            ScopedClockOffset later{Devices::REMOVAL_MARKER_MAX_AGE + 1h};
+            TestHelper::deliver_device_message(*l.applicant, without({}), in(10min), "G2");
+            CHECK(membership() == device::Membership::Dropped);
+        }
+    }
+
+    SECTION("with only removals it never heard of: dropped, which acts on nothing") {
+        // Within the grace, a snapshot that may have yet to hear of it, and so nothing.
+        auto unknown = tombstone(device::State::Kicked, now);
+        TestHelper::deliver_device_message(*l.applicant, without({unknown}), in(10min), "G2");
+        REQUIRE(membership() == device::Membership::InGroup);
+
+        // A forger cannot make more of it than that: nothing pushed, nobody admitted or removed.
+        ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+        TestHelper::deliver_device_message(*l.applicant, without({unknown}), in(10min), "G3");
+        CHECK(membership() == device::Membership::Dropped);
+        CHECK(l.applicant_events.membership.back() == device::Membership::Dropped);
+        CHECK_FALSE(l.applicant->devices.needs_push().device_group);
+        CHECK_FALSE(l.applicant->devices.remove_device(Linking::id_of(l.core), await));
+
+        // A later one telling more says so.
+        later.advance(1min);
+        TestHelper::deliver_device_message(*l.applicant, without({known}), in(10min), "G4");
+        CHECK(membership() == device::Membership::Displaced);
+
+        // And reading the group again, at or past both, puts it back.
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G5");
+        CHECK(membership() == device::Membership::InGroup);
+    }
+}
+
+TEST_CASE("Devices - a removal announced by another group is ignored", "[core][devices][removal]") {
+    Linking l;
+    l.admit();
+
+    // Another group on the account, whose message names the applicant's id as removed.
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_group(*other);
+    auto other_self = other->devices.device_info(await).first;
+    auto ours = tombstone(
+            device::State::Kicked, std::chrono::floor<std::chrono::seconds>(clock_now_s()));
+    ours.id = l.applicant_id();
+    auto message = TestHelper::encrypt_device_data(
+            other->devices, {{other_self.id, other_self}, {ours.id, ours}});
+    REQUIRE(TestHelper::names_us_kicked(*l.applicant, message));
+
+    ScopedClockOffset later{Devices::DISPLACEMENT_GRACE + 1min};
+    TestHelper::deliver_device_message(*l.applicant, message, in(10min), "B1");
+    CHECK(l.applicant->devices.device_info(await).first.state == device::State::Registered);
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Forked);
+}
+
+TEST_CASE(
         "Devices - an old removal leaves the group's messages but not this device",
         "[core][devices][removal]") {
     TempCore c;

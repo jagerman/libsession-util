@@ -88,10 +88,12 @@ static device::GroupId new_group_id() {
     return id;
 }
 
-// The signed time of the newest message from our group that we could read, and of the one we could
-// not that displaced us from it, in unix milliseconds.
+// The signed time of the newest message from our group that we could read, of the one we could not
+// that displaced us from it, and of the newest we could not that left us unable to tell why, in
+// unix milliseconds.
 static constexpr auto read_at_key = "devices_group_read_at"sv;
 static constexpr auto displaced_key = "devices_group_displaced_at"sv;
+static constexpr auto dropped_key = "devices_group_dropped_at"sv;
 
 // Set when a tombstone named the group this device was in, until it joins or starts another.
 static constexpr auto dissolved_key = "devices_group_dissolved"sv;
@@ -1425,10 +1427,22 @@ void Devices::receive_device_group_message(
         auto raw = decrypt_device_data(std::as_bytes(data));
         payload = decode_group_payload(raw);
     } catch (const device::decryption_failed& e) {
-        if (_names_us_kicked(data)) {
+        // Only our own group's messages say anything of us.  Another group's lists removals from
+        // that group, which a device that once was in it would otherwise take as its own.
+        if (_group_of(data) != _group_id()) {
+            log::warning(cat, "Ignoring incoming device group message: {}", e.what());
+            return;
+        }
+
+        auto verdict = _unreadable_verdict(data);
+        if (verdict == device::Membership::Removed) {
             // When we learned of it, which is the nearest we can say: the removal time is in the
             // payload we can no longer read.  Only from a live state, so that every later message
             // still naming us leaves it where it is.
+            //
+            // Not held to the timing below: nothing written before our admission names our id,
+            // which is new to every group we join, while a removal made just after a message we
+            // read would otherwise go unnoticed until the group next pushed.
             if (conn().prepared_maybe_get<int64_t>(
                         "UPDATE devices SET state = ?, kicked_timestamp = ?"
                         " WHERE unique_id = ? AND state < ? RETURNING id",
@@ -1443,13 +1457,20 @@ void Devices::receive_device_group_message(
         }
 
         // Every message from our group is encrypted to us while we are in it, so a newer one we
-        // cannot read means another device holds our place.  Older ones say nothing: they are from
-        // before we joined, or snapshots overtaken since -- see DISPLACEMENT_GRACE.
+        // cannot read means the group has moved on without us.  Older ones say nothing: they are
+        // from before we joined, or snapshots overtaken since -- see DISPLACEMENT_GRACE.
         auto read_at = core.globals.get_integer(read_at_key);
-        if (_group_of(data) == _group_id() && read_at &&
-            t > from_epoch_ms(*read_at) + DISPLACEMENT_GRACE && _member()) {
-            core.globals.set(displaced_key, epoch_ms(t));
-            log::warning(cat, "Another device has taken this device's place in its device group");
+        if (read_at && t > from_epoch_ms(*read_at) + DISPLACEMENT_GRACE && _registered()) {
+            if (verdict == device::Membership::Displaced) {
+                core.globals.set(displaced_key, epoch_ms(t));
+                log::warning(
+                        cat, "Another device has taken this device's place in its device group");
+            } else {
+                if (auto dropped = core.globals.get_integer(dropped_key);
+                    !dropped || epoch_ms(t) > *dropped)
+                    core.globals.set(dropped_key, epoch_ms(t));
+                log::warning(cat, "This device can no longer read its device group");
+            }
             return;
         }
         log::warning(cat, "Ignoring incoming device group message: {}", e.what());
@@ -1654,7 +1675,8 @@ bool Devices::_leave_group() {
 
     // Only a member in good standing speaks for the group.  A removed device's departure could not
     // lower its removal, and a displaced one's would be taken as the departure of whichever device
-    // now holds its id there.
+    // now holds its id there.  A dropped one's would bring back a group gone from the swarm beside
+    // another, or come from a device that may itself have been displaced.
     bool member = _member();
     auto devs = member ? devices(true, true, true) : device::map{};
 
@@ -1741,7 +1763,7 @@ bool Devices::_record_group(const SwarmMessage& msg) {
     // since that decides nothing.  A device outside one takes it as it would any other group.
     if (auto dissolved = _dissolved_at(group)) {
         bool back = t > *dissolved;
-        if (_member()) {
+        if (_registered()) {
             std::vector<std::string> hashes;
             if (!msg.hash.empty())
                 hashes.push_back(msg.hash);
@@ -1998,22 +2020,45 @@ void Devices::receive_dissolution(std::span<const std::byte> data) {
     }
 }
 
-bool Devices::_names_us_kicked(std::span<const std::byte> data) {
+device::Membership Devices::_unreadable_verdict(std::span<const std::byte> data) {
     oxenc::bt_dict_consumer in{data};
     in.require<std::string_view>("");
     auto A = in.require_span<std::byte, 32>("A");
-    if (!in.skip_until("k"))
-        return false;
-    auto kicked = in.consume_span<std::byte>();
+    std::span<const std::byte> kicked;
+    if (in.skip_until("k"))
+        kicked = in.consume_span<std::byte>();
+    auto t = from_epoch_ms(in.require<int64_t>("t"));
+
+    // No removal carried at all: had ours happened since we last read the group, it would be, being
+    // the only one and recent enough not to have been pruned.
+    if (kicked.empty()) {
+        auto read_at = core.globals.get_integer(read_at_key);
+        return read_at && from_epoch_ms(*read_at) > t - REMOVAL_MARKER_MAX_AGE
+                     ? device::Membership::Displaced
+                     : device::Membership::Dropped;
+    }
     if (kicked.size() % 16 != 0)
-        return false;
+        return device::Membership::Dropped;
 
     auto seed = core.globals.account_seed();
-    auto ours = kicked_entry(A, seed.seed(), self_id);
-    for (size_t i = 0; i < kicked.size(); i += 16)
-        if (std::ranges::equal(kicked.subspan(i, 16), ours))
-            return true;
-    return false;
+    auto names = [&](std::span<const std::byte, device::ID_SIZE> id) {
+        auto entry = kicked_entry(A, seed.seed(), id);
+        for (size_t i = 0; i < kicked.size(); i += 16)
+            if (std::ranges::equal(kicked.subspan(i, 16), entry))
+                return true;
+        return false;
+    };
+    if (names(self_id))
+        return device::Membership::Removed;
+
+    // A message carries its group's most recent removals, so one carrying a removal we already knew
+    // of, from before we lost the group, carries every removal since -- ours, had it happened.
+    for (auto id : conn().prepared_results<sqlite::blob_guts<device::Id>>(
+                 "SELECT unique_id FROM devices WHERE state = ?",
+                 static_cast<int>(device::State::Kicked)))
+        if (names(id))
+            return device::Membership::Displaced;
+    return device::Membership::Dropped;
 }
 
 void Devices::request_link(device::GroupId group, result_function<OutgoingLinkRequest> cb) {
@@ -2873,16 +2918,12 @@ device::MembershipState Devices::_membership() {
     auto ours = _group_id();
     auto c = conn();
 
-    bool ours_present = false;
     for (auto [group, seen] :
          c.prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>, int64_t>(
                  "SELECT group_id, seen_at FROM device_groups"
                  " WHERE expires_at > ? ORDER BY seen_at DESC",
                  epoch_seconds(clock_now_s()))) {
-        device::GroupId id{group};
-        if (id == ours)
-            ours_present = true;
-        else
+        if (device::GroupId id{group}; id != ours)
             out.others.push_back({id, from_epoch_s(seen)});
     }
 
@@ -2902,10 +2943,10 @@ device::MembershipState Devices::_membership() {
             // something else: whatever became of our group, the account's group is now the other.
             // None of ours left, with no other group, is a group whose messages have yet to reach
             // the swarm, or expired while every device was away, and our next push restores them.
-            out.membership = _displaced()                         ? device::Membership::Displaced
-                           : !out.others.empty() && !ours_present ? device::Membership::Dropped
-                           : !out.others.empty()                  ? device::Membership::Forked
-                                                                  : device::Membership::InGroup;
+            out.membership = _displaced()        ? device::Membership::Displaced
+                           : _dropped()          ? device::Membership::Dropped
+                           : !out.others.empty() ? device::Membership::Forked
+                                                 : device::Membership::InGroup;
             break;
         case device::State::Pending: out.membership = device::Membership::Waiting; break;
         default: {
@@ -2938,6 +2979,7 @@ void Devices::_forget_group() {
     core.globals.erase(group_id_key);
     core.globals.erase(read_at_key);
     core.globals.erase(displaced_key);
+    core.globals.erase(dropped_key);
     core.globals.erase(dissolved_key);
 }
 
@@ -2946,6 +2988,10 @@ bool Devices::_displaced() {
 }
 
 bool Devices::_member() {
+    return _registered() && !_dropped();
+}
+
+bool Devices::_registered() {
     return !_displaced() && conn().prepared_maybe_get<int>(
                                     "SELECT 1 FROM devices WHERE unique_id = ? AND state = ?",
                                     self_id,
@@ -2957,12 +3003,13 @@ void Devices::_note_read(sys_ms t) {
     if (auto read_at = core.globals.get_integer(read_at_key); !read_at || ms > *read_at)
         core.globals.set(read_at_key, ms);
 
-    // Read again at or past what displaced us, which only a member could: the group took us back,
-    // or what looked like displacement was a snapshot that had yet to hear of us after all.
-    if (auto displaced = core.globals.get_integer(displaced_key); displaced && ms >= *displaced) {
-        core.globals.erase(displaced_key);
-        log::info(cat, "This device can read its device group again");
-    }
+    // Read again at or past what displaced or dropped us, which only a member could: the group took
+    // us back, or what looked like it had moved on was a snapshot that had yet to hear of us.
+    for (auto key : {displaced_key, dropped_key})
+        if (auto at = core.globals.get_integer(key); at && ms >= *at) {
+            core.globals.erase(key);
+            log::info(cat, "This device can read its device group again");
+        }
 }
 
 bool Devices::_cast_out() {
@@ -3086,6 +3133,8 @@ bool Devices::_dropped() {
     auto ours = _group_id();
     if (!ours)
         return false;
+    if (core.globals.get_integer(dropped_key))
+        return true;
     auto c = conn();
     auto id = std::span<const std::byte>{ours->value};
     auto now = epoch_seconds(clock_now_s());

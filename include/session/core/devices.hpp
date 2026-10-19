@@ -281,11 +281,11 @@ namespace device {
         Removed,  ///< Removed from its group by another device.  It can come back only under a new
                   ///< device id, which `request_link` and `start_group` take for it.
         Displaced,  ///< Its group has moved on without it: a newer message from the group is one
-                    ///< it cannot read, though nothing removed it.  Another device holds its place
-                    ///< under its id -- a restored copy of it, admitted as a replacement, or
-                    ///< someone holding a copy of its data who has rotated it out, which is an
-                    ///< attack.  Never dismissable.  It can come back only under a new device id,
-                    ///< which `request_link` and `start_group` take for it.
+                    ///< it cannot read, whose removals show that nothing removed it.  Another
+                    ///< device holds its place under its id -- a restored copy of it, admitted as
+                    ///< a replacement, or someone holding a copy of its data who has rotated it
+                    ///< out, which is an attack.  Never dismissable.  It can come back only under
+                    ///< a new device id, which `request_link` and `start_group` take for it.
         Dissolved,  ///< Its group was dissolved: the user of another of the account's devices kept
                     ///< another group over it.  What it held of the group is forgotten and it has
                     ///< a new device id; it rejoins by asking to join the group that was kept, as
@@ -298,10 +298,11 @@ namespace device {
                     ///< keep it, dissolving the others (`Devices::dissolve_group`), or to leave it
                     ///< for another (`Devices::leave_group`, then `Devices::request_link`).
         Dropped,    ///< No longer in a device group: its group is gone from the swarm while
-                    ///< another group is there.  It was removed, replaced, or away too long, and
-                    ///< cannot tell which -- it may itself have been dissolved.  It pushes
-                    ///< nothing, and dissolves nothing new; it can come back only under a new
-                    ///< device id, which `request_link` and `start_group` take for it.
+                    ///< another group is there, or has moved on to keys it does not hold without
+                    ///< showing why.  It was removed, replaced, or away too long, and cannot tell
+                    ///< which -- it may itself have been dissolved.  It pushes nothing, acts for
+                    ///< the group in nothing, and dissolves nothing new; it can come back only
+                    ///< under a new device id, which `request_link` and `start_group` take for it.
     };
 
     /// A device group in the swarm other than this device's own.
@@ -472,8 +473,11 @@ class Devices final : detail::CoreComponent {
     // Recorded only on a message we could decrypt -- see `device_group_merged`.
     void receive_device_group_message(std::span<const std::byte> data, const std::string& hash);
 
-    // In the group and able to act for it: registered, and not displaced from it.
+    // In the group and able to act for it: registered, neither displaced from it nor dropped.
     bool _member();
+    // Registered in a group and not displaced from it, though perhaps dropped: placed to tell what
+    // it has seen -- a dissolution, or how it lost its group -- but not to act for the group.
+    bool _registered();
     bool _displaced();
 
     // A message from our own group, signed at `t`, was one we could read.
@@ -713,8 +717,8 @@ class Devices final : detail::CoreComponent {
     // that forgets the group, and kept until the swarm confirms it: attempted at once, and again
     // after every fetch while the application runs, across restarts too.  Not reported on.  An
     // application clearing its data wipes the database with it, and so gets whatever the first
-    // attempt achieved.  A device removed, displaced or dissolved has nothing it may say to its
-    // group, and only forgets it.
+    // attempt achieved.  A device removed, displaced, dropped or dissolved has nothing it may say
+    // to its group, and only forgets it.
     //
     // Leaving, the device takes a new device id and new device keys: the group it left holds the
     // old id as departed, and the new one can ask to join any group, that one included, as a new
@@ -748,16 +752,18 @@ class Devices final : detail::CoreComponent {
 
     bool _dissolve_group(const device::GroupId& group);
 
-    // Whether our group's messages are gone from the swarm while another group's are there: what
-    // makes a member Membership::Dropped.
+    // What makes a member Membership::Dropped: our group's messages gone from the swarm while
+    // another group's are there, or one of them we cannot read that says too little to tell why.
     bool _dropped();
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
     void _rebaseline_membership();
 
-    // Whether an unreadable group message names this device in its `kicked` list, which is the only
-    // way a removed device learns of it: it is no longer given a key to the payload.
-    bool _names_us_kicked(std::span<const std::byte> data);
+    // What a message from our own group that we cannot read says of us, by its `kicked` list (see
+    // "Displaced devices"): Removed if it names us, Displaced if it shows we were not removed, and
+    // Dropped if it cannot tell.  The only way a removed device learns of it: it is no longer given
+    // a key to the payload.
+    device::Membership _unreadable_verdict(std::span<const std::byte> data);
 
     struct LinkRequestResult {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
@@ -937,11 +943,11 @@ class Devices final : detail::CoreComponent {
     static constexpr auto LINK_REQUEST_TTL = 10min;
 
     // How much newer than the newest message from our group we could read one we cannot read must
-    // be before it says we were displaced.  Just after we join, a member can push a snapshot it
-    // built before fetching our admission, which leaves us out for no reason but timing; this
-    // covers that, and the difference between the clocks of the two devices whose timestamps are
-    // compared.  A real displacement is not missed for it: every later message is unreadable too,
-    // and the account key's rotation guarantees one.
+    // be before it says we were displaced or dropped.  Just after we join, a member can push a
+    // snapshot it built before fetching our admission, which leaves us out for no reason but
+    // timing; this covers that, and the difference between the clocks of the two devices whose
+    // timestamps are compared.  A real displacement is not missed for it: every later message is
+    // unreadable too, and the account key's rotation guarantees one.
     static constexpr auto DISPLACEMENT_GRACE = 5min;
 
     // How far ahead of our clock a group message's signed time may be before we ignore the

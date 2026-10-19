@@ -84,7 +84,7 @@ its newest message was written, by the clock of the device that wrote it).
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `GroupsVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
 | `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
-| `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
+| `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there, or has moved on to keys it doesn't hold without saying why. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `GroupsVisible`. |
 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
@@ -248,12 +248,14 @@ a device that started a group of its own by mistake months ago ("two months ago"
   different group, and this device's group is gone. Nothing is needed before joining again: the
   device already has a new identity, and its messages and the account's configs are kept. Offer to
   link it to the group that was kept, an ordinary join with the emoji confirmation.
-- **Dropped** (`membership_changed(Dropped)`). This device's group has gone from the swarm while
-  another group is there, and the device cannot tell why: it may have been removed or replaced
-  while away, been away too long, or had its group dissolved. It stops pushing by itself. Tell the
-  user it is no longer in the account's device group, and offer to link it again (`request_link`,
-  which gives it a new identity first); starting a group instead is possible but dissolves the
-  group in view, so offer it less prominently and with the warning from "Starting a group".
+- **Dropped** (`membership_changed(Dropped)`). Either this device's group has gone from the swarm
+  while another group is there, or the group has moved on to keys this device doesn't hold without
+  saying why. Either way the device cannot tell what happened: it may have been removed or
+  replaced while away, been away too long, or had its group dissolved. It stops acting for the
+  group by itself. Tell the user it is no longer in the account's device group, and offer to link
+  it again (`request_link`, which gives it a new identity first); starting a group instead is
+  possible but dissolves any group in view, so offer it less prominently and with the warning from
+  "Starting a group".
 
 ## Starting a group
 
@@ -285,10 +287,10 @@ its user's.
   the network is still up, and give it a moment before wiping if you can.
 - **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join.
 
-A device that was removed, displaced or dissolved just forgets the group; it has nothing it may tell
-it. Leaving gives the device a new identity, as joining the group again would need anyway: it can
-ask to join any group afterwards, the one it left included. `leave_group` answers false if there is
-no group to leave. A device cannot ask to join a group while it is in one
+A device that was removed, displaced, dropped or dissolved just forgets the group; it has nothing it
+may tell it. Leaving gives the device a new identity, as joining the group again would need anyway:
+it can ask to join any group afterwards, the one it left included. `leave_group` answers false if
+there is no group to leave. A device cannot ask to join a group while it is in one
 (`err::already_registered`): leaving comes first.
 
 ## Do not
