@@ -1507,6 +1507,18 @@ void Devices::receive_device_group_message(
             return;
         }
         if (!confirmed) {
+            // The first stands: the user may already be comparing emoji against it, and a seed
+            // holder could otherwise swap in an admission of its own beneath their confirmation.
+            if (accepted->held) {
+                if (conn().prepared_get<std::string>(
+                            "SELECT admission_hash FROM device_own_requests WHERE id = ?",
+                            accepted->row) != hash)
+                    log::warning(
+                            cat,
+                            "Ignoring a second admission on a request already approved; keeping "
+                            "the first");
+                return;
+            }
             conn().prepared_exec(
                     "UPDATE device_own_requests SET admission = ?, admission_hash = ? WHERE id = ?",
                     data,
@@ -1541,20 +1553,27 @@ void Devices::receive_device_group_message(
     // from multiple devices converge deterministically.  For seeds we already have, we reconcile
     // the `rotated` column: if both sides have rotated at different times, take the minimum; if
     // only one side has rotated, adopt that rotation.
+    std::vector<int64_t> carried_keys;
     for (const auto& k : payload.account_keys) {
         auto keys = keys_from_seed<AccountKeys>(k.seed);
-        c.prepared_exec(
+        carried_keys.push_back(c.prepared_get<int64_t>(
                 "INSERT INTO device_account_keys"
                 " (created, rotated, seed, pubkey_mlkem768, pubkey_x25519)"
                 " VALUES (?, ?, ?, ?, ?)"
                 " ON CONFLICT (seed) DO UPDATE SET"
-                "   rotated = COALESCE(MIN(excluded.rotated, rotated), excluded.rotated, rotated)",
+                "   rotated = COALESCE(MIN(excluded.rotated, rotated), excluded.rotated, rotated)"
+                " RETURNING id",
                 k.created,
                 k.rotated,
                 k.seed,
                 keys.mlkem768_pub,
-                keys.x25519_pub);
+                keys.x25519_pub));
     }
+    std::vector<device::Id> recipients;
+    for (const auto& [id, info] : payload.devices)
+        if (info.state == device::State::Registered)
+            recipients.push_back(id);
+    _record_key_delivery(carried_keys, recipients);
 
     bool departed = false;
     std::vector<device::Id> members;
@@ -1878,6 +1897,39 @@ void Devices::_dissolve_all_but(const device::GroupId& kept) {
         others.push_back(device::GroupId{group});
     if (!others.empty())
         _dissolve(others);
+}
+
+void Devices::_record_key_delivery(
+        std::span<const int64_t> keys, std::span<const device::Id> devices) {
+    auto c = conn();
+    for (auto key : keys)
+        for (const auto& device : devices)
+            c.prepared_exec(
+                    "INSERT INTO device_account_key_recipients (key, device)"
+                    " SELECT id, ? FROM device_account_keys WHERE id = ?"
+                    " ON CONFLICT DO NOTHING",
+                    device,
+                    key);
+}
+
+std::vector<device::Id> Devices::_key_recipients(int64_t key) {
+    std::vector<device::Id> out;
+    for (auto id : conn().prepared_results<sqlite::blob_guts<device::Id>>(
+                 "SELECT device FROM device_account_key_recipients WHERE key = ?", key))
+        out.push_back(id);
+    return out;
+}
+
+bool Devices::_key_held_outside(int64_t key) {
+    return conn()
+            .prepared_maybe_get<int>(
+                    "SELECT 1 FROM device_account_key_recipients r"
+                    " JOIN devices d ON d.unique_id = r.device"
+                    " WHERE r.key = ? AND d.state IN (?, ?)",
+                    key,
+                    static_cast<int>(device::State::Kicked),
+                    static_cast<int>(device::State::Left))
+            .has_value();
 }
 
 void Devices::_queue_push(
@@ -2526,8 +2578,8 @@ std::optional<std::vector<std::byte>> Devices::_decrypt_link_request(
 
     // Any key we still hold, not only the current one: the group may have rotated since the
     // request's sender read its link key.
-    for (auto account_seed : conn().prepared_results<sqlite::blobn<32>>(
-                 "SELECT seed FROM device_account_keys WHERE substr(pubkey_x25519, 1, 2) = ?",
+    for (auto [id, account_seed] : conn().prepared_results<int64_t, sqlite::blobn<32>>(
+                 "SELECT id, seed FROM device_account_keys WHERE substr(pubkey_x25519, 1, 2) = ?",
                  std::span<const std::byte>{prefix})) {
         auto keys = keys_from_seed<AccountKeys>(account_seed);
         cleared_b32 shared_x;
@@ -2535,8 +2587,18 @@ std::optional<std::vector<std::byte>> Devices::_decrypt_link_request(
             continue;
         auto [key, nonce] = link_request_key(shared_x, E, keys.x25519_pub);
         std::vector<std::byte> plaintext(encrypted.size() - encryption::XCHACHA20_ABYTES);
-        if (encryption::xchacha20poly1305_decrypt(plaintext, encrypted, nonce, key))
-            return plaintext;
+        if (!encryption::xchacha20poly1305_decrypt(plaintext, encrypted, nonce, key))
+            continue;
+
+        // Except one a device no longer in the group also holds.  Such a device can publish that
+        // key as the group's link key, read the request encrypted to it, and admit the device
+        // asking into a group of its own.  Prompting here would show the user matching emoji on a
+        // real device, which is all the asking device's confirmation checks.
+        if (_key_held_outside(id)) {
+            log::info(cat, "Ignoring a link request under a key a removed device holds");
+            return std::nullopt;
+        }
+        return plaintext;
     }
     return std::nullopt;
 }
@@ -3462,6 +3524,7 @@ void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string 
                 "UPDATE device_account_keys SET distributed = 1 WHERE id IN ({})"_format(
                         sqlite::placeholders(push.keys.size())),
                 sqlite::bind_each{push.keys});
+    _record_key_delivery(push.carried_keys, push.recipients);
 
     tx.commit();
 }
@@ -3575,9 +3638,15 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     for (auto id : c.prepared_results<sqlite::blob_guts<device::Id>>(
                  "SELECT unique_id FROM devices WHERE broadcast_needed"))
         push.broadcast.push_back(id);
-    for (auto id :
-         c.prepared_results<int64_t>("SELECT id FROM device_account_keys WHERE NOT distributed"))
-        push.keys.push_back(id);
+    for (auto [id, distributed] :
+         c.prepared_results<int64_t, int>("SELECT id, distributed FROM device_account_keys")) {
+        push.carried_keys.push_back(id);
+        if (!distributed)
+            push.keys.push_back(id);
+    }
+    for (const auto& [id, info] : devs)
+        if (info.state == device::State::Registered)
+            push.recipients.push_back(id);
     for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
         push.obsolete.push_back(std::move(hash));
 

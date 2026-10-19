@@ -616,6 +616,24 @@ ML-KEM steps, there being no ML-KEM key to encapsulate to, and so not X-Wing.  W
 A member decrypts with `xE` for the account key whose X25519 pubkey begins with `ki ⊕ kiss`,
 `kiss` being computed as `BLAKE2b_2(E || S, key=sE, ...)` from the account's long-term secret `s`.
 
+That may be any key the member still holds, current or retained, since the group may have rotated
+since the requesting device read its link key -- except a key that also reached a device no longer
+in the group.  A removed or departed device keeps every account key it was given, and any holder of
+the seed can publish a group message: one carrying the real group's identifier with such a key as
+its `link_x25519` has a joining device encrypt its request to a key that device can read, so that
+it can admit the joining device into a group of its own while the real group prompts for the same
+request -- showing the user the very emoji they then confirm.  A member refusing such requests
+leaves that device's admission the only one, with nothing on the user's devices to confirm it
+against (see "Confirmation on the requesting device").
+
+To tell those keys apart, a member records, for each account key, the devices it was delivered
+to: a payload is encrypted to exactly the live records it carries, so every payload carrying a
+key, whether the member merged it or pushed it, delivered the key to each of them.  That set is
+exactly the keys a removed device holds, the retained keys handed over on its admission included,
+and every other retained key is honoured, so an ordinary rotation never costs a request its
+prompt.  What it does cost is a request made under a key that reached a device removed in the
+meantime, which lapses unprompted and has to be made again.
+
 #### Handshake short authentication string
 
 This initial key also implies a human-readable short authentication string that allows a user to
@@ -732,7 +750,9 @@ keeps its requests for as long as an admission accepting one could still be in t
 - an admission matching none of them is ignored: the device asked for nothing that it answers;
 - one matching the device's newest request is held until the user confirms it -- even past that
   request's deadline, since the acceptance came in time and only the message carrying it arrived
-  late.  Once one is held, the request no longer lapses;
+  late.  Once one is held, the request no longer lapses, and any other admission on it is ignored:
+  the user may already be comparing emoji against the first, and a seed holder could otherwise
+  swap an admission of its own in beneath their confirmation;
 - one matching an older request is ignored.  The user has moved on to a newer request, whose SAS is
   what they are now looking at, and that one admits them instead.
 

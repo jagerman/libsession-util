@@ -443,6 +443,17 @@ class Devices final : detail::CoreComponent {
     // by completing a join to it.
     void _dissolve_all_but(const device::GroupId& kept);
 
+    // Records the account keys `keys` (device_account_keys ids) as delivered to `devices`, by a
+    // payload carrying them that was encrypted to them.  A key deleted since is skipped.
+    void _record_key_delivery(std::span<const int64_t> keys, std::span<const device::Id> devices);
+
+    // The devices account key `key` has been delivered to; see `device_account_key_recipients`.
+    std::vector<device::Id> _key_recipients(int64_t key);
+
+    // Whether account key `key` was delivered to a device that is no longer in the group, removed
+    // or departed, which can therefore still use it.
+    bool _key_held_outside(int64_t key);
+
     // Deletes `hashes` from the swarm, once and without reporting back; `what` names them in logs.
     void _delete_from_swarm(std::vector<std::string> hashes, std::string_view what);
 
@@ -999,6 +1010,11 @@ class Devices final : detail::CoreComponent {
         // therefore stays owed -- it would otherwise be marked clean by a message it never reached.
         std::vector<device::Id> broadcast;  // device ids whose transition it carries
         std::vector<int64_t> keys;          // device_account_keys rows it distributes
+
+        // Every account key it carries, and the devices it is encrypted to: what confirming it
+        // records as delivered (see `device_account_key_recipients`).
+        std::vector<int64_t> carried_keys;
+        std::vector<device::Id> recipients;
 
         // Messages this one makes redundant: everything we had merged when it was built, whoever
         // wrote it.  A "G" is a snapshot of the whole group rather than one device's contribution,

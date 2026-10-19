@@ -620,6 +620,16 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
+    // The devices `core` holds its account key with X25519 pubkey `pub` as delivered to.
+    static std::vector<core::device::Id> key_recipients(
+            core::Core& core, std::span<const std::byte, 32> pub) {
+        return on_loop(core, [&] {
+            auto key = core.devices.conn().prepared_get<int64_t>(
+                    "SELECT id FROM device_account_keys WHERE pubkey_x25519 = ?", pub);
+            return core.devices._key_recipients(key);
+        });
+    }
+
     // Whether a group message's `kicked` list names `core`'s device.
     static bool names_us_kicked(core::Core& core, std::span<const std::byte> message) {
         return on_loop(core, [&] {

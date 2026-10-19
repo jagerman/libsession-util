@@ -235,6 +235,16 @@ BEGIN
     WHERE device_account_keys.rotated IS NULL AND device_account_keys.id != winner.id;
 END;
 
+-- The devices each account key has been delivered to, and so holds for good: a payload is
+-- encrypted to exactly the registered records it carries, so every payload carrying a key -- one
+-- this device merged, or pushed -- delivered it to each of them.  A key that reached a device no
+-- longer in the group is one that device can still use.
+CREATE TABLE device_account_key_recipients (
+    key INTEGER NOT NULL REFERENCES device_account_keys(id) ON DELETE CASCADE,
+    device BLOB NOT NULL CHECK(length(device) == 16),  -- the unique_id it was delivered to
+    PRIMARY KEY(key, device)
+) STRICT, WITHOUT ROWID;
+
 -- from 000_config_dumps.sql
 -- The serialised state of each config object, so a config survives a restart without being rebuilt
 -- from its swarm.  A dump holds the merged config together with the bookkeeping a merge needs --

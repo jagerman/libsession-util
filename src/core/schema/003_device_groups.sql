@@ -125,6 +125,12 @@ BEGIN
     WHERE device_account_keys.rotated IS NULL AND device_account_keys.id != winner.id;
 END;
 
+CREATE TABLE device_account_key_recipients (
+    key INTEGER NOT NULL REFERENCES device_account_keys(id) ON DELETE CASCADE,
+    device BLOB NOT NULL CHECK(length(device) == 16),
+    PRIMARY KEY(key, device)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE device_group_merged (
     hash TEXT PRIMARY KEY NOT NULL
 ) STRICT;

@@ -2556,6 +2556,62 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a second admission does not replace the one held",
+        "[core][devices][linking][confirm]") {
+    Linking l;
+    l.ask();
+    REQUIRE(l.core->devices.accept_request(l.events.added.at(0).id, await));
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G1");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Approved);
+
+    // Another, readable and admitting the same record, saying something else of the group.
+    auto group = l.core->devices.devices(true, true, true);
+    auto core_id = Linking::id_of(l.core);
+    group.at(core_id).description = "Not what the user approved";
+    TestHelper::deliver_device_message(
+            *l.applicant, TestHelper::encrypt_device_data(l.core->devices, group), in(10min), "G2");
+
+    REQUIRE(l.applicant->devices.confirm_link(await));
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(l.applicant->devices.devices().at(core_id).description != "Not what the user approved");
+}
+
+TEST_CASE(
+        "Devices - a link request under a key a removed device holds is not read",
+        "[core][devices][linking][removal]") {
+    Linking l;
+    l.admit();
+
+    // The group's key, delivered to both devices: by the admission, and by the existing device's
+    // push once the swarm confirms it.
+    auto key = l.core->devices.active_account_keys().front().x25519_pub;
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G2");
+    std::set<device::Id> both{Linking::id_of(l.core), l.applicant_id()};
+    auto pushed_to = TestHelper::key_recipients(*l.core, key);
+    CHECK(std::set(pushed_to.begin(), pushed_to.end()) == both);
+    auto merged_to = TestHelper::key_recipients(*l.applicant, key);
+    CHECK(std::set(merged_to.begin(), merged_to.end()) == both);
+
+    // A new device asking under that key.
+    TempCore asking{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    auto request = TestHelper::build_link_request(*asking, *l.core);
+    REQUIRE(l.events.added.size() == 1);
+
+    SECTION("rotated away from since: still read") {
+        l.core->devices.rotate_account_keys();
+        TestHelper::deliver_device_message(*l.core, request.message, in(10min), "L2");
+        CHECK(l.events.added.size() == 2);
+    }
+
+    SECTION("held by a device removed since: not read") {
+        REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+        TestHelper::deliver_device_message(*l.core, request.message, in(10min), "L2");
+        CHECK(l.events.added.size() == 1);
+    }
+}
+
+TEST_CASE(
         "Devices - starting a group with others in view dissolves them",
         "[core][devices][membership][dissolve]") {
     Linking l;
