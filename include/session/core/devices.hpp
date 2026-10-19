@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "component.hpp"
+#include "link_sas.hpp"
 #include "swarm_message.hpp"
 
 namespace oxenc {
@@ -231,9 +232,10 @@ namespace device {
         /// group moves to new keys.
         std::optional<Info> replaces;
 
-        /// The 21 emoji to compare against what the requesting device is showing.  The first 7 are
-        /// the standard display; all 21 are there for an extended view.
-        std::array<std::string_view, 21> sas;
+        /// The emoji to compare against what the requesting device is showing, by their indices
+        /// into the SAS table (see `sas_emoji`).  The first 7 are the standard display; all 21 are
+        /// there for an extended view.
+        Sas sas;
 
         /// When we stored it, and when the swarm drops the message it arrived in.  The deadline is
         /// the swarm's rather than ours: past it the message cannot be fetched, so no device can
@@ -258,10 +260,11 @@ namespace device {
         /// When the group was created, by the creating device's clock.
         std::chrono::sys_time<std::chrono::minutes> created() const;
 
-        /// The emoji a user compares to check that two devices are in the same group.  The
-        /// suggested basic display is the first 4 beside `created()`; all 21 are for an extended
-        /// view.  Not a security check: anyone holding the account seed can copy an identifier.
-        std::array<std::string_view, 21> sas() const;
+        /// The emoji a user compares to check that two devices are in the same group, by their
+        /// indices into the SAS table (see `sas_emoji`).  The suggested basic display is the first
+        /// 4 beside `created()`; all 21 are for an extended view.  Not a security check: anyone
+        /// holding the account seed can copy an identifier.
+        Sas sas() const;
 
         bool operator==(const GroupId&) const = default;
     };
@@ -576,9 +579,9 @@ class Devices final : detail::CoreComponent {
 
     /// This device's own link request, as the waiting screen shows it.
     struct OutgoingLinkRequest {
-        /// The 21 emoji the user compares against what the accepting device shows; the first 7 are
-        /// the standard display.
-        std::array<std::string_view, 21> sas;
+        /// The emoji the user compares against what the accepting device shows, by their indices
+        /// into the SAS table (see `sas_emoji`); the first 7 are the standard display.
+        Sas sas;
 
         /// When the request lapses unapproved, for the countdown while `Requesting`.  After it no
         /// device can approve it, and asking again is the only way in.  Meaningless once
@@ -802,7 +805,7 @@ class Devices final : detail::CoreComponent {
 
     struct LinkRequestResult {
         std::vector<std::byte> message;  // encrypted bytes to push to Namespace::Devices
-        std::array<std::string_view, 21> sas;
+        Sas sas;
         int64_t row;  // in device_own_requests
     };
 

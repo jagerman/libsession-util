@@ -500,6 +500,46 @@ TEST_CASE(
                   "SELECT distributed FROM device_account_keys") == 0);
 }
 
+TEST_CASE("Devices - link request SAS", "[core][devices][sas]") {
+    SECTION("indices into Matrix's table, as the emoji were before") {
+        std::array<std::byte, 16> seed;
+        for (size_t i = 0; i < seed.size(); i++)
+            seed[i] = std::byte(i);
+        auto sas = sas_from_seed(seed);
+        CHECK(sas == Sas{0, 4, 32, 0, 3, 16, 16, 1, 6, 28, 0, 2, 9, 40, 48, 2, 12, 52, 32, 3, 15});
+
+        std::vector<std::string_view> emoji;
+        for (auto i : sas)
+            emoji.push_back(sas_emoji(i).emoji);
+        CHECK(emoji == std::vector{"🐶"sv, "🦄"sv, "🎩"sv, "🐶"sv, "🐎"sv, "🌳"sv, "🌳"sv,
+                                   "🐱"sv, "🐘"sv, "🎂"sv, "🐶"sv, "🦁"sv, "🐓"sv, "🎁"sv,
+                                   "🔨"sv, "🦁"sv, "🐟"sv, "🚲"sv, "🎩"sv, "🐎"sv, "🌷"sv});
+    }
+
+    SECTION("each emoji with Matrix's description") {
+        CHECK(sas_emoji(0).emoji == "🐶");
+        CHECK(sas_emoji(0).description == "Dog");
+        CHECK(sas_emoji(36).description == "Thumbs Up");
+        CHECK(sas_emoji(63).emoji == "📌");
+        CHECK(sas_emoji(63).description == "Pin");
+        std::set<std::string_view> descriptions;
+        for (uint8_t i = 0; i < 64; i++)
+            descriptions.insert(sas_emoji(i).description);
+        CHECK(descriptions.size() == 64);
+        CHECK_THROWS_AS(sas_emoji(64), std::out_of_range);
+    }
+
+    SECTION("Argon2id at 64 MiB and 2 passes, as the spec says") {
+        CHECK(SAS_ARGON2_OPSLIMIT == 2);
+        CHECK(SAS_ARGON2_MEMLIMIT == 64 * 1024 * 1024);
+        // Computed independently, from libsodium's Argon2id through PyNaCl, with the salt from
+        // hashlib's BLAKE2b.
+        auto plaintext = "SessionLinkEmoji test plaintext"sv;
+        CHECK(oxenc::to_hex(derive_sas_seed(to_span<std::byte>(plaintext))) ==
+              "419dcb7bc15bd4a8b281dee155e27bb6");
+    }
+}
+
 TEST_CASE("Devices - build_link_request", "[core][devices]") {
     // Restored, not generated: asking to join a group only makes sense for a device that adopted
     // an existing account's seed.  A device that generated the account *is* the group.
@@ -510,8 +550,8 @@ TEST_CASE("Devices - build_link_request", "[core][devices]") {
         auto result = TestHelper::build_link_request(*c, *group);
         CHECK_FALSE(result.message.empty());
         CHECK(result.sas.size() == 21);
-        for (const auto& s : result.sas)
-            CHECK_FALSE(s.empty());
+        for (auto s : result.sas)
+            CHECK(s < 64);
     }
 
     SECTION("consecutive calls produce different messages") {

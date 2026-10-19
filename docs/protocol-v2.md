@@ -651,22 +651,28 @@ This initial key also implies a human-readable short authentication string that 
 verify that the request being accepted on a linked device matches the one that originated on the new
 device.  This authentication string is an emoji sequence selected from a set of 64 distinct emoji
 values as specified in the Matrix specification's short authentication string emoji list (see
-https://spec.matrix.org/v1.17/client-server-api/#sas-method-emoji).  Clients shall show the first 7
-characters of this emoji, with an optional "extended" view (either a toggle, or visual indicator) to
-show an extended version of the SAS with 14 additional characters (21 total) that users can use for
-extra assurance.
+https://spec.matrix.org/v1.17/client-server-api/#sas-method-emoji), in that list's order.  Clients
+shall show the first 7 of these emoji, with an optional "extended" view (either a toggle, or visual
+indicator) to show an extended version of the SAS with 14 additional emoji (21 total) that users
+can use for extra assurance.  As the Matrix specification has it, clients SHOULD show each emoji
+with its description: the English name the list gives it, or a translation of that name.  What the
+user checks is that the two devices show the same emoji, not identical glyphs: a few look alike, or
+render differently, from one platform to another, and the descriptions settle which is which.
 
 The exact sequence is calculated from a list of 6-bit (0-63) integer values that determine the index
 of the emoji value, generated as follows:
 
-- seed = Argon2id(M, salt=blake2b(M, size=16, pers="SessionLinkEmoji"), size=16, cost=16MiB, ops=2)
+- seed = Argon2id(M, salt=blake2b(M, size=16, pers="SessionLinkEmoji"), size=16, cost=64MiB, ops=2)
   where M is the signed request dict, as decrypted from `L`.
 - emoji indices are then selected by interpreting the resulting 16 bytes as a 128-bit, little-endian
   encoded integer where index 0 is the value of the least significant 6 bits, index 1 is bits 6-11,
   and so on.
-- the final secret displayed on both devices is then 7 characters joined with spaces between each
-  emoji.  When displaying an extended version, devices are recommended to format as 3 lines of 7
-  characters each.
+- the final secret displayed on both devices is then the first 7 emoji, each with its description.
+  When displaying an extended version, devices are recommended to format as 3 lines of 7.
+
+Each side derives the seed from the request itself, when it makes or receives it, so a change to
+these parameters affects only requests in flight across it, whose two sides then show different
+emoji and are simply asked again.
 
 This short string simply serves as a quick visual representation of the device key.  This prevents a
 rogue device with the root Session key from being able to wait for and quickly replace a device
@@ -679,6 +685,8 @@ the linking request in the swarm and quickly replace it with its own linking req
 user into accepting *it* rather than the intended device.  Given that the 7 emoji sequence offers
 only 42 bits of entropy, a cheap hash here (such as BLAKE2b) could conceivably be collided within
 the short window before the user accepts the request; a memory-hard hash makes that infeasible.
+64 MiB and 2 passes cost each device a few tens of milliseconds, once per request; a collision
+attempt pays that for every one of its ~2^42 tries.
 
 ### Device link request handling
 

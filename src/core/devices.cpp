@@ -1051,7 +1051,7 @@ std::chrono::sys_time<std::chrono::minutes> device::GroupId::created() const {
             std::chrono::minutes{oxenc::load_little_to_host<uint32_t>(value.data())}};
 }
 
-std::array<std::string_view, 21> device::GroupId::sas() const {
+Sas device::GroupId::sas() const {
     std::array<std::byte, 16> seed;
     hash::blake2b_pers(seed, PERS_GROUP_SAS, value);
     return sas_from_seed(seed);

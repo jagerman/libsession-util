@@ -27,6 +27,13 @@ from libsession each time the screen is drawn, and the events below say when to 
   sets to confuse.
 - **Link request.** How a device asks to join a group. Both devices show the same **7** emoji (21
   for an extended view), and the user confirms on *both* that they match.
+- **Showing emoji.** A SAS (`sas` on a request, `GroupId::sas()`) is a list of indices, 0-63, into
+  Matrix's SAS emoji table. Look each up with `sas_emoji(i)` and show its `emoji` with its
+  `description` under it -- Matrix's English name for it, or your own translation of that name,
+  which you keep by the same index -- the first 7 in a row, or all 21 as 3 rows of 7 for the
+  extended view. Never show the index itself. A few emoji look alike or render
+  differently from one platform to another, which the names settle. Ask whether the two devices
+  show "the same" emoji, not "identical" ones.
 - **One group per account.** An account can still end up with two, usually because a device
   started a new group when it should have joined the existing one: a **fork**. libsession does not
   resolve it by itself. The user does, by keeping one group, which **dissolves** the other: its
