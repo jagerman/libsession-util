@@ -817,7 +817,7 @@ TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][device
     CHECK(state_of(id).state == device::State::Left);
     CHECK(state_of(id).kicked == t1);
 
-    // And is written back as a departure: the timestamp negated.
+    // And is written back as a departure, which is all its tombstone says.
     auto plaintext = TestHelper::decrypt_device_data(
             c->devices,
             TestHelper::encrypt_device_data(c->devices, c->devices.devices(true, true, true)));
@@ -825,7 +825,9 @@ TEST_CASE("Devices - a departure is a tombstone of its own kind", "[core][device
     REQUIRE(btdc.skip_until("D"));
     auto devs = btdc.consume_dict_consumer();
     REQUIRE(devs.skip_until(std::string_view{reinterpret_cast<const char*>(id.data()), id.size()}));
-    CHECK(devs.consume_integer<int64_t>() == -t1.time_since_epoch().count());
+    auto written = devs.consume_dict_consumer();
+    CHECK(written.require<int64_t>("l") == t1.time_since_epoch().count());
+    CHECK(written.is_finished());
 
     // A removal beats it, even one timestamped earlier: a device that left and was then removed
     // must read as removed everywhere, or it would never be told.

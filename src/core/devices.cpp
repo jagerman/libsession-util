@@ -702,18 +702,17 @@ namespace {
                     continue;
                 } else if (
                         info.state == device::State::Kicked || info.state == device::State::Left) {
-                    // A removed device goes in as a bare timestamp: that is how every other device
-                    // learns it is gone, since a record merely absent from a message means
-                    // "unchanged" rather than "removed".  Negated for one that left, which is what
-                    // keeps it out of the `kicked` list.
+                    // A tombstone is how every other device learns that a device is gone, since a
+                    // record merely absent from a message means "unchanged" rather than "removed".
                     //
                     // TODO: we should stop writing devices gone a long time ago.  Pruning means
                     // dropping them from *this payload* and never from the table -- the budget is
                     // on what the message carries, a local row costs nothing, and forgetting one
                     // would lower its rank and let a stale group resurrect the device.
                     assert(info.kicked);
-                    auto t = info.kicked->time_since_epoch().count();
-                    devs.append(id_sv, info.state == device::State::Left ? -t : t);
+                    devs.append_dict(id_sv).append(
+                            info.state == device::State::Left ? "l" : "r",
+                            info.kicked->time_since_epoch().count());
                     continue;
                 } else if (info.state == device::State::Unregistered) {
                     // Never in the group rather than removed from it, so there is nothing to say
@@ -833,6 +832,28 @@ namespace {
         return hash::blake2b<8>(std::move(out).str());
     }
 
+    // The state and time a tombstone carries -- {"r": when} for a device removed, {"l": when} for
+    // one that left -- or nullopt for a live record.  Told apart by the seqno, which every record
+    // carries and no tombstone does; anything else in a tombstone is for a later version, and
+    // ignored.  Either way the id is spent, and the device must take a new one to come back.
+    std::optional<std::pair<device::State, std::chrono::sys_seconds>> decode_tombstone(
+            std::string_view raw) {
+        oxenc::bt_dict_consumer in{raw};
+        if (in.skip_until("#"))
+            return std::nullopt;
+        auto left = in.maybe<int64_t>("l");
+        auto removed = in.maybe<int64_t>("r");
+        if (left.has_value() == removed.has_value())
+            throw std::runtime_error{
+                    "Invalid encoded device data: a tombstone needs exactly one of 'l' and 'r'"};
+        auto t = left ? *left : *removed;
+        if (t <= 0)
+            throw std::runtime_error{"Invalid encoded device data: invalid tombstone timestamp"};
+        return std::pair{
+                left ? device::State::Left : device::State::Kicked,
+                std::chrono::sys_seconds{std::chrono::seconds{t}}};
+    }
+
     // Decodes the plaintext bt-encoded device group payload.  The returned device map will include
     // both full device records and tombstoned devices: the latter have a mostly default-constructed
     // Info where only id, state (Kicked or Left), and kicked are set.
@@ -858,18 +879,12 @@ namespace {
             auto& info = it->second;
             info.id = id;
 
-            if (devs.is_integer()) {
-                // A tombstone: the time the device was removed, or negated, the time it left.
-                // Either way the id is spent, and the device must generate a new one to come back.
-                auto t = devs.consume_integer<int64_t>();
-                if (t == 0 || t == std::numeric_limits<int64_t>::min())
-                    throw std::runtime_error{"Invalid encoded device data: invalid tombstone"};
-                info.state = t > 0 ? device::State::Kicked : device::State::Left;
-                info.kicked.emplace(std::chrono::seconds{t > 0 ? t : -t});
+            // The encoded record itself, rather than what we would make of it again: taking the
+            // view costs nothing here, and re-encoding to hash would.
+            auto raw = devs.consume_dict_data();
+            if (auto gone = decode_tombstone(raw)) {
+                std::tie(info.state, info.kicked) = *gone;
             } else {
-                // The encoded record itself, rather than what we would make of it again: taking the
-                // view costs nothing here, and re-encoding to hash would.
-                auto raw = devs.consume_dict_data();
                 decode_one(info, oxenc::bt_dict_consumer{raw}, device::State::Registered);
                 info.digest = hash::blake2b<8>(raw);
             }

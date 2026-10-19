@@ -166,13 +166,16 @@ server reads to enforce a device limit (see "Extension - Pro subscriptions" belo
 
 ### Removed devices
 
-A removed device is written into the devices dict as a tombstone: its ID maps to the unix timestamp
-of the removal, where a live device maps to a sub-dict.  The type of the value distinguishes the
-two, so a device can never be both.
+A removed device is written into the devices dict as a tombstone: its ID maps to a small dict saying
+how and when it went, in place of the record a live device maps to.
 
-The sign of the timestamp says how the device went: positive for a device removed by another, and
-negative (the timestamp negated) for one that left of its own accord (see "Leaving a group to join
-another").  Zero is invalid.  Where two tombstones for the same device differ, a removal beats a
+- `{"r": timestamp}` for a device removed by another;
+- `{"l": timestamp}` for one that left of its own accord (see "Leaving a group to join another").
+
+The timestamp is the unix time, in seconds, of the removal or departure, and must be positive.  A
+tombstone holds exactly one of the two keys.  Every live record carries `seq`, and a tombstone never
+does, which is how a reader tells them apart; any other key in a tombstone is ignored, so that later
+versions can add to it.  Where two tombstones for the same device differ, a removal beats a
 departure, and between two of the same kind the later timestamp wins.
 
 A device holding an existing record for the removed device marks that record removed and retains the
