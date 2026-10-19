@@ -97,7 +97,9 @@ class DeviceEvents {
     virtual void link_request_added(device::LinkRequest request) = 0;
 
     /// A request announced by `link_request_added` can no longer be answered, and whatever prompt
-    /// was drawn for it should close.
+    /// was drawn for it should close.  Not for a request this device accepted or ignored itself,
+    /// whose prompt closed when the user acted on it, nor on hearing afterwards that another device
+    /// accepted that same request too.
     virtual void link_request_ended(int reqid, device::LinkRequestEnd why) = 0;
 
     /// The account's devices changed: one joined, was removed, or changed how it describes itself.
