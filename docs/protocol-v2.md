@@ -206,9 +206,10 @@ group message of its own: one registering a device it controls, encrypted to the
 public keys it knows.  The seed signs whatever its holder likes, and nothing in the protocol
 prevents that.  Device key rotation makes the knowledge go stale (see "Device key rotation"): once
 the members have rotated, nothing encrypted to the keys it knew is readable by any of them.  Beyond
-that the defence is notification, not prevention: every member tells its user of a device added to
-the group, and the user decides what to do about one they do not recognise -- remove it, or, if the
-seed itself is compromised, start afresh from a device they trust.
+that the defence is notification, not prevention, as it is for everything a seed holder can do
+(see "Displaced devices"): every member tells its user of a device added to the group, and the user
+decides what to do about one they do not recognise -- remove it, or, if the seed itself is
+compromised, start afresh from a device they trust.
 
 #### Which removals a message carries
 
@@ -493,10 +494,17 @@ the same way, but tells its user only that it is no longer in the group.  Readin
 the group again, as new as the one that displaced or dropped it, undoes either.
 
 A holder of the account seed can forge a message carrying the group's identifier, with whatever
-`kicked` list it likes.  With entries it makes up it can take the device no further than dropped; to
-have it displaced it must know the ID of a device removed before, and to have it removed, the
-device's own.  None of it gives the forger anything: the device stops acting for its group, rather
-than starting to trust anything new.
+`kicked` list it likes, and by leaving the list out have every member of the group conclude that it
+was displaced.  That is one of many things the seed lets its holder do to the account: it can as
+well delete any of the account's messages, publish account keys of its own in place of the
+account's, register a device of its own in the group (see "Removed devices"), or dissolve every
+group the account has.  The protocol does not try to prevent any of them, and could not: the
+account's user, restoring onto a new device, must be able to do each one.  What it does for those
+that reach the device group is make them seen: a device added is announced to every member, a
+dissolution leaves each device of the group dissolved and saying so, and a forged displacement is
+no quieter than a real one -- every member alerts its user, as a possible attack, and the user
+decides what happened.  The forger gains nothing else by it: the devices stop acting for their
+group, rather than starting to trust anything new.
 
 ### Group identifier
 

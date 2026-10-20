@@ -99,7 +99,7 @@ its newest message was written, by the clock of the device that wrote it).
 | `Approved` | Another device approved the request; the user has to confirm the emoji. | The confirmation, brought up wherever the user is (see "Joining"). |
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `DeviceGroupVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
-| `Displaced` | Another device now holds this device's place in its group, under this device's identity. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity -- or someone with the recovery phrase has made it look that way. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
 | `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there, or has moved on to keys it doesn't hold without saying why. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `DeviceGroupVisible`. |
 
@@ -231,7 +231,8 @@ rather than for the list. It does not fire for this device's own `accept_request
 **Show an addition prominently**, as a notice the user will see rather than a line in a list: "A
 new device was added to your account: *Alice's laptop*". It is the one event the user must not
 miss. Anyone holding the account's recovery phrase -- a removed device included -- can add a device
-of their own, and the design answers that by telling the user rather than by preventing it. Offer,
+of their own, and the design answers that, as it answers everything a holder of the phrase can do,
+by telling the user rather than by preventing it: the user sees it, and the user decides. Offer,
 with the notice, what to do about a device they don't recognise: remove it (`remove_device`); and if
 the recovery phrase itself may be in someone else's hands, start afresh from a device they trust --
 `leave_group`, then `start_device_group`, which dissolves the old group (see "Starting a group") --
@@ -273,14 +274,19 @@ a device that started a group of its own by mistake months ago ("two months ago"
 ### Other alerts
 
 - **Displaced** (`membership_changed(Displaced)`). Critical, and never dismissable. The group has
-  moved on to keys this device doesn't hold, under this device's own identity. Either the user
-  restored this device elsewhere and approved the copy as a replacement, or someone with a copy of
-  this device's data has taken its place. Say both: "Another device has taken this device's place
-  in your device group. If you didn't restore it on another device, someone may have a copy of
-  this device's data." The device stops acting for the group by itself. The way back is joining
-  again as a new device (`request_link`, which takes the new identity itself); the user should also
-  remove the old identity from one of their other devices if they don't recognise what now holds
-  it.
+  moved on to keys this device doesn't hold, under this device's own identity -- or a message from
+  the group says so, and anyone with the recovery phrase can write one. So there are three ways
+  here: the user restored this device elsewhere and approved the copy as a replacement; someone
+  with a copy of this device's data has taken its place; or someone with the recovery phrase has
+  made the group's devices believe they were displaced. Say so: "Another device has taken this
+  device's place in your device group. If you didn't restore it on another device, someone may
+  have a copy of this device's data, or your recovery phrase." The device stops acting for the
+  group by itself. The way back is joining again as a new device (`request_link`, which takes the
+  new identity itself); the user should also remove the old identity from one of their other
+  devices if they don't recognise what now holds it. If several of their devices show this at
+  once, no restore explains it: the recovery phrase is in someone else's hands, and the user should
+  start afresh from a device they trust (`start_device_group`, which dissolves the group in view)
+  and treat the phrase as compromised.
 - **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back, offer
   to link it again (or to start a group); the call gives it a new identity, and it then joins like
   any new device. Messages and the account's configs are kept.
