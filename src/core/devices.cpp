@@ -578,7 +578,8 @@ bool device::Info::same_user_fields(const Info& other) const {
 }
 
 void Devices::update_info(device::Info info, result_function<> cb) {
-    async([this, info = std::move(info)] { _update_info(info); }, std::move(cb));
+    async([this, info = std::move(info)]() mutable { _update_info(std::move(info)); },
+          std::move(cb));
 }
 
 void Devices::update_info(const device::Info& info, await_t) {
@@ -790,7 +791,10 @@ namespace {
     // The inverse of `encode_described`.
     void decode_described(device::Info& info, oxenc::bt_dict_consumer& dev) {
         read_extras(dev, "d", info.extra);
-        info.description = dev.maybe<std::string_view>("d").value_or(""sv);
+        // A record from a newer or broken device can carry more than the protocol allows.
+        info.description = utf8_truncate(
+                std::string{dev.maybe<std::string_view>("d").value_or(""sv)},
+                device::DESCRIPTION_MAX);
 
         read_extras(dev, "t", info.extra);
         auto type = dev.maybe<std::string_view>("t").value_or(""sv);
@@ -1102,8 +1106,11 @@ std::pair<device::Info, bool> Devices::_device_info() {
     return {std::move(own), registered};
 }
 
-void Devices::_update_info(const device::Info& info) {
+void Devices::_update_info(device::Info info) {
     assert(on_loop());
+    // Reading the master copy back cuts it too, but cutting here keeps the stored copy itself to
+    // what is published, and makes a change only past the cap no write at all.
+    info.description = utf8_truncate(std::move(info.description), device::DESCRIPTION_MAX);
     if (_described().same_user_fields(info))
         return;
 

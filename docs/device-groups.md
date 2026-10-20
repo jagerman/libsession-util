@@ -73,10 +73,12 @@ and listing keys -- are Core's own machinery, and not for an application.
 
 At startup, and whenever the user changes them, describe this device with `update_info`: its
 `type` (e.g. `device::Type::Session_CLI`), a short `description`, and its `version`. That is what
-other devices show for it. It is this device's own and kept across joining, leaving and starting
-groups, so there is no need to set it again after any of those. `device_info()` reads back what it
-publishes; the device list (`devices()`) shows what the group holds for it, which catches up once a
-push carrying a change has reached the swarm.
+other devices show for it. The description is capped at `device::DESCRIPTION_MAX` (64) bytes;
+libsession cuts a longer one to fit, on a UTF-8 character boundary, so limit what the user can
+type to the same, or show them what was kept. It is this device's own and kept across joining,
+leaving and starting groups, so there is no need to set it again after any of those.
+`device_info()` reads back what it publishes; the device list (`devices()`) shows what the group
+holds for it, which catches up once a push carrying a change has reached the swarm.
 
 ## Startup: membership drives everything
 

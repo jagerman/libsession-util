@@ -44,6 +44,11 @@ namespace device {
     inline constexpr size_t ID_SIZE = 16;
     using Id = std::array<std::byte, ID_SIZE>;
 
+    /// The protocol's cap on `Info::description`, in bytes.  Libsession cuts anything longer to it
+    /// on a UTF-8 character boundary: in `update_info`, and in every record it reads from the
+    /// swarm, so no description it holds or hands out is longer.
+    inline constexpr size_t DESCRIPTION_MAX = 64;
+
     enum class Type {
         Unknown,
         Session_iOS,
@@ -153,7 +158,8 @@ namespace device {
         std::string other_device;
 
         // Device-provided description of itself.  This could contain the OS type or version,
-        // possible a device nickname, but is generally free-form data.
+        // possibly a device nickname, but is generally free-form data, of at most
+        // `DESCRIPTION_MAX` bytes.
         std::string description;
 
         // Indicates whether the device is registered, pending registration, or not registered.
@@ -563,7 +569,7 @@ class Devices final : detail::CoreComponent {
     // What both public forms of each dispatch onto the loop, and what the rest of this class
     // calls internally, since it is already there.  Each asserts it got there.
     std::pair<device::Info, bool> _device_info();
-    void _update_info(const device::Info& info);
+    void _update_info(device::Info info);
 
     // What this device describes itself as, from its master copy (see `own_info_key`): every field
     // but the id, seqno, timestamp, state and keys.
@@ -936,7 +942,9 @@ class Devices final : detail::CoreComponent {
     // device is registered, its group is owed a push carrying it, which follows a fetch this call
     // asks for at once.
     //
-    // The id, seqno, timestamp, state and pk_* fields of the input value are ignored.
+    // The id, seqno, timestamp, state and pk_* fields of the input value are ignored.  A
+    // description longer than `device::DESCRIPTION_MAX` bytes is cut to it on a UTF-8 character
+    // boundary, and `device_info()` reads back the cut value, which is what is published.
     //
     // Filling these in is the application's job -- libsession establishes the group with them
     // blank -- and an application is on its own thread when it does.  The handler form takes the

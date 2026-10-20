@@ -144,6 +144,37 @@ TEST_CASE("Devices - update_info and same_user_fields", "[core][devices]") {
     }
 }
 
+namespace {
+constexpr auto cake = "\xf0\x9f\x8e\x82"sv;
+// One ending exactly at the cap with a 4-byte character, and one that same character straddles.
+const auto at_cap = std::string(device::DESCRIPTION_MAX - cake.size(), 'a') + std::string{cake};
+const auto straddling = std::string(device::DESCRIPTION_MAX - 1, 'b') + std::string{cake};
+const auto straddling_cut = std::string(device::DESCRIPTION_MAX - 1, 'b');
+// Differs from `straddling` only in the character the cap falls inside.
+const auto straddling_other = straddling_cut + "\xf0\x9f\x8d\xb0";
+}  // namespace
+
+TEST_CASE(
+        "Devices - update_info cuts a description to DESCRIPTION_MAX on a character boundary",
+        "[core][devices]") {
+    REQUIRE(at_cap.size() == device::DESCRIPTION_MAX);
+    auto c = restored_core();
+    device::Info info{};
+    info.description = straddling;
+    c->devices.update_info(info, await);
+    auto got = c->devices.device_info(await).first;
+    CHECK(got.description == straddling_cut);
+
+    // Differing only past the cap is no change, and costs no seqno.
+    info.description = straddling_other;
+    c->devices.update_info(info, await);
+    CHECK(c->devices.device_info(await).first.seqno == got.seqno);
+
+    info.description = at_cap;
+    c->devices.update_info(info, await);
+    CHECK(c->devices.device_info(await).first.description == at_cap);
+}
+
 TEST_CASE(
         "Devices - this device's seqno counts on from what the swarm holds for it",
         "[core][devices]") {
@@ -2743,6 +2774,43 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a description from the swarm is held to DESCRIPTION_MAX",
+        "[core][devices][linking]") {
+    Linking l;
+    l.admit();
+    auto core_id = Linking::id_of(l.core);
+    // Otherwise the admission's record and the one below share a seqno, and the digest picks.
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
+
+    SECTION("one at the cap arrives whole") {
+        auto self = l.core->devices.device_info(await).first;
+        self.description = at_cap;
+        l.core->devices.update_info(self, await);
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G2");
+        CHECK(l.applicant->devices.devices().at(core_id).description == at_cap);
+    }
+
+    SECTION("a longer one is held cut on a character boundary") {
+        auto group = l.core->devices.devices(true, true, true);
+        auto& record = group.at(core_id);
+        record.description = straddling;
+        record.seqno++;
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                TestHelper::encrypt_device_data(l.core->devices, group),
+                in(10min),
+                "G2");
+        auto held = l.applicant->devices.devices().at(core_id);
+        REQUIRE(held.seqno == record.seqno);
+        CHECK(held.description == straddling_cut);
+    }
+}
+
+TEST_CASE(
         "Devices - a link request under a key a removed device holds is not read",
         "[core][devices][linking][removal]") {
     Linking l;
@@ -4152,6 +4220,27 @@ TEST_CASE(
     CHECK(account_key(l.applicant) == account_key(l.core));
     CHECK(*l.applicant->devices.next_account_rotation() >
           clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
+}
+
+TEST_CASE(
+        "Devices - a description changed only past DESCRIPTION_MAX asks for no push",
+        "[core][devices][push]") {
+    Linking l;
+    l.admit();
+    auto [self, registered] = l.core->devices.device_info(await);
+    self.description = straddling;
+    l.core->devices.update_info(self, await);
+    auto* net = attach_mock_network(*l.core);
+    TestHelper::finish_fetch(*l.core);
+    answer_upload(l.core, *net, true);
+    REQUIRE_FALSE(l.core->devices.needs_push().device_group);
+    TestHelper::drain(*l.core);
+    REQUIRE_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+
+    self.description = straddling_other;
+    l.core->devices.update_info(self, await);
+    TestHelper::drain(*l.core);
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
 }
 
 TEST_CASE(
