@@ -299,8 +299,9 @@ namespace device {
         /// whose removals show that nothing removed it.  Another device holds its place under its
         /// id -- a restored copy of it, admitted as a replacement, or someone holding a copy of its
         /// data who has rotated it out -- or a holder of the account seed has forged that message
-        /// to make it look so; the last two are attacks.  Never dismissable.  It can come back
-        /// only under a new device id, which `request_link` and `start_device_group` take for it.
+        /// to make it look so; the last two are attacks.  Shown so it cannot be missed, and kept
+        /// as a warning once dismissed.  It can come back only under a new device id, which
+        /// `request_link` and `start_device_group` take for it.
         Displaced,
         /// Its group was dissolved: the user of another of the account's devices kept another group
         /// over it.  What it held of the group is forgotten and it has a new device id; it rejoins

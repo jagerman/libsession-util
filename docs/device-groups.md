@@ -99,7 +99,7 @@ its newest message was written, by the clock of the device that wrote it).
 | `Approved` | Another device approved the request; the user has to confirm the emoji. | The confirmation, brought up wherever the user is (see "Joining"). |
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `DeviceGroupVisible`: link this device again, or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
-| `Displaced` | Another device now holds this device's place in its group, under this device's identity -- or someone with the recovery phrase has made it look that way. | A critical alert (see "Forks and alerts"). Never dismissable. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity -- or someone with the recovery phrase has made it look that way. | A critical alert (see "Forks and alerts"), shown so it cannot be missed; once dismissed it stays as a warning the user can reopen. Offer to link this device again, which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
 | `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there, or has moved on to keys it doesn't hold without saying why. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `DeviceGroupVisible`. |
 
@@ -273,7 +273,10 @@ a device that started a group of its own by mistake months ago ("two months ago"
 
 ### Other alerts
 
-- **Displaced** (`membership_changed(Displaced)`). Critical, and never dismissable. The group has
+- **Displaced** (`membership_changed(Displaced)`). Critical. Bring it up so it cannot be missed
+  (a full screen is fine, perhaps with a second confirmation to dismiss), and once dismissed keep
+  it as a warning somewhere in the UI that the user can reopen at any time. The device is not
+  read-only meanwhile: it can still send. The group has
   moved on to keys this device doesn't hold, under this device's own identity -- or a message from
   the group says so, and anyone with the recovery phrase can write one. So there are three ways
   here: the user restored this device elsewhere and approved the copy as a replacement; someone
