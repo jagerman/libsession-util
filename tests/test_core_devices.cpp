@@ -1560,19 +1560,61 @@ size_t answer_fetch(TempCore& c, MockNetwork& net, const Held& held = {}, bool r
             [&](MockNetwork::SentRequest& r) {
                 if (!reached)
                     return r.callback(false, true, 0, {}, std::nullopt);
-                nlohmann::json messages = nlohmann::json::array();
+                auto body = retrieved_body();
                 for (const auto& [data, hash] : held)
-                    messages.push_back(
-                            {{"data", oxenc::to_base64(to_string_view(data))},
-                             {"hash", hash},
-                             {"expiry", epoch_ms(clock_now_ms() + 10min)}});
-                nlohmann::json result{
-                        {"code", 200}, {"body", {{"messages", messages}, {"more", false}}}};
+                    body["messages"].push_back(retrieved_message(data, hash));
+                nlohmann::json result{{"code", 200}, {"body", std::move(body)}};
                 r.callback(true, false, 200, {}, nlohmann::json{{"results", {result}}}.dump());
             },
             1);
     TestHelper::drain(*c);
     return answered;
+}
+
+TEST_CASE(
+        "Devices - a fetched message keeps the expiry the swarm reports for it",
+        "[core][devices][fetch]") {
+    Linking l;
+    auto fetch_one = [](TempCore& c, std::span<const std::byte> data, sys_ms expiration) {
+        auto* net = attach_mock_network(*c);
+        TestHelper::fetch(*c, {config::Namespace::Devices}, nullptr);
+        TestHelper::drain(*c);
+        auto body = retrieved_body();
+        body["messages"].push_back(retrieved_message(data, "M1", clock_now_ms(), expiration));
+        nlohmann::json result{{"code", 200}, {"body", std::move(body)}};
+        REQUIRE(answer_requests(
+                        *net,
+                        is_device_fetch,
+                        [&](MockNetwork::SentRequest& r) {
+                            r.callback(
+                                    true,
+                                    false,
+                                    200,
+                                    {},
+                                    nlohmann::json{{"results", {result}}}.dump());
+                        },
+                        1) == 1);
+        TestHelper::drain(*c);
+    };
+
+    SECTION("a group's message puts the group in view") {
+        fetch_one(
+                l.applicant,
+                l.core->devices.build_device_group_message().message,
+                clock_now_ms() + Devices::DEVICE_GROUP_TTL);
+        auto state = l.applicant->devices.membership(await);
+        CHECK(state.membership == device::Membership::DeviceGroupVisible);
+        REQUIRE(state.others.size() == 1);
+        CHECK(state.others[0].id == *TestHelper::group_id(*l.core));
+    }
+
+    SECTION("a link request takes it as its deadline") {
+        auto deadline = std::chrono::floor<std::chrono::seconds>(clock_now_ms() + 7min);
+        fetch_one(l.core, TestHelper::build_link_request(*l.applicant, *l.core).message, deadline);
+        auto requests = l.core->devices.incoming_link_requests(await);
+        REQUIRE(requests.size() == 1);
+        CHECK(requests[0].expires == deadline);
+    }
 }
 
 // Asks for a link from `c` and runs the job, answering the fetch it begins with as a swarm holding

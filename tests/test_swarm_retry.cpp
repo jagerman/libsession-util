@@ -52,7 +52,7 @@ std::string empty_batch(const Request& req) {
     auto batch = parse_json(*req.body);
     auto results = nlohmann::json::array();
     for (size_t i = 0; i < batch["requests"].size(); i++)
-        results.push_back({{"code", 200}, {"body", {{"messages", nlohmann::json::array()}}}});
+        results.push_back({{"code", 200}, {"body", retrieved_body()}});
     return nlohmann::json{{"results", std::move(results)}}.dump();
 }
 

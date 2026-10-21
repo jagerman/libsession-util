@@ -17,19 +17,12 @@ using namespace std::literals;
 // Wraps a single bt-dict message payload as a mock AccountPubkeys retrieve response.
 // prefetch_pfs_keys() sends a plain "retrieve" and expects {messages: [...]} at the top level.
 static nlohmann::json make_pubkey_response(std::span<const std::byte> msg_data) {
-    nlohmann::json msg_item;
-    msg_item["data"] = oxenc::to_base64(
-            std::string_view{reinterpret_cast<const char*>(msg_data.data()), msg_data.size()});
-    nlohmann::json resp;
-    resp["messages"] = nlohmann::json::array({std::move(msg_item)});
-    return resp;
+    return retrieved_body(nlohmann::json::array({retrieved_message(msg_data, "pubkeys")}));
 }
 
 // Returns an AccountPubkeys response body with no messages.
 static nlohmann::json make_empty_response() {
-    nlohmann::json resp;
-    resp["messages"] = nlohmann::json::array();
-    return resp;
+    return retrieved_body();
 }
 
 TEST_CASE("prefetch_pfs_keys throws without network", "[core][pfs]") {
@@ -223,10 +216,7 @@ TEST_CASE("prefetch_pfs_keys handles malformed responses gracefully", "[core][pf
         c->prefetch_pfs_keys(sid);
         REQUIRE(mock_net->sent_requests.size() == 1);
 
-        nlohmann::json msg_item;
-        msg_item["data"] = oxenc::to_base64("not a bt-dict");
-        nlohmann::json bad_resp;
-        bad_resp["messages"] = nlohmann::json::array({std::move(msg_item)});
+        auto bad_resp = make_pubkey_response(to_span<std::byte>("not a bt-dict"sv));
 
         mock_net->sent_requests[0].callback(true, false, 200, {}, bad_resp.dump());
         auto entry = TestHelper::pfs_cache_entry(*c, sid);

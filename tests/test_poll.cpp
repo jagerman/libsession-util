@@ -48,17 +48,9 @@ static nlohmann::json make_response(
     auto batch = parse_json(request_body);
     auto results = nlohmann::json::array();
     for (const auto& r : batch["requests"]) {
-        nlohmann::json body;
-        body["messages"] = nlohmann::json::array();
-        if (r["params"]["namespace"] == ns) {
-            nlohmann::json item;
-            item["data"] = oxenc::to_base64(msg_data);
-            item["hash"] = hash;
-            // A storage server always says when it will drop a message, and a link request takes
-            // that as its deadline -- without one it would arrive already expired.
-            item["expiry"] = epoch_ms(clock_now_ms() + 10min);
-            body["messages"].push_back(std::move(item));
-        }
+        auto body = retrieved_body();
+        if (r["params"]["namespace"] == ns)
+            body["messages"].push_back(retrieved_message(msg_data, hash));
         results.push_back({{"code", 200}, {"body", std::move(body)}});
     }
     return nlohmann::json{{"results", std::move(results)}};
@@ -263,7 +255,7 @@ static nlohmann::json make_empty_response(std::span<const std::byte> request_bod
     auto batch = parse_json(request_body);
     auto results = nlohmann::json::array();
     for (size_t i = 0; i < batch["requests"].size(); i++)
-        results.push_back({{"code", 200}, {"body", {{"messages", nlohmann::json::array()}}}});
+        results.push_back({{"code", 200}, {"body", retrieved_body()}});
     return nlohmann::json{{"results", std::move(results)}};
 }
 

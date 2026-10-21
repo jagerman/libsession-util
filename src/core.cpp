@@ -333,7 +333,8 @@ namespace {
             if (auto t = msg.find("timestamp"); t != msg.end() && t->is_number_integer())
                 swarm_msg.timestamp = from_epoch_ms(t->get<int64_t>());
 
-            if (auto e = msg.find("expiry"); e != msg.end() && e->is_number_integer())
+            // "expiration" in a retrieve, though a store or expire reply calls it "expiry".
+            if (auto e = msg.find("expiration"); e != msg.end() && e->is_number_integer())
                 swarm_msg.expiry = from_epoch_ms(e->get<int64_t>());
 
             got.messages.push_back(std::move(swarm_msg));

@@ -30,6 +30,26 @@ inline nlohmann::json parse_json(std::span<const std::byte> body) {
     return nlohmann::json::parse(to_string_view(body));
 }
 
+/// One message as a storage server's `retrieve` lists it (oxenss `process_retrieve`): every field,
+/// every time, and `data` base64-encoded, as it is for a json request.  A real expiry by default:
+/// a link request takes it as its deadline, and a group is in view only until it.
+inline nlohmann::json retrieved_message(
+        std::span<const std::byte> data,
+        std::string_view hash,
+        sys_ms timestamp = clock_now_ms(),
+        sys_ms expiration = clock_now_ms() + std::chrono::minutes{10}) {
+    return {{"hash", hash},
+            {"timestamp", epoch_ms(timestamp)},
+            {"expiration", epoch_ms(expiration)},
+            {"data", oxenc::to_base64(to_string_view(data))}};
+}
+
+/// The body of a `retrieve` answer, as the server sends it: always both fields.
+inline nlohmann::json retrieved_body(
+        nlohmann::json messages = nlohmann::json::array(), bool more = false) {
+    return {{"messages", std::move(messages)}, {"more", more}};
+}
+
 /// A minimal in-process mock of network::Network for unit tests.
 /// Tests can set `current_node` to control which node get_swarm returns, and inspect
 /// `sent_requests` to observe outgoing requests and fire their callbacks.
