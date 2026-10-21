@@ -472,6 +472,11 @@ class Devices final : detail::CoreComponent {
     // network they wait for one.
     void _dissolve(std::span<const device::GroupId> groups, std::vector<std::string> obsolete = {});
 
+    // What `_dissolve` commits, inside the caller's transaction and sending nothing: also how a
+    // sole member leaving dissolves its own group.
+    void _queue_dissolution(
+            std::span<const device::GroupId> groups, std::vector<std::string> obsolete);
+
     // Dissolves every group in the swarm but `kept`, which the user has chosen: by starting it, or
     // by completing a join to it.
     void _dissolve_all_but(const device::GroupId& kept);
@@ -784,13 +789,14 @@ class Devices final : detail::CoreComponent {
     // leave, then `request_link` to it.  See "Leaving a group".
     //
     // A member in good standing tells its group: a departure is pushed to the other members, so
-    // that they stop encrypting to it and move to an account key it does not hold, or the group's
-    // messages are deleted if it had no other.  That push is stored, complete, in the same commit
-    // that forgets the group, and kept until the swarm confirms it: attempted at once, and again
-    // after every fetch while the application runs, across restarts too.  Not reported on.  An
-    // application clearing its data wipes the database with it, and so gets whatever the first
-    // attempt achieved.  A device removed, displaced, dropped or dissolved has nothing it may say
-    // to its group, and only forgets it.
+    // that they stop encrypting to it and move to an account key it does not hold; or, if it had no
+    // other, the group is dissolved -- its messages deleted and a tombstone published, so that the
+    // devices of any other group on the account stop seeing it as a fork.  That push is stored,
+    // complete, in the same commit that forgets the group, and kept until the swarm confirms it:
+    // attempted at once, and again after every fetch while the application runs, across restarts
+    // too.  Not reported on.  An application clearing its data wipes the database with it, and so
+    // gets whatever the first attempt achieved.  A device removed, displaced, dropped or dissolved
+    // has nothing it may say to its group, and only forgets it.
     //
     // Leaving, the device takes a new device id and new device keys: the group it left holds the
     // old id as departed, and the new one can ask to join any group, that one included, as a new
@@ -910,13 +916,13 @@ class Devices final : detail::CoreComponent {
     // new identity: none of them can admit it to anything after that.
     void _forget_own_requests();
 
-    // What `leave_group` does once on the loop: a departure (or the group's deletion) queued only
-    // by a member in good standing, in the same commit as `_forget_identity`.  False with no group
-    // to leave.
+    // What `leave_group` does once on the loop: a departure (or the group's dissolution) queued
+    // only by a member in good standing, in the same commit as `_forget_identity`.  False with no
+    // group to leave.
     bool _leave_group();
 
-    // Queues our departure from the group `devs` holds, or the deletion of its messages if no one
-    // else is in it, inside the caller's transaction.
+    // Queues our departure from the group `devs` holds, or its dissolution if no one else is in it,
+    // inside the caller's transaction.
     void _queue_departure(device::map& devs);
 
     bool _confirm_link();

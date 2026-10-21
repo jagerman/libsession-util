@@ -3195,7 +3195,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - a device leaving a group of its own deletes it",
+        "Devices - a device leaving a group of its own dissolves it",
         "[core][devices][membership][leave]") {
     TempCore c;
     TestHelper::deliver_device_message(
@@ -3204,11 +3204,13 @@ TEST_CASE(
 
     REQUIRE(c->devices.leave_group(await));
 
-    // Nobody was left in it, so it is deleted rather than told anything, and is no group to see.
+    // Nobody was left in it to tell, so it is dissolved: deleted, with a tombstone in its place for
+    // any other group's devices, and no group to see.
     auto sent = pushes(*net);
     REQUIRE(sent.size() == 1);
     auto [stored, deleted] = pushed(*sent[0]);
-    CHECK(stored.empty());
+    REQUIRE_FALSE(stored.empty());
+    CHECK(oxenc::bt_dict_consumer{stored}.require<std::string_view>("") == "T");
     CHECK(deleted == nlohmann::json::array({"B1"}));
     CHECK(c->devices.membership(await).others.empty());
 }
@@ -4979,6 +4981,50 @@ TEST_CASE(
         CHECK(l.applicant->devices.membership(await).others.size() == 2);
         CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
     }
+}
+
+TEST_CASE(
+        "Devices - a sole member leaving for another group dissolves its own",
+        "[core][devices][dissolve][leave]") {
+    // The core alone in its group, the applicant alone in another; each sees the other's.
+    Linking l;
+    TestHelper::start_device_group(*l.applicant);
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "A1");
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "B1");
+    REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Forked);
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
+    auto old_id = Linking::id_of(l.core);
+
+    // Its user chooses the other group: leave, then ask to join it.
+    auto* net = attach_mock_network(*l.core);
+    REQUIRE(l.core->devices.leave_group(await));
+    auto tombstone = latest_tombstone(*net);
+    REQUIRE(oxenc::bt_dict_consumer{tombstone}.require<std::string_view>("") == "T");
+
+    auto req = TestHelper::build_link_request(*l.core, *l.applicant);
+    TestHelper::deliver_device_message(*l.applicant, req.message, in(10min), "L1");
+    REQUIRE(l.applicant->devices.accept_request(l.applicant_events.added.at(0).id, await));
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "B2");
+    REQUIRE(l.core->devices.confirm_link(await));
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::InGroup);
+
+    // The group left behind is no fork any more, without its user having to say so.
+    l.applicant_events.membership.clear();
+    TestHelper::deliver_device_message(*l.applicant, tombstone, in(10min), "T1");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+    CHECK(l.applicant->devices.membership(await).others.empty());
+    CHECK(l.applicant_events.membership == std::vector{device::Membership::InGroup});
+
+    // And the identity it left under is in nobody's list.
+    CHECK_FALSE(l.applicant->devices.devices(true, true, true).contains(old_id));
+    CHECK_FALSE(l.core->devices.devices(true, true, true).contains(old_id));
+
+    // Its own tombstone, read back, only reminds it the old group is gone.
+    TestHelper::deliver_device_message(*l.core, tombstone, in(10min), "T1");
+    CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
 }
 
 TEST_CASE(

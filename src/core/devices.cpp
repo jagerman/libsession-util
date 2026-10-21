@@ -1793,25 +1793,24 @@ void Devices::_queue_departure(device::map& devs) {
     for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
         messages.push_back(std::move(hash));
 
-    // A departure for the members left, so they stop encrypting to us and rotate to a key we do
-    // not hold, pushed as an ordinary group message: so it replaces the group's messages as any
-    // push does.  With nobody left, the messages are only deleted: nothing could read them, and
-    // devices elsewhere would go on seeing a group nobody is in.
-    std::optional<std::vector<std::byte>> departure;
-    if (others) {
-        auto& self = devs.at(self_id);
-        self.state = device::State::Left;
-        self.kicked = clock_now_s();
-        departure = encrypt_device_data(devs);
-    } else {
-        // Nobody left in it, so not a group to see in the swarm, beside one joined next.
-        auto ours = std::span<const std::byte>{_group_id()->value};
-        c.prepared_exec("DELETE FROM device_groups WHERE group_id = ?", ours);
-        c.prepared_exec("DELETE FROM device_group_messages WHERE group_id = ?", ours);
+    // With nobody left the group is dissolved rather than departed: its messages deleted, and a
+    // tombstone naming it.  Deleting alone would leave the devices of any other group on the
+    // account, which cannot see a deletion, holding it as a fork in view until it lapsed -- and a
+    // stale copy of it coming back is then dissolved again by whatever group we join next.
+    if (!others) {
+        auto ours = *_group_id();
+        _queue_dissolution(std::span{&ours, 1}, std::move(messages));
+        return;
     }
 
-    // Complete in itself, so nothing about sending it needs the group about to be forgotten.
-    _queue_push(std::move(departure), std::move(messages));
+    // A departure for the members left, so they stop encrypting to us and rotate to a key we do
+    // not hold, pushed as an ordinary group message: so it replaces the group's messages as any
+    // push does.  Complete in itself, so nothing about sending it needs the group about to be
+    // forgotten.
+    auto& self = devs.at(self_id);
+    self.state = device::State::Left;
+    self.kicked = clock_now_s();
+    _queue_push(encrypt_device_data(devs), std::move(messages));
 }
 
 bool Devices::_record_group(const SwarmMessage& msg) {
@@ -1925,25 +1924,35 @@ std::vector<std::byte> Devices::_build_dissolution(
 void Devices::_dissolve(
         std::span<const device::GroupId> groups, std::vector<std::string> obsolete) {
     assert(on_loop());
-    auto t = clock_now_ms();
     {
         auto c = conn();
         SQLite::Transaction tx{c.sql};
-        for (const auto& group : groups) {
-            for (auto hash : c.prepared_results<std::string>(
-                         "SELECT hash FROM device_group_messages WHERE group_id = ?",
-                         std::span<const std::byte>{group.value}))
-                obsolete.push_back(std::move(hash));
-            _mark_dissolved(group, t);
-        }
-
-        // Never renewed, and never among what a group push deletes: it is there to tell the
-        // dissolved group's devices that are online now, and lapses with the messages it replaced.
-        _queue_push(_build_dissolution(groups, t), std::move(obsolete));
+        _queue_dissolution(groups, std::move(obsolete));
         tx.commit();
     }
     log::info(cat, "Dissolved {} other device group(s)", groups.size());
     _send_pending_pushes();
+}
+
+void Devices::_queue_dissolution(
+        std::span<const device::GroupId> groups, std::vector<std::string> obsolete) {
+    auto t = clock_now_ms();
+    auto c = conn();
+    for (const auto& group : groups) {
+        for (auto hash : c.prepared_results<std::string>(
+                     "SELECT hash FROM device_group_messages WHERE group_id = ?",
+                     std::span<const std::byte>{group.value}))
+            obsolete.push_back(std::move(hash));
+        _mark_dissolved(group, t);
+    }
+    // A hash can be both one the caller had and one of the group's we saw.
+    std::ranges::sort(obsolete);
+    auto [dup, end] = std::ranges::unique(obsolete);
+    obsolete.erase(dup, end);
+
+    // Never renewed, and never among what a group push deletes: it is there to tell the dissolved
+    // group's devices that are online now, and lapses with the messages it replaced.
+    _queue_push(_build_dissolution(groups, t), std::move(obsolete));
 }
 
 void Devices::_dissolve_all_but(const device::GroupId& kept) {

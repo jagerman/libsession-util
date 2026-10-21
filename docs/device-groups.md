@@ -345,7 +345,9 @@ was its user's.
   has it; it is not reported on. On logout or clearing data the app then wipes the database, and
   the departure with it, so it gets whatever that first attempt achieved: call `leave_group` while
   the network is still up, and give it a moment before wiping if you can.
-- **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join.
+- **From `Forked`, when the user chooses the other group** (see "Forks"): leave, then join. A
+  device that was its group's only member dissolves the group as it leaves, so the other group's
+  devices stop showing a fork without anyone there having to choose.
 
 A device that was removed, displaced, dropped or dissolved just forgets the group; it has nothing it
 may tell it. Leaving gives the device a new identity, as joining the group again would need anyway:

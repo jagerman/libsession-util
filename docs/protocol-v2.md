@@ -874,6 +874,9 @@ can do, and publishing a **tombstone** naming it, so that the group's devices le
 fetch.  It is resolution rather than permission: anyone with the seed could delete the messages
 without saying so.
 
+A group's sole member leaving it dissolves it too, with a tombstone like any other (see "Leaving a
+group"): a group nobody is in is one no device of another group should go on counting as a fork.
+
 The tombstone is a bt-encoded dict in namespace 21:
 
     {
@@ -948,8 +951,15 @@ device now holds its ID, and a dropped device's would bring back a group gone fr
 come from a device that may have been displaced; a device removed, displaced, dropped or dissolved
 only forgets its group.  A member in good standing leaving its group:
 
-- If it was the group's only member, deletes the group's messages from the swarm.  No device is left
-  to read them, and other devices would otherwise go on seeing a group that nobody is in.
+- If it was the group's only member, dissolves the group (see "Dissolving a group"): deletes its
+  messages from the swarm and publishes a tombstone naming it, and remembers it as dissolved.  No
+  device is left to read the messages, and deleting them alone is not enough: a deletion is
+  invisible, so the devices of any other group on the account would go on seeing this one as a fork
+  until it lapsed, 30 days on, and none of them would dissolve it once the leaving device had joined
+  their group, since it no longer knows of the group to dissolve.  Remembering it means a stale copy
+  turning up later is dissolved again, by this device as a member of whatever group it joins next.
+  The tombstone is harmless to the device itself: by the time it could read it back, it has
+  forgotten the group, and only remembers the group as dissolved.
 - Otherwise pushes one last update to the group with a departure tombstone for itself, so that the
   remaining members stop encrypting to it.  Being a departure rather than a removal, it does not
   appear in the `kicked` list.
