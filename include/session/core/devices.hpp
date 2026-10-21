@@ -405,10 +405,18 @@ class Devices final : detail::CoreComponent {
     // could be an application-chosen interval away, or never while the network is down.
     quic::TimerID _expiry_timer;
 
-    // Fetches the group when a key rotation falls due, so that a device whose swarm is quiet -- one
-    // subscribed for pushes, which stops polling -- still rotates on time.  The rotation itself is
-    // the fetch's to make, as after any other (see `_rotate_due_keys`).
-    quic::TimerID _rotation_timer;
+    // Fetches the group on our own account: when a key rotation falls due, and when a push that
+    // failed is due another try.  A device subscribed for pushes stops polling, so without this a
+    // quiet swarm would never prompt the fetch either one waits on.  What follows is the fetch's to
+    // do, as after any other: rotating (see `_rotate_due_keys`), and pushing what is owed.
+    quic::TimerID _fetch_timer;
+
+    // When a push that was not stored is next to be tried, by a fetch of our own; unset while
+    // nothing failed, and from the moment a fetch completes, since what follows it is that try.
+    std::optional<sys_ms> _push_retry_at;
+    // How long the next failure waits: `PUSH_RETRY_FIRST`, doubling to `PUSH_RETRY_MAX`, and back
+    // to the first on any push the swarm confirms.
+    std::chrono::milliseconds _push_backoff = PUSH_RETRY_FIRST;
 
     // Lapses our own request if its deadline has passed, reports what changed through
     // `callbacks::devices`, and re-arms the expiry timer.  Run once a fetch has been merged and at
@@ -934,8 +942,16 @@ class Devices final : detail::CoreComponent {
     // standing; the push that follows a fetch then carries both.
     void _rotate_due_keys();
 
-    // Points the rotation timer at the earlier of the two next rotations, or stops it.
-    void _arm_rotation();
+    // Points the fetch timer at the earliest of the two next rotations and a push retry, or stops
+    // it.
+    void _arm_fetch_timer();
+
+    // A push the swarm did not store: schedules the fetch that tries it again, unless one is
+    // already scheduled, and lengthens the wait for the next failure.
+    void _push_failed();
+
+    // A push the swarm confirmed: the next failure waits only `PUSH_RETRY_FIRST` again.
+    void _push_stored();
 
     // Fetches the group now if a change of ours owes a push, so that the push following the fetch
     // carries it: a device subscribed for pushes does not poll, and could otherwise hold the change
@@ -1064,6 +1080,13 @@ class Devices final : detail::CoreComponent {
     // -- out of reach of every honest message until our own clock caught up.  Ten minutes is far
     // more than clocks kept in sync disagree by, and caps what a bad time can hold back to that.
     static constexpr auto GROUP_MESSAGE_MAX_AHEAD = 10min;
+
+    // How long a device group push the swarm did not store waits before a fetch of our own tries it
+    // again: the first, doubling with each failure in a row up to the most.  The first is about as
+    // long as a failed store has already taken to time out; the most keeps a device whose swarm is
+    // unreachable for a while to one try every five minutes.
+    static constexpr std::chrono::milliseconds PUSH_RETRY_FIRST = 10s;
+    static constexpr std::chrono::milliseconds PUSH_RETRY_MAX = 5min;
 
     // Rotates the shared account keys used for PFS+PQ message encryption.  Generates a new random
     // seed, stores it in the database, and marks the previous active key as rotated.  Done by Core

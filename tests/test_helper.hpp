@@ -786,13 +786,18 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         on_loop(core, [&] { core.devices.parse_device_messages({}, true); });
     }
 
-    // Whether the rotation timer will fire by itself, and firing it now: what it does once its
+    // Whether the fetch timer will fire by itself, and firing it now: what it does once its
     // interval is up, without waiting that out in real time.
-    static bool rotation_timer_armed(core::Core& core) {
-        return on_loop(core, [&] { return core.devices.jq().armed(core.devices._rotation_timer); });
+    static bool fetch_timer_armed(core::Core& core) {
+        return on_loop(core, [&] { return core.devices.jq().armed(core.devices._fetch_timer); });
     }
-    static void fire_rotation_timer(core::Core& core) {
-        on_loop(core, [&] { core.devices.jq().wake(core.devices._rotation_timer); });
+    static void fire_fetch_timer(core::Core& core) {
+        on_loop(core, [&] { core.devices.jq().wake(core.devices._fetch_timer); });
+    }
+
+    // When a push that was not stored is next to be tried; unset with none pending a retry.
+    static std::optional<sys_ms> push_retry_due(core::Core& core) {
+        return on_loop(core, [&] { return core.devices._push_retry_at; });
     }
 
     // Core's one-off fetch of `namespaces`, as Devices asks for one.

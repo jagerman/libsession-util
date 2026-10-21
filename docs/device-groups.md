@@ -230,6 +230,12 @@ which:
 A device that was removed before this one joined appears as a bare tombstone with nothing to show
 for it (an empty description). Leave those out of the list.
 
+Draw **this** device's own entry from `device_info()`, never from its row in `devices()`.
+`devices()` mirrors what the group holds in the swarm, so this device's row there lags until a push
+carrying its latest description has been confirmed; on a new account it is a blank record until
+the first push lands, and stays blank for as long as that push keeps failing. `device_info()` is
+what this device publishes, and is right at once.
+
 A `Dissolved` device's list is empty by design: it has forgotten the group it was in. Show it as
 "not in a device group", not as "no devices yet".
 

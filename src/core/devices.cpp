@@ -106,8 +106,8 @@ static constexpr auto device_rotation_key = "devices_device_rotation_at"sv;
 // early, in unix milliseconds; see `_early_account_rotation`.
 static constexpr auto early_rotation_key = "devices_account_rotation_early_at"sv;
 
-// How long the rotation timer waits to try again after its fetch failed.
-static constexpr auto ROTATION_RETRY = 1min;
+// How long the fetch timer waits to try again after its fetch failed.
+static constexpr auto FETCH_RETRY = 1min;
 
 void Devices::init() {
     if (core.globals.get_blob_to(dev_key, self_id))
@@ -124,17 +124,17 @@ void Devices::init() {
     establish_group();
 
     _expiry_timer = jq().add_wakeable([this] { _flush_events(); });
-    _rotation_timer = jq().add_wakeable([this] {
-        jq().stop(_rotation_timer);
+    _fetch_timer = jq().add_wakeable([this] {
+        jq().stop(_fetch_timer);
         if (!core.network())
             return;
         // A successful fetch re-arms the timer from what it then finds due; a failed one tries
-        // again shortly rather than at once, which with the rotation still overdue would spin.
+        // again shortly rather than at once, which with a rotation still overdue would spin.
         core._fetch(
                 {config::Namespace::Devices},
                 [this, alive = std::weak_ptr<int>{_alive}](bool fetched) {
                     if (!alive.expired() && !fetched)
-                        jq().repeat(_rotation_timer, ROTATION_RETRY);
+                        jq().repeat(_fetch_timer, FETCH_RETRY);
                 });
     });
 
@@ -2066,8 +2066,10 @@ void Devices::_send_pending_pushes() {
                     _pending_in_flight.erase(row);
                     if (!results || (storing && (results->empty() || !results->front().stored))) {
                         log::warning(cat, "A pending device group push was not stored; will retry");
+                        _push_failed();
                         return;
                     }
+                    _push_stored();
                     conn().prepared_exec("DELETE FROM device_pending_pushes WHERE id = ?", row);
                 });
     }
@@ -3536,7 +3538,10 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     // Rotated here, after the fetch, and not before it: what waited for us in the swarm was
     // encrypted to the keys we had, and a device back from a long absence rotates once, now.
     _rotate_due_keys();
-    _arm_rotation();
+
+    // This fetch is the retry of any push that failed, made just below.
+    _push_retry_at.reset();
+    _arm_fetch_timer();
 
     // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
     // on top of everything this fetch merged.  A local change made between fetches waits for the
@@ -3691,10 +3696,12 @@ void Devices::push_device_group() {
                 _push_in_flight = false;
 
                 if (!results || results->empty() || !results->front().stored) {
-                    log::warning(cat, "Device group push was not stored; leaving it owed");
+                    log::warning(cat, "Device group push was not stored; will retry");
+                    _push_failed();
                     return;
                 }
 
+                _push_stored();
                 mark_device_group_pushed(push, std::move(results->front().hash));
             });
 }
@@ -3803,16 +3810,36 @@ void Devices::_push_soon() {
         core._fetch({config::Namespace::Devices}, nullptr);
 }
 
-void Devices::_arm_rotation() {
-    auto account = next_account_rotation();
-    auto device = next_device_rotation();
-    if (!account && !device) {
-        jq().stop(_rotation_timer);
+void Devices::_arm_fetch_timer() {
+    std::optional<std::chrono::system_clock::time_point> next;
+    auto consider = [&next](std::optional<std::chrono::system_clock::time_point> t) {
+        if (t && (!next || *t < *next))
+            next = t;
+    };
+    consider(next_account_rotation());
+    consider(next_device_rotation());
+    consider(_push_retry_at);
+    if (!next) {
+        jq().stop(_fetch_timer);
         return;
     }
-    auto next = account && device ? std::min(*account, *device) : account ? *account : *device;
-    auto delay = std::chrono::ceil<std::chrono::microseconds>(next - clock_now());
-    jq().repeat(_rotation_timer, std::max<std::chrono::microseconds>(delay, 1ms));
+    auto delay = std::chrono::ceil<std::chrono::microseconds>(*next - clock_now());
+    jq().repeat(_fetch_timer, std::max<std::chrono::microseconds>(delay, 1ms));
+}
+
+void Devices::_push_failed() {
+    // A device subscribed for pushes has stopped polling, so nothing else would fetch again -- and
+    // a push goes out only after a fetch -- until another device happened to push, or the
+    // application restarted: what failed would stay owed for as long as that took.
+    if (!_push_retry_at) {
+        _push_retry_at = clock_now_ms() + _push_backoff;
+        _push_backoff = std::min(_push_backoff * 2, PUSH_RETRY_MAX);
+    }
+    _arm_fetch_timer();
+}
+
+void Devices::_push_stored() {
+    _push_backoff = PUSH_RETRY_FIRST;
 }
 
 Devices::DeviceGroupPush Devices::build_device_group_message() {

@@ -5357,8 +5357,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "Devices - the rotation timer tries again when its fetch fails",
-        "[core][devices][rotation]") {
+        "Devices - the fetch timer tries again when its fetch fails", "[core][devices][rotation]") {
     Linking l;
     auto* net = attach_mock_network(*l.core);
     TestHelper::finish_fetch(*l.core);
@@ -5380,15 +5379,89 @@ TEST_CASE(
     REQUIRE(answer_fetch(l.core, *net, {}, false) == 1);
     CHECK(account_key(l.core) == account);
     CHECK(device_key(l.core) == device);
-    CHECK(TestHelper::rotation_timer_armed(*l.core));
+    CHECK(TestHelper::fetch_timer_armed(*l.core));
     CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
 
     // Its retry, fired now rather than waited for, fetches again, and rotates after that fetch.
-    TestHelper::fire_rotation_timer(*l.core);
+    TestHelper::fire_fetch_timer(*l.core);
     REQUIRE(eventually(
             *l.core, [&] { return std::ranges::any_of(net->sent_requests, is_device_fetch); }));
     REQUIRE(answer_fetch(l.core, *net) == 1);
     CHECK((account_key(l.core) != account || device_key(l.core) != device));
+}
+
+namespace {
+// When a push that failed will be tried again, from now; zero for none.
+std::chrono::milliseconds retry_in(TempCore& c) {
+    auto due = TestHelper::push_retry_due(*c);
+    return due ? std::chrono::ceil<std::chrono::seconds>(*due - clock_now_ms()) : 0ms;
+}
+
+// Fires the fetch timer, as its interval running out would, and answers the fetch it makes with
+// nothing new: what follows is the push of whatever is owed.
+void retry_now(TempCore& c, MockNetwork& net) {
+    TestHelper::fire_fetch_timer(*c);
+    REQUIRE(eventually(
+            *c, [&] { return std::ranges::any_of(net.sent_requests, is_device_fetch); }));
+    REQUIRE(answer_fetch(c, net) == 1);
+    REQUIRE(pushes(net).size() == 1);
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a group push the swarm did not store is tried again by a fetch of our own",
+        "[core][devices][push]") {
+    // A new account, owing its group's first push -- and subscribed, as far as this goes: nothing
+    // polls, so nothing fetches unless something asks.
+    TempCore c;
+    auto* net = attach_mock_network(*c);
+    TestHelper::finish_fetch(*c);
+    REQUIRE(pushes(*net).size() == 1);
+
+    answer_upload(c, *net, false);
+    CHECK(retry_in(c) == Devices::PUSH_RETRY_FIRST);
+    CHECK(TestHelper::fetch_timer_armed(*c));
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+
+    // Failing again waits longer.
+    retry_now(c, *net);
+    answer_upload(c, *net, false);
+    CHECK(retry_in(c) == 2 * Devices::PUSH_RETRY_FIRST);
+
+    // Stored at last: nothing left to try again, and a later failure waits only the first again.
+    retry_now(c, *net);
+    answer_upload(c, *net, true);
+    CHECK_FALSE(TestHelper::push_retry_due(*c));
+    CHECK_FALSE(c->devices.needs_push().device_group);
+
+    device::Info renamed{};
+    renamed.description = "renamed";
+    c->devices.update_info(renamed, await);
+    REQUIRE(answer_fetch(c, *net) == 1);
+    answer_upload(c, *net, false);
+    CHECK(retry_in(c) == Devices::PUSH_RETRY_FIRST);
+}
+
+TEST_CASE(
+        "Devices - a departure the swarm did not store is tried again by a fetch of our own",
+        "[core][devices][push][leave]") {
+    Linking l;
+    l.admit();
+    auto* net = attach_mock_network(*l.core);
+    REQUIRE(l.core->devices.leave_group(await));
+    REQUIRE(pushes(*net).size() == 1);
+    auto departure = pushed(*pushes(*net).front()).first;
+
+    answer_upload(l.core, *net, false);
+    CHECK(retry_in(l.core) == Devices::PUSH_RETRY_FIRST);
+    CHECK(TestHelper::fetch_timer_armed(*l.core));
+
+    // The same departure, kept as it was queued, and gone once the swarm has it.
+    retry_now(l.core, *net);
+    CHECK(pushed(*pushes(*net).front()).first == departure);
+    answer_upload(l.core, *net, true);
+    CHECK_FALSE(TestHelper::push_retry_due(*l.core));
+    CHECK(pending_pushes(l.core) == 0);
 }
 
 TEST_CASE(
