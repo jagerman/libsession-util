@@ -200,6 +200,50 @@ TEST_CASE(
     }
 }
 
+TEST_CASE("Poll: a cursor entry keeps the expiry whichever answer gave one", "[core][poll]") {
+    TempCore c;
+    auto* mock_net = attach_mock_network(*c);
+    network::service_node node;
+    node.remote_pubkey[0] = std::byte{0xAA};
+    mock_net->current_node = node;
+
+    // One poll, answered with `hash` and that expiry -- or none, as a node that does not say.
+    auto poll_answering = [&](const std::string& hash, std::optional<sys_ms> expiration) {
+        mock_net->sent_requests.clear();
+        TestHelper::poll(*c);
+        REQUIRE(mock_net->sent_requests.size() == 1);
+        auto& req = mock_net->sent_requests[0];
+        auto response = make_response(*req.request.body, 21, {std::byte{0x01}}, hash);
+        for (auto& result : response["results"])
+            for (auto& msg : result["body"]["messages"]) {
+                if (expiration)
+                    msg["expiration"] = epoch_ms(*expiration);
+                else
+                    msg.erase("expiration");
+            }
+        req.callback(true, false, 200, {}, response.dump());
+        TestHelper::drain(*c);
+    };
+    auto expiry_of = [&](std::string_view hash) {
+        return TestHelper::swarm_hash_expiry(*c, 21, node.remote_pubkey, hash);
+    };
+    auto later = clock_now_ms() + std::chrono::hours{1};
+
+    SECTION("one first seen without an expiry learns it") {
+        poll_answering("h1", std::nullopt);
+        REQUIRE_FALSE(expiry_of("h1"));
+        poll_answering("h1", later);
+        CHECK(expiry_of("h1") == epoch_ms(later));
+    }
+
+    SECTION("a known one survives an answer without one") {
+        poll_answering("h1", later);
+        REQUIRE(expiry_of("h1") == epoch_ms(later));
+        poll_answering("h1", std::nullopt);
+        CHECK(expiry_of("h1") == epoch_ms(later));
+    }
+}
+
 TEST_CASE("Poll: the sync cursor advances only after the batch is handled", "[core][poll]") {
     // Attached below, once there is a Core to own it; the callback that reads it does not run
     // until then either.

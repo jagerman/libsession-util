@@ -628,6 +628,23 @@ SELECT h.hash FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
                 epoch_ms(clock_now_ms()));
     }
 
+    // When the cursor entry for `hash` from this namespace+node lapses, in epoch ms; nullopt where
+    // the node never said.  Throws if there is no such entry.
+    static std::optional<int64_t> swarm_hash_expiry(
+            core::Core& core,
+            int16_t ns,
+            const network::ed25519_pubkey& sn_pubkey,
+            std::string_view hash) {
+        return core.db.conn().prepared_get<std::optional<int64_t>>(
+                R"(
+SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
+ WHERE h.namespace = ? AND n.pubkey = ? AND h.hash = ?
+)",
+                ns,
+                sn_pubkey,
+                hash);
+    }
+
     // Device group payload encryption/decryption, which are private to Devices, for tests that need
     // to build a group message with contents of their choosing.
     static std::vector<std::byte> encrypt_device_data(

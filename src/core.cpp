@@ -935,13 +935,17 @@ void Core::_record_swarm_cursor(
     auto node_id =
             conn.prepared_get<int64_t>("SELECT id FROM swarm_nodes WHERE pubkey = ?", node_pubkey);
 
+    // The later of the two expiries, or whichever one exists: SQLite's multi-argument max() is NULL
+    // if any argument is, which alone would keep an unknown (NULL) expiry unknown for good, and let
+    // an answer without one erase what an earlier answer said.
     for (const auto& m : messages) {
         if (m.hash.empty())
             continue;
         conn.prepared_exec(
                 R"(
 INSERT INTO swarm_hashes (namespace, node, hash, expiry) VALUES (?, ?, ?, ?)
-ON CONFLICT(namespace, node, hash) DO UPDATE SET expiry = max(expiry, excluded.expiry)
+ON CONFLICT(namespace, node, hash) DO UPDATE
+   SET expiry = coalesce(max(expiry, excluded.expiry), excluded.expiry, expiry)
 )",
                 ns_val,
                 node_id,
