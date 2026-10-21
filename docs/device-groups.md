@@ -106,7 +106,7 @@ the table below is `request_link(others.front().id)`, or a choice among them if 
 | `Approved` | Another device approved the request; the user has to confirm the emoji. | The confirmation, brought up wherever the user is (see "Joining"). |
 | `Removed` | Another device removed this one. | An alert: "This device was removed from your account's device group." Then the same choices as `DeviceGroupVisible`: link this device again, to the group it was removed from (in `others`), or start a group. Either call gives the device a new identity first; there is nothing else to do. Starting a group from here dissolves the group in view: the very group this device was removed from. |
 | `Forked` | In its group, which is fine and goes on working, while another group is in the swarm: the account has forked. | A prominent prompt that does not go away by itself: keep this group, or use the other. See "Forks". |
-| `Displaced` | Another device now holds this device's place in its group, under this device's identity -- or someone with the recovery phrase has made it look that way. | A critical alert (see "Forks and alerts"), shown so it cannot be missed; once dismissed it stays as a warning the user can reopen. Offer to link this device again, to the group in `others` (the one it was displaced from), which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
+| `Displaced` | Another device now holds this device's place in its group, under this device's identity -- or someone with the recovery phrase has made it look that way. | A critical alert (see "Forks and alerts"), shown so it cannot be missed; once dismissed it stays as a warning the user can reopen. It arrives with the first unreadable message written more than `DISPLACEMENT_GRACE` (5 minutes) after the last one this device could read. Offer to link this device again, to the group in `others` (the one it was displaced from), which gives it a new identity as part of asking. Starting a group from here dissolves the group in view. |
 | `Dropped` | No longer in a device group: its group has gone from the swarm while another group is there, or has moved on to keys it doesn't hold without saying why. It was removed, replaced, or away too long, and cannot tell which. | "This device is no longer in your account's device group. It may have been removed or replaced, or been away too long." Offer "link this device again" as the default, to the group in `others` -- the one it was in, if that is still in the swarm, or else the one that took its place -- which gives it a new identity; "start a new group" less prominently, with the dissolve warning (see "Starting a group"): it dissolves the group in view. |
 | `Dissolved` | The user, on another of their devices, kept a different group over this device's. This device has already forgotten its old group and taken a new identity. | "Your devices now use a different device group; link this device to it." Offer to join (see "Joining"), as from `DeviceGroupVisible`. |
 
@@ -288,7 +288,12 @@ a device that started a group of its own by mistake months ago ("two months ago"
   it as a warning somewhere in the UI that the user can reopen at any time. The device is not
   read-only meanwhile: it can still send. The group has
   moved on to keys this device doesn't hold, under this device's own identity -- or a message from
-  the group says so, and anyone with the recovery phrase can write one. So there are three ways
+  the group says so, and anyone with the recovery phrase can write one. An unreadable message
+  counts only if it was written more than `Devices::DISPLACEMENT_GRACE` (5 minutes) after the
+  newest message this device could read: a member may push a snapshot built before it fetched a
+  new device's admission, which would otherwise look like displacement for no reason but timing.
+  So the alert arrives with the first unreadable message past that window, not the first
+  unreadable message. So there are three ways
   here: the user restored this device elsewhere and approved the copy as a replacement; someone
   with a copy of this device's data has taken its place; or someone with the recovery phrase has
   made the group's devices believe they were displaced. Say so: "Another device has taken this
