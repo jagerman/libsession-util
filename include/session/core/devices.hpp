@@ -330,7 +330,7 @@ namespace device {
         Dropped,
     };
 
-    /// A device group in the swarm other than this device's own.
+    /// A device group in the swarm that this device could ask to join.
     struct VisibleGroup {
         GroupId id;
         std::chrono::sys_seconds last_seen;  ///< When its newest message was written, by the
@@ -340,8 +340,13 @@ namespace device {
 
     struct MembershipState {
         Membership membership;
-        std::optional<GroupId> group;      ///< This device's group, while it is in one.
-        std::vector<VisibleGroup> others;  ///< Every other group in the swarm, newest first.
+        /// This device's group, while it is a member in good standing: `InGroup` or `Forked`.
+        std::optional<GroupId> group;
+        /// Every group in the swarm this device could ask to join, newest first: every one but
+        /// `group`.  For a device `Removed`, `Displaced` or `Dropped`, that includes the group it
+        /// was in, while that group is still in the swarm, since asking under a new identity is
+        /// the way back into it.
+        std::vector<VisibleGroup> others;
     };
 
     struct decryption_failed : std::runtime_error {
@@ -738,10 +743,10 @@ class Devices final : detail::CoreComponent {
     void remove_device(device::Id id, result_function<bool> cb);
     bool remove_device(std::span<const std::byte, device::ID_SIZE> id, await_t);
 
-    // Where this device stands, and which other groups are in the swarm.  What an application
-    // prompts from at startup and draws its device screen from; read again on `membership_changed`.
-    // `Unknown` until the first fetch of this run completes, since the swarm may have changed while
-    // it was down.
+    // Where this device stands, and which groups in the swarm it could ask to join.  What an
+    // application prompts from at startup and draws its device screen from; read again on
+    // `membership_changed`.  `Unknown` until the first fetch of this run completes, since the swarm
+    // may have changed while it was down.
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 

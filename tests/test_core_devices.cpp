@@ -3912,6 +3912,82 @@ TEST_CASE(
     }
 }
 
+// What a device out of its group sees of the groups it could ask to join, and that it can.
+void check_asks_back_into(TempCore& c, const device::GroupId& group) {
+    auto state = c->devices.membership(await);
+    CHECK_FALSE(state.group);
+    REQUIRE(state.others.size() == 1);
+    CHECK(state.others.front().id == group);
+
+    auto* net = attach_mock_network(*c);
+    Asked got;
+    request_link(c, state.others.front().id, got);
+    answer_upload(c, *net, true);
+    REQUIRE(got);
+    CHECK(got->has_value());
+    CHECK(c->devices.membership(await).membership == device::Membership::Requesting);
+}
+
+TEST_CASE(
+        "Devices - a device out of its group still sees it, to ask its way back",
+        "[core][devices][membership]") {
+    Linking l;
+    l.admit();
+    auto group = *TestHelper::group_id(*l.core);
+    auto now = std::chrono::floor<std::chrono::seconds>(clock_now_s());
+    ScopedClockOffset later{0s};
+
+    // The group gone on without the applicant, carrying `removed`.
+    auto core_self = l.core->devices.device_info(await).first;
+    auto without = [&](std::vector<device::Info> removed) {
+        device::map m{{core_self.id, core_self}};
+        for (auto& r : removed)
+            m.emplace(r.id, r);
+        return TestHelper::encrypt_device_data(l.core->devices, m);
+    };
+    auto membership = [&] { return l.applicant->devices.membership(await).membership; };
+
+    SECTION("removed") {
+        auto ours = tombstone(device::State::Kicked, now);
+        ours.id = l.applicant_id();
+        TestHelper::deliver_device_message(*l.applicant, without({ours}), in(10min), "G2");
+        REQUIRE(membership() == device::Membership::Removed);
+    }
+    SECTION("displaced") {
+        later.advance(Devices::DISPLACEMENT_GRACE + 1min);
+        TestHelper::deliver_device_message(*l.applicant, without({}), in(10min), "G2");
+        REQUIRE(membership() == device::Membership::Displaced);
+    }
+    SECTION("dropped, by a message that cannot say why") {
+        later.advance(Devices::DISPLACEMENT_GRACE + 1min);
+        TestHelper::deliver_device_message(
+                *l.applicant, without({tombstone(device::State::Kicked, now)}), in(10min), "G2");
+        REQUIRE(membership() == device::Membership::Dropped);
+    }
+
+    check_asks_back_into(l.applicant, group);
+}
+
+TEST_CASE(
+        "Devices - a device whose group is gone beside another sees the other, to ask to join",
+        "[core][devices][membership]") {
+    Linking l;
+    TestHelper::start_device_group(*l.applicant);
+    auto theirs = *TestHelper::group_id(*l.applicant);
+    TestHelper::deliver_device_message(
+            *l.core,
+            l.applicant->devices.build_device_group_message().message,
+            in(1min) + Devices::DEVICE_GROUP_TTL + 1h,
+            "B1");
+
+    ScopedClockOffset later{Devices::DEVICE_GROUP_TTL + 1h};
+    TestHelper::finish_fetch(*l.core);
+    REQUIRE(l.core->devices.membership(await).membership == device::Membership::Dropped);
+
+    // Its own group is not among them: nothing of it is left in the swarm to ask.
+    check_asks_back_into(l.core, theirs);
+}
+
 TEST_CASE("Devices - a removal announced by another group is ignored", "[core][devices][removal]") {
     Linking l;
     l.admit();

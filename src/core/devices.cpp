@@ -3060,23 +3060,25 @@ device::MembershipState Devices::membership(await_t) {
 device::MembershipState Devices::_membership() {
     assert(on_loop());
     device::MembershipState out{.membership = device::Membership::Unknown};
-    auto ours = _group_id();
     auto c = conn();
+
+    // A group this device was removed, displaced or dropped from is one it can ask to join again,
+    // under a new identity, so it is among the others; only a member in good standing has a group.
+    if (_member())
+        out.group = _group_id();
 
     for (auto [group, seen] :
          c.prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>, int64_t>(
                  "SELECT group_id, seen_at FROM device_groups"
                  " WHERE expires_at > ? ORDER BY seen_at DESC",
                  epoch_seconds(clock_now_s()))) {
-        if (device::GroupId id{group}; id != ours)
+        if (device::GroupId id{group}; id != out.group)
             out.others.push_back({id, from_epoch_s(seen)});
     }
 
     auto own = static_cast<device::State>(
             c.prepared_maybe_get<int>("SELECT state FROM devices WHERE unique_id = ?", self_id)
                     .value_or(static_cast<int>(device::State::Unregistered)));
-    if (own == device::State::Registered)
-        out.group = ours;
 
     if (!_fetched)
         return out;
