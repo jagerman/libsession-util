@@ -5465,6 +5465,36 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a change made while a group push is in flight follows it",
+        "[core][devices][push]") {
+    TempCore c;
+    auto* net = attach_mock_network(*c);
+    TestHelper::finish_fetch(*c);
+    REQUIRE(pushes(*net).size() == 1);
+
+    // Renamed while that is out: the fetch it asks for finds a push already in flight, and adds
+    // none of its own.
+    device::Info renamed{};
+    renamed.description = "renamed";
+    c->devices.update_info(renamed, await);
+    REQUIRE(answer_fetch(c, *net) == 1);
+    REQUIRE(pushes(*net).size() == 1);
+
+    // The first lands, carrying the old record; the rename is still owed, and asks for the fetch
+    // its push follows.
+    answer_upload(c, *net, true);
+    REQUIRE(c->devices.needs_push().device_group);
+    REQUIRE(eventually(
+            *c, [&] { return std::ranges::any_of(net->sent_requests, is_device_fetch); }));
+    REQUIRE(answer_fetch(c, *net) == 1);
+    REQUIRE(pushes(*net).size() == 1);
+    answer_upload(c, *net, true);
+
+    CHECK_FALSE(c->devices.needs_push().device_group);
+    CHECK(c->devices.devices(true, true, true).at(Linking::id_of(c)).description == "renamed");
+}
+
+TEST_CASE(
         "Devices - two fetches of the same namespace asked at once are one request",
         "[core][devices][fetch]") {
     TempCore c;

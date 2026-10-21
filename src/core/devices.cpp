@@ -3703,6 +3703,11 @@ void Devices::push_device_group() {
 
                 _push_stored();
                 mark_device_group_pushed(push, std::move(results->front().hash));
+
+                // A change made while this was in flight found it so and was not pushed; with this
+                // confirmed, nothing else owes it a fetch -- a subscribed device does not poll --
+                // so ask for the one its push follows.
+                _push_soon();
             });
 }
 
