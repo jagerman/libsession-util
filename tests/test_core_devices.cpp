@@ -4915,14 +4915,16 @@ TEST_CASE(
     CHECK_FALSE(l.core->devices.dissolve_group(theirs, await));
 
     // What is left is to start again -- its own doing, so not reported -- and to ask to join that.
-    // The other, Dissolved until it joins or starts a group, stays so on seeing the new one.
+    // The other, Dissolved until it joins or starts a group, stays so on seeing the new one, and is
+    // told of it: there is now a group to offer joining.
     auto mine = l.core->devices.start_device_group(await);
     CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
     CHECK(l.events.membership == std::vector{device::Membership::Dissolved});
     TestHelper::deliver_device_message(
             *other, l.core->devices.build_device_group_message().message, in(10min), "A2");
     CHECK(other->devices.membership(await).membership == device::Membership::Dissolved);
-    CHECK(other_events.membership == std::vector{device::Membership::Dissolved});
+    auto told = std::vector{device::Membership::Dissolved, device::Membership::Dissolved};
+    CHECK(other_events.membership == told);
     while (!pushes(*other_net).empty())
         answer_upload(other, *other_net, true);
     Asked got;
@@ -4931,7 +4933,52 @@ TEST_CASE(
     REQUIRE(got);
     REQUIRE(got->has_value());
     CHECK(other->devices.membership(await).membership == device::Membership::Requesting);
-    CHECK(other_events.membership == std::vector{device::Membership::Dissolved});
+    CHECK(other_events.membership == told);
+}
+
+TEST_CASE(
+        "Devices events - a change in the groups in view is a change of membership",
+        "[core][devices][events][membership]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.core);
+    TestHelper::finish_fetch(*l.applicant);
+    TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    TestHelper::start_device_group(*other);
+    auto theirs = *TestHelper::group_id(*other);
+    auto their_message = other->devices.build_device_group_message().message;
+
+    SECTION("dissolved before the kept group is in view, then seeing it") {
+        auto* other_net = attach_mock_network(*other);
+        TestHelper::deliver_device_message(
+                *other, l.core->devices.build_device_group_message().message, in(10min), "A1");
+        REQUIRE(other->devices.dissolve_group(*TestHelper::group_id(*l.core), await));
+        l.events.membership.clear();
+        TestHelper::deliver_device_message(*l.core, latest_tombstone(*other_net), in(10min), "T1");
+        REQUIRE(l.core->devices.membership(await).others.empty());
+        REQUIRE(l.events.membership == std::vector{device::Membership::Dissolved});
+
+        TestHelper::deliver_device_message(*l.core, their_message, in(10min), "B1");
+        CHECK(l.core->devices.membership(await).others.size() == 1);
+        CHECK(l.events.membership ==
+              std::vector{device::Membership::Dissolved, device::Membership::Dissolved});
+    }
+
+    SECTION("forked, until the other group lapses") {
+        TestHelper::deliver_device_message(*l.core, their_message, in(10min), "B1");
+        REQUIRE(l.events.membership.back() == device::Membership::Forked);
+        ScopedClockOffset later{11min};
+        TestHelper::finish_fetch(*l.core);
+        CHECK(l.events.membership.back() == device::Membership::InGroup);
+    }
+
+    SECTION("a second group beside the one in view") {
+        l.show_group();
+        REQUIRE(l.applicant_events.membership.back() == device::Membership::DeviceGroupVisible);
+        l.applicant_events.membership.clear();
+        TestHelper::deliver_device_message(*l.applicant, their_message, in(10min), "B1");
+        CHECK(l.applicant->devices.membership(await).others.size() == 2);
+        CHECK(l.applicant_events.membership == std::vector{device::Membership::DeviceGroupVisible});
+    }
 }
 
 TEST_CASE(

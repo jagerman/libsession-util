@@ -3110,8 +3110,20 @@ device::MembershipState Devices::_membership() {
 }
 
 void Devices::_rebaseline_membership() {
-    if (auto m = _membership().membership; m != device::Membership::Unknown)
-        _reported_membership = m;
+    if (auto state = _membership(); state.membership != device::Membership::Unknown)
+        _take_as_reported(state);
+}
+
+bool Devices::_take_as_reported(const device::MembershipState& state) {
+    std::vector<device::GroupId> others;
+    for (const auto& g : state.others)
+        others.push_back(g.id);
+    std::ranges::sort(others, {}, &device::GroupId::value);
+    if (state.membership == _reported_membership && others == _reported_others)
+        return false;
+    _reported_membership = state.membership;
+    _reported_others = std::move(others);
+    return true;
 }
 
 void Devices::_forget_group() {
@@ -3481,11 +3493,8 @@ std::optional<std::chrono::sys_seconds> Devices::_report_events(
         report("devices_replaced", [&] { events.devices_replaced(devices(true, false, true)); });
 
     auto state = _membership();
-    if (state.membership != device::Membership::Unknown &&
-        state.membership != _reported_membership) {
-        _reported_membership = state.membership;
+    if (state.membership != device::Membership::Unknown && _take_as_reported(state))
         report("membership_changed", [&] { events.membership_changed(state.membership); });
-    }
 
     return next_deadline;
 }

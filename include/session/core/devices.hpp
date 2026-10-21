@@ -395,6 +395,9 @@ class Devices final : detail::CoreComponent {
     std::vector<device::Id> _member_changes;
     bool _fetched = false;
     device::Membership _reported_membership = device::Membership::Unknown;
+    // The ids in `others` as last reported, sorted: their `last_seen` moves with every message, so
+    // only which groups are there counts as a change.
+    std::vector<device::GroupId> _reported_others;
     std::unordered_set<int64_t> _ended;
 
     // Fires a flush at the earliest deadline among our own request and those handed out and still
@@ -827,6 +830,10 @@ class Devices final : detail::CoreComponent {
 
     // Takes where we now stand as already reported, after a change the caller made and so knows of.
     void _rebaseline_membership();
+
+    // Takes `state` as reported, answering whether that is news: a different membership, or a
+    // different set of groups in `others`.
+    bool _take_as_reported(const device::MembershipState& state);
 
     // What a message from our own group that we cannot read says of us, by its `kicked` list (see
     // "Displaced devices"): Removed if it names us, Displaced if it shows we were not removed, and

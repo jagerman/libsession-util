@@ -114,8 +114,10 @@ class DeviceEvents {
     /// `remove_device`, nor for the members of a group this device has just been admitted to.
     virtual void device_membership_changed(device::Info device) = 0;
 
-    /// This device's membership changed, or became known with the first fetch of this run; see
-    /// device::Membership for what each value means.  `Removed`, `Displaced`, `Dissolved`,
+    /// Where this device stands, or the groups it can see, changed -- or became known with the
+    /// first fetch of this run; see device::Membership for what each value means.  So the same
+    /// value can arrive twice: a `Dissolved` device is told again when the group it can join
+    /// appears in `MembershipState::others`.  `Removed`, `Displaced`, `Dissolved`,
     /// `Dropped` and `Forked` are the ones to alert on, and arrive as soon as the fetch that
     /// reveals them is merged.  `Approved` is the one to bring up the confirmation on, wherever
     /// the user is.  Not for the move to `Requesting` that `Devices::request_link` makes, nor back

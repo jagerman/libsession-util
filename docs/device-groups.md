@@ -55,7 +55,7 @@ pure virtual, so none can be left out by accident:
 | `link_request_ended(reqid, why)` | That request can no longer be answered (accepted elsewhere, replaced, expired). Close its prompt. |
 | `device_membership_changed(device::Info)` | Another device joined the group, or was removed, or left. Tell the user ("Alice's laptop was added"). |
 | `devices_replaced(device::map)` | The group's device list changed. Redraw the device screen. |
-| `membership_changed(Membership)` | Where this device stands changed, or became known. Re-read `membership()` and act on it. `Approved` is the cue to bring up the new device's confirmation, wherever the user is. |
+| `membership_changed(Membership)` | Where this device stands, or the groups it can see, changed -- or became known. The same value can arrive again when only `others` changed. Re-read `membership()` and act on it. `Approved` is the cue to bring up the new device's confirmation, wherever the user is. |
 
 Pass a pointer to your implementation as `callbacks::devices`: `client::callbacks` for a `Client`
 application, `core::callbacks` for one using `Core` directly. It must outlive the `Client` (or
@@ -85,8 +85,9 @@ holds for it, which catches up once a push carrying a change has reached the swa
 Call `membership()` at startup. Until the first fetch from the swarm completes it answers
 `Unknown`, because the swarm may have changed while the application was down. **Do not prompt from
 `Unknown`.** Wait for `membership_changed`, which fires when the first fetch makes the state known,
-and on every change after, except one made by your own call (asking to join, starting a group,
-dissolving one, leaving one). Re-read `membership()` after making those calls.
+and on every change after -- to the state, or to which groups are in `others` -- except one made
+by your own call (asking to join, starting a group, dissolving one, leaving one). Re-read
+`membership()` after making those calls.
 
 `membership()` returns the state, this device's `group` (only while it is a member in good
 standing: `InGroup` or `Forked`), and `others`: every group in the swarm this device could ask to
