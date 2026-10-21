@@ -201,7 +201,10 @@ automatically.
    - **Approve:** `accept_request(id)`. Only if the user confirms the emoji match what the new
      device shows.
    - **Ignore:** `ignore_request(id)`. Local only; another of the user's devices may still approve
-     it, which is the normal case when the user is approving elsewhere.
+     it, which is the normal case when the user is approving elsewhere. The requesting device is
+     not told: it goes on waiting until its deadline (10 minutes) unless some device approves it.
+     So word the button as "not now" or "decide on another device" rather than "decline", which
+     it is not.
    - **"I don't recognise this":** `ignore_request(id, true)`. Also deletes it from the swarm, so
      devices that haven't fetched it yet never see it. A device that already has it can still
      approve it until it expires, so word this as "stop other devices seeing it", not "block it".
@@ -213,6 +216,12 @@ automatically.
 replaced, expired, the device removed, or this device has left the group meanwhile). That is not an
 error: close the prompt. Accepting a replacement also gives the group a new account key; there is
 nothing for the application to do about that.
+
+Ignoring is not final. A request this device ignored can still be accepted with `accept_request`
+until its deadline, which is how an Ignore pressed by mistake is put right -- with or without the
+swarm deletion, since this device keeps its own record of the request. `link_requests()` lists it,
+with `status` `Ignored` and its `expires`, so a devices screen can offer "approve" for an ignored
+request that is still live without prompting for it again.
 
 Request ids are counters for this run only. Never persist or display them.
 

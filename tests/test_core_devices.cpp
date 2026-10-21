@@ -1129,7 +1129,68 @@ TEST_CASE(
     CHECK(l.state_of_applicant().state == device::State::Pending);
 
     CHECK_FALSE(l.core->devices.ignore_request(id, await));
+}
+
+TEST_CASE(
+        "Devices - a request ignored here can still be accepted here while it is live",
+        "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto id = l.events.added.at(0).id;
+
+    // Whatever came before it, an acceptance tells this device's application what any does.
+    SECTION("accepted outright") {}
+    SECTION("ignored first") {
+        REQUIRE(l.core->devices.ignore_request(id, await));
+    }
+    SECTION("ignored and deleted from the swarm first") {
+        REQUIRE(l.core->devices.ignore_request(id, true, await));
+    }
+
+    l.events = DeviceEventsRecorder{};
+    REQUIRE(l.core->devices.accept_request(id, await));
+    CHECK(l.core->devices.link_requests(await).at(0).status == device::LinkStatus::Accepted);
+    CHECK(l.events.ended.empty());
+    CHECK(l.events.members.empty());
+    CHECK(l.events.replaced.size() == 1);
+    CHECK(l.events.membership.empty());
+
+    TestHelper::deliver_device_message(
+            *l.applicant,
+            l.core->devices.build_device_group_message().message,
+            std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min,
+            "G1");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Approved);
+}
+
+TEST_CASE(
+        "Devices - a request ignored here cannot be accepted past its deadline",
+        "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto id = l.events.added.at(0).id;
+    REQUIRE(l.core->devices.ignore_request(id, await));
+
+    ScopedClockOffset later{11min};
     CHECK_FALSE(l.core->devices.accept_request(id, await));
+    CHECK(l.state_of_applicant().state == device::State::Pending);
+    CHECK(l.core->devices.link_requests(await).at(0).status == device::LinkStatus::Ignored);
+}
+
+TEST_CASE(
+        "Devices - a request ignored here is superseded by the device asking again",
+        "[core][devices][linking]") {
+    Linking l;
+    l.ask();
+    auto first = l.events.added.at(0).id;
+    REQUIRE(l.core->devices.ignore_request(first, await));
+
+    // Accepting the old one now would admit the device as the new request describes it, under the
+    // emoji the user compared for the old one.
+    l.ask(std::chrono::floor<std::chrono::seconds>(clock_now_s()) + 10min, "L2");
+    CHECK(l.core->devices.link_requests(await).back().status == device::LinkStatus::Superseded);
+    CHECK_FALSE(l.core->devices.accept_request(first, await));
+    CHECK(l.core->devices.accept_request(l.events.added.at(1).id, await));
 }
 
 TEST_CASE("Devices - a request past its deadline cannot be accepted", "[core][devices][linking]") {

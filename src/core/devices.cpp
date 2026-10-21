@@ -2802,11 +2802,13 @@ void Devices::receive_link_request(
 
     // A newer request from the same device replaces the earlier one for the user's purposes, but
     // does not erase it: the older row stays readable as something this device saw.  Marked before
-    // the insert so that exactly one request per device is ever pending.
+    // the insert so that exactly one request per device is ever pending.  An ignored one too, since
+    // it can still be accepted: accepting it would admit the device under this newer record.
     c.prepared_exec(
-            "UPDATE device_link_requests SET status = {} WHERE device = ? AND status = {}"_format(
+            "UPDATE device_link_requests SET status = {} WHERE device = ? AND status IN ({}, {})"_format(
                     static_cast<int>(device::LinkStatus::Superseded),
-                    static_cast<int>(device::LinkStatus::Pending)),
+                    static_cast<int>(device::LinkStatus::Pending),
+                    static_cast<int>(device::LinkStatus::Ignored)),
             *dev_id);
 
     c.prepared_exec(
@@ -2943,10 +2945,13 @@ bool Devices::_accept_request(int reqid) {
     if (!_member())
         return false;
 
+    // Ignored too: ignoring is this device's alone, and an Ignore pressed by mistake is put right
+    // by accepting after all, for as long as the request is live.
     auto request = c.prepared_maybe_get<int64_t, int>(
             "SELECT device, replaces FROM device_link_requests"
-            " WHERE id = ? AND status = {} AND expires_at > ?"_format(
-                    static_cast<int>(device::LinkStatus::Pending)),
+            " WHERE id = ? AND status IN ({}, {}) AND expires_at > ?"_format(
+                    static_cast<int>(device::LinkStatus::Pending),
+                    static_cast<int>(device::LinkStatus::Ignored)),
             *row,
             epoch_seconds(clock_now_s()));
     if (!request)

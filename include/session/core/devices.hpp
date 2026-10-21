@@ -114,7 +114,8 @@ namespace device {
         Pending = 0,     ///< Awaiting an answer, here or on another device.
         Accepted = 1,    ///< Admitted to the group, by us or by another device.
         Ignored = 2,     ///< Dismissed here.  Local and silent: nothing is sent, and another device
-                         ///< can still accept the same request.
+                         ///< can still accept the same request -- as can this one, while it is
+                         ///< live.
         Superseded = 3,  ///< The same device asked again; the newer request is the live one.
     };
 
@@ -714,7 +715,10 @@ class Devices final : detail::CoreComponent {
     // one held, and the account key is rotated: a copy of the device as it was, still holding the
     // replaced record's keys, must not read what comes after.
     //
-    // Answers false if the request can no longer be accepted: answered here or elsewhere,
+    // A request this device ignored can still be accepted while it is live: ignoring is local, and
+    // this is how an Ignore pressed by mistake is put right.
+    //
+    // Answers false if the request can no longer be accepted: accepted here or elsewhere,
     // superseded by a newer request from the same device, past its deadline, or this device is no
     // longer in the group itself.  None of those is an error -- each can happen between a prompt
     // being drawn and the user answering it.  An id this session never handed out is an error
@@ -726,10 +730,14 @@ class Devices final : detail::CoreComponent {
     // never handed out is an error (std::invalid_argument).
     //
     // By default local and silent: nothing is sent, and another device may still accept it -- the
-    // ordinary case of a request being answered on a different device.  With `delete_from_swarm`,
-    // for a request the user does not recognise, it is also deleted from the swarm, so that a
-    // device yet to fetch it never sees it.  A device that has already fetched it is not told, and
-    // can still accept it until it expires.  The deletion is attempted once, and not reported on.
+    // ordinary case of a request being answered on a different device.  This one may too: ignoring
+    // is undone by `accept_request` for as long as the request is live.  Either way the requesting
+    // device is told nothing, and waits until its deadline unless some device accepts it.
+    //
+    // With `delete_from_swarm`, for a request the user does not recognise, it is also deleted from
+    // the swarm, so that a device yet to fetch it never sees it.  A device that has already fetched
+    // it is not told, and can still accept it until it expires -- this one included, since its
+    // record of the request is kept.  The deletion is attempted once, and not reported on.
     void ignore_request(int reqid, result_function<bool> cb);
     void ignore_request(int reqid, bool delete_from_swarm, result_function<bool> cb);
     bool ignore_request(int reqid, await_t);
