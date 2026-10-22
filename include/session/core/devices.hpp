@@ -973,6 +973,17 @@ class Devices final : detail::CoreComponent {
             std::span<const std::byte, 1184> mlkem768_pub,
             std::span<const std::byte, 32> x25519_pub);
 
+    // Settles the keys seen on -21 that were not ours when seen (see `suspect_pubkeys_key`), by a
+    // fetch of the group sent after they were: a key another device has just rotated to reaches -21
+    // and 21 in separate stores, either of which this device can see first.  Does nothing with none
+    // waiting, or no network to fetch with.
+    void _verify_suspects();
+
+    // What that fetch decides: a key now known was a rotation; one still unknown is rogue, which
+    // `callbacks::rogue_account_key` reports and, with PFS/PQ enabled, our own key is published
+    // over.
+    void _judge_suspects();
+
     // Fetches the group now if anything is owed a push -- a change of ours, or the account's key
     // once PFS/PQ is enabled -- so that the push following the fetch carries it: a device
     // subscribed for pushes does not poll, and could otherwise hold it until the swarm next had

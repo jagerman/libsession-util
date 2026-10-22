@@ -210,6 +210,23 @@ struct callbacks {
     /// - changed -- the namespaces whose configs the merge altered.  Valid only for the duration of
     ///   the call.
     std::function<void(std::span<const config::Namespace> changed)> configs_changed;
+
+    /// Callback fired when the account's key outbox (namespace -21) -- where contacts find the key
+    /// they encrypt PFS/PQ messages to -- holds a key that is not one of this account's.
+    ///
+    /// Only a holder of the account's seed can publish there, so it means someone other than the
+    /// account's own devices has the seed: tell the user, as for a forged Displaced alert, that the
+    /// recovery phrase is in someone else's hands (see the device groups guide).  Whether PFS/PQ is
+    /// enabled or not: a seed holder publishing a key need not have enabled it, and contacts
+    /// encrypt to whatever they find.  Where it is enabled, this device publishes the account's own
+    /// key over it straight away, if it is a member of its group in good standing.  Nothing is ever
+    /// deleted from -21, and the seed holder can publish again.
+    ///
+    /// Not decided on sight: a key another device of the account has just rotated to is in -21 a
+    /// moment before its group message reaches this device, so a key not yet known is checked again
+    /// after a fetch of the device group, and reported only if it is still unknown then.  May fire
+    /// more than once for the same key, if it is seen again.
+    std::function<void()> rogue_account_key;
 };
 
 }  // namespace session::core

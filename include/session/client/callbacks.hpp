@@ -144,6 +144,11 @@ struct callbacks {
     /// Held by pointer, so it must outlive the Client, and any delivery the dispatcher still has
     /// queued once the Client is gone.
     DeviceEvents* devices = nullptr;
+
+    /// The account's key outbox holds a key that is none of the account's: someone else has the
+    /// recovery phrase.  See `core::callbacks::rogue_account_key` for when it fires and what to
+    /// tell the user.  Delivered through the dispatcher like everything above.
+    std::function<void()> rogue_account_key;
 };
 
 }  // namespace session::client

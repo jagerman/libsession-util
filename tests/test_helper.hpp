@@ -781,6 +781,16 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
+    // Sets `core`'s rogue_account_key callback after the fact, for a Core built with other
+    // callbacks of its own.
+    static void set_rogue_account_key(core::Core& core, std::function<void()> f) {
+        on_loop(core, [&] { core.callbacks.rogue_account_key = std::move(f); });
+    }
+    // Fires it, as a rogue key judged would: for what a layer above Core does with it.
+    static void fire_rogue_account_key(core::Core& core) {
+        on_loop(core, [&] { core.callbacks.rogue_account_key(); });
+    }
+
     // The same for namespace -21: what the account's key outbox holds, as a fetch of it finds it.
     static void deliver_pubkey_message(
             core::Core& core, std::span<const std::byte> data, std::string hash = "pubkey") {

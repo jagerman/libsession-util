@@ -95,6 +95,12 @@ static constexpr auto read_at_key = "devices_group_read_at"sv;
 static constexpr auto displaced_key = "devices_group_displaced_at"sv;
 static constexpr auto dropped_key = "devices_group_dropped_at"sv;
 
+// The keys seen on -21 that were none of ours when seen, waiting on a fetch of the group to say
+// whether they are a rotation or rogue: each the X25519 half then the ML-KEM half, concatenated.
+// Kept rather than held in memory because -21 is not handed out twice: a retrieve resumes after
+// the last hash it returned, so a key forgotten across a restart would never be judged.
+static constexpr auto suspect_pubkeys_key = "devices_suspect_account_pubkeys"sv;
+
 // Set when a tombstone named the group this device was in, until it joins or starts another.
 static constexpr auto dissolved_key = "devices_group_dissolved"sv;
 
@@ -3553,6 +3559,9 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     // next one, which is what stops two devices answering the same update with duelling pushes.
     push_owed();
     _send_pending_pushes();
+
+    // Keys seen on -21 whose fetch failed, or that were waiting across a restart.
+    _verify_suspects();
 }
 
 void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool /*is_final*/) {
@@ -3577,11 +3586,82 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
                                     "failed"};
                     });
 
-            _mark_published(M, X);
+            if (_mark_published(M, X))
+                continue;
+
+            // Not ours, as far as we know yet.  Whatever PFS/PQ says: a seed holder publishing a
+            // key need not have enabled it, and contacts encrypt to whatever they find.
+            log::info(cat, "Namespace -21 holds an account key we do not know of; checking it");
+            auto held =
+                    core.globals.get_blob(suspect_pubkeys_key).value_or(std::vector<std::byte>{});
+            held.insert(held.end(), X.begin(), X.end());
+            held.insert(held.end(), M.begin(), M.end());
+            core.globals.set(suspect_pubkeys_key, std::span<const std::byte>{held});
         } catch (const std::exception& e) {
             log::warning(cat, "Ignoring malformed account pubkey message: {}", e.what());
         }
     }
+    _verify_suspects();
+}
+
+void Devices::_verify_suspects() {
+    if (!core.network() || !core.globals.get_blob(suspect_pubkeys_key))
+        return;
+    std::vector namespaces{config::Namespace::Devices};
+    // A fetch already under way may have read 21 before the group message that makes the key ours
+    // reached the swarm: only one sent after the key was seen can settle it.
+    bool joined = core._fetches.contains(namespaces);
+    core._fetch(
+            std::move(namespaces),
+            [this, alive = std::weak_ptr<int>{_alive}, joined](bool fetched) {
+                // A failed one leaves them waiting for the next fetch to complete.
+                if (alive.expired() || !fetched)
+                    return;
+                if (joined)
+                    _verify_suspects();
+                else
+                    _judge_suspects();
+            });
+}
+
+void Devices::_judge_suspects() {
+    auto held = core.globals.get_blob(suspect_pubkeys_key);
+    if (!held)
+        return;
+    core.globals.erase(suspect_pubkeys_key);
+
+    constexpr size_t X_SIZE = 32, M_SIZE = mlkem768::PUBLICKEYBYTES;
+    bool rogue = false;
+    for (size_t i = 0; i + X_SIZE + M_SIZE <= held->size(); i += X_SIZE + M_SIZE) {
+        auto X = std::span<const std::byte, X_SIZE>{held->data() + i, X_SIZE};
+        auto M = std::span<const std::byte, M_SIZE>{held->data() + i + X_SIZE, M_SIZE};
+        // Known now: another device's rotation, whose group message has since arrived.
+        if (!_mark_published(M, X))
+            rogue = true;
+    }
+    if (!rogue)
+        return;
+
+    log::warning(
+            cat,
+            "Namespace -21 holds an account key that is none of ours: someone else holds the "
+            "account seed");
+
+    // Where the account publishes its key, ours goes back over it; nothing is deleted from -21,
+    // which a seed holder could only publish to again.
+    if (core._pfs_enabled())
+        conn().prepared_exec("UPDATE device_account_keys SET published = 0 WHERE rotated IS NULL");
+
+    if (cb().rogue_account_key) {
+        try {
+            cb().rogue_account_key();
+        } catch (const std::exception& e) {
+            log::error(cat, "rogue_account_key callback threw: {}", e.what());
+        }
+    }
+
+    // A fetch has just completed, which is all a push waits on.
+    push_owed();
 }
 
 bool Devices::_mark_published(

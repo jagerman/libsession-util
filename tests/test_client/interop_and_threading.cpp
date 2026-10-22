@@ -99,6 +99,22 @@ TEST_CASE("Client: device events arrive through the dispatcher", "[client][callb
     CHECK(events.replaced[0].at(self.id).description == "renamed");
 }
 
+TEST_CASE("Client: a rogue account key arrives through the dispatcher", "[client][callbacks]") {
+    std::vector<std::function<void()>> queued;
+    int alerts = 0;
+    callbacks cbs;
+    cbs.rogue_account_key = [&alerts] { alerts++; };
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    TestHelper::fire_rogue_account_key(c->core);
+    sync(*c);
+    CHECK(alerts == 0);
+    REQUIRE(queued.size() == 1);
+    queued.front()();
+    CHECK(alerts == 1);
+}
+
 TEST_CASE("Client: Core is usable directly through the Client", "[client][callbacks]") {
     TempClient c;
 

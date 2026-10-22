@@ -5642,6 +5642,97 @@ TEST_CASE(
     CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
 }
 
+namespace {
+// A key published to -21 under the account's seed by a device that is none of ours: a seed holder
+// elsewhere, with keys of its own.
+std::vector<std::byte> foreign_pubkey_message(TempCore& c) {
+    TempCore stranger{core::predefined_seed{std::span<const std::byte, 32>{Linking::seed_of(c)}}};
+    return stranger->devices.build_account_pubkey_message();
+}
+
+// `c` watching for rogue keys, with everything it owes pushed, so that what follows is all a key
+// on -21 makes it do.
+MockNetwork* watching(TempCore& c, int& alerts) {
+    TestHelper::set_rogue_account_key(*c, [&alerts] { alerts++; });
+    auto* net = attach_mock_network(*c);
+    TestHelper::finish_fetch(*c);
+    while (!pushes(*net).empty())
+        answer_upload(c, *net, true);
+    return net;
+}
+
+bool device_fetch_asked(TempCore& c, MockNetwork& net) {
+    return eventually(*c, [&] { return std::ranges::any_of(net.sent_requests, is_device_fetch); });
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a key on -21 that is not ours is judged once the group has been fetched",
+        "[core][devices][pfs][rogue]") {
+    Linking l;
+    l.admit();
+    int alerts = 0;
+    auto* net = watching(l.core, alerts);
+    REQUIRE(l.core->pfs_enabled());
+    REQUIRE_FALSE(l.core->devices.needs_push().account_pubkey);
+
+    SECTION("another device's rotation, its -21 store seen before its group message: nothing") {
+        l.applicant->devices.rotate_account_keys();
+        TestHelper::deliver_pubkey_message(
+                *l.core, l.applicant->devices.build_account_pubkey_message(), "P2");
+        CHECK(alerts == 0);
+
+        // Not judged on sight: a fetch of the group is asked for, and the rotation is in it.
+        REQUIRE(device_fetch_asked(l.core, *net));
+        TestHelper::deliver_device_message(
+                *l.core,
+                l.applicant->devices.build_device_group_message().message,
+                in(10min),
+                "G9");
+        REQUIRE(answer_fetch(l.core, *net) == 1);
+        CHECK(alerts == 0);
+        CHECK_FALSE(l.core->devices.needs_push().account_pubkey);
+    }
+
+    SECTION("a key none of ours, still unknown after the fetch: rogue, and ours goes over it") {
+        TestHelper::deliver_pubkey_message(*l.core, foreign_pubkey_message(l.core), "P2");
+        CHECK(alerts == 0);
+        REQUIRE(device_fetch_asked(l.core, *net));
+        REQUIRE(answer_fetch(l.core, *net) == 1);
+        CHECK(alerts == 1);
+        CHECK(l.core->devices.needs_push().account_pubkey);
+        REQUIRE(pushes(*net).size() == 1);
+        CHECK(stored_namespaces(*pushes(*net).front()) == std::vector{-21});
+    }
+
+    SECTION("our own key, rotated away since: nothing, and nothing to check") {
+        auto old = l.core->devices.build_account_pubkey_message();
+        l.core->devices.rotate_account_keys();
+        TestHelper::deliver_pubkey_message(*l.core, old, "P2");
+        TestHelper::drain(*l.core);
+        CHECK(alerts == 0);
+        CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+    }
+}
+
+TEST_CASE(
+        "Devices - a rogue key is reported without PFS/PQ, and nothing is published over it",
+        "[core][devices][pfs][rogue]") {
+    // The applicant is restored, so its account has not enabled PFS/PQ.
+    Linking l;
+    l.admit();
+    int alerts = 0;
+    auto* net = watching(l.applicant, alerts);
+    REQUIRE_FALSE(l.applicant->pfs_enabled());
+
+    TestHelper::deliver_pubkey_message(*l.applicant, foreign_pubkey_message(l.applicant), "P2");
+    REQUIRE(device_fetch_asked(l.applicant, *net));
+    REQUIRE(answer_fetch(l.applicant, *net) == 1);
+    CHECK(alerts == 1);
+    CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
+    CHECK(pushes(*net).empty());
+}
+
 TEST_CASE(
         "Devices - two fetches of the same namespace asked at once are one request",
         "[core][devices][fetch]") {

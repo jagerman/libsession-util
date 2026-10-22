@@ -404,6 +404,11 @@ core::callbacks Client::_core_callbacks() {
     if (_cbs->devices)
         cb.devices = this;
 
+    if (_cbs->rogue_account_key)
+        cb.rogue_account_key = [this] {
+            _emit([](const callbacks& cbs) { cbs.rogue_account_key(); });
+        };
+
     return cb;
 }
 
