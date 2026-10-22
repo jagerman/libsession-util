@@ -257,6 +257,10 @@ void Configs::initialise_new_account() {
     // UserProfile config, so leaving it at the default 0 would not merely show the conversation
     // here, it would make it appear on every device on the account the moment they synced.
     user_profile().set_nts_priority(-1);
+
+    // A new account's only device is a current one, so it can say from the start that every device
+    // of it reads PFS/PQ messages; a restored one may have older devices, and is enabled by hand.
+    user_profile().set_min_message_version(2);
     _flush();
 }
 

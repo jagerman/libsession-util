@@ -129,6 +129,7 @@ TEST_CASE("Configs: a fresh account starts with its defaults", "[core][configs]"
         // shared -- the account's other devices have to be told, or they would each invent their
         // own answer.
         CHECK(c->configs.user_profile().get_nts_priority() == -1);
+        CHECK(c->configs.user_profile().get_min_message_version() == 2);
         CHECK(c->configs.needs_push());
         CHECK(stored_dumps(c) == 1);
 
