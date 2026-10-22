@@ -771,6 +771,7 @@ class Client : private core::DeviceEvents {
     struct EarlyStatus {
         core::MessageSendStatus status;
         std::optional<std::string> swarm_hash;
+        std::optional<core::MessageEncryption> encryption;
     };
     std::unordered_map<int64_t, EarlyStatus> _early_status;
 
@@ -1481,7 +1482,8 @@ class Client : private core::DeviceEvents {
     void _on_send_status(
             int64_t core_id,
             core::MessageSendStatus status,
-            std::optional<std::string_view> swarm_hash);
+            std::optional<std::string_view> swarm_hash,
+            std::optional<core::MessageEncryption> encryption);
 
     // Applies what a config merge changed to the tables that answer queries about it.
     //
@@ -1594,11 +1596,14 @@ class Client : private core::DeviceEvents {
 
     // `swarm_hash` is recorded against the message only when it names a copy in our own swarm; the
     // caller passes nullopt for the copy sent to someone else, whose hash is meaningless here.
+    // `encryption` is recorded only from the copy sent to the recipient: the sync copy's is how it
+    // was encrypted to us, which says nothing about the message.
     void _apply_send_status(
             int64_t client_id,
             core::MessageSendStatus status,
             bool sync,
-            std::optional<std::string_view> swarm_hash);
+            std::optional<std::string_view> swarm_hash,
+            std::optional<core::MessageEncryption> encryption = std::nullopt);
 
     // Runs `invoke` against the application's handlers, swallowing and logging anything it throws:
     // a broken listener is not something a data model can do anything about.

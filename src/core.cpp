@@ -1756,10 +1756,11 @@ void Core::_do_send_dm(
         const ed25519::OptionalPrivKeySpan& pro_privkey,
         std::chrono::milliseconds ttl,
         bool force_v2) {
-    auto fire_status = [&](MessageSendStatus status) {
+    auto fire_status = [&](MessageSendStatus status,
+                           std::optional<MessageEncryption> encryption = std::nullopt) {
         if (callbacks.message_send_status) {
             try {
-                callbacks.message_send_status(message_id, status, std::nullopt);
+                callbacks.message_send_status(message_id, status, std::nullopt, encryption);
             } catch (const std::exception& e) {
                 log::error(cat, "message_send_status callback threw: {}", e.what());
             }
@@ -1793,21 +1794,21 @@ void Core::_do_send_dm(
     // (0x00 0x02 | ki | E | mlkem_ct | encrypted_inner) — no protobuf wrapping.  v1 uses
     // encode_dm_v1 which wraps in Envelope + WebSocketMessage protobufs.
     std::vector<std::byte> payload;
+    MessageEncryption encryption;
     try {
         auto seed = globals.account_seed();
         auto ed_sec = seed.ed25519_secret();
 
-        std::string_view version;
         if (pfs_x25519) {
             payload = encrypt_for_recipient_v2(
                     ed_sec, recipient, *pfs_x25519, *pfs_mlkem768, content, pro_privkey);
-            version = "v2 PFS";
+            encryption = MessageEncryption::v2_pfs;
         } else if (force_v2) {
             payload = encrypt_for_recipient_v2_nopfs(ed_sec, recipient, content, pro_privkey);
-            version = "v2 nopfs";
+            encryption = MessageEncryption::v2_basic;
         } else {
             payload = encode_dm_v1(content, ed_sec, sent_timestamp, recipient, pro_privkey);
-            version = "v1";
+            encryption = MessageEncryption::v1;
         }
 
         log::debug(
@@ -1815,7 +1816,9 @@ void Core::_do_send_dm(
                 "send_dm: message {} encrypted for {} as {} ({}B)",
                 message_id,
                 oxenc::to_hex(recipient),
-                version,
+                encryption == MessageEncryption::v2_pfs     ? "v2 PFS"
+                : encryption == MessageEncryption::v2_basic ? "v2 nopfs"
+                                                            : "v1",
                 payload.size());
     } catch (const std::exception& e) {
         log::warning(cat, "send_dm: encryption failed for message {}: {}", message_id, e.what());
@@ -1824,21 +1827,23 @@ void Core::_do_send_dm(
     }
 
     // Dispatch to swarm.
-    fire_status(MessageSendStatus::sending);
+    fire_status(MessageSendStatus::sending, encryption);
     try {
         _send_to_swarm(
                 recipient,
                 config::Namespace::Default,
                 std::move(payload),
                 ttl,
-                [this, message_id](bool success, std::optional<std::string_view> swarm_hash) {
+                [this, message_id, encryption](
+                        bool success, std::optional<std::string_view> swarm_hash) {
                     if (callbacks.message_send_status) {
                         try {
                             callbacks.message_send_status(
                                     message_id,
                                     success ? MessageSendStatus::success
                                             : MessageSendStatus::network_error,
-                                    swarm_hash);
+                                    swarm_hash,
+                                    success ? std::optional{encryption} : std::nullopt);
                         } catch (const std::exception& e) {
                             log::error(cat, "message_send_status callback threw: {}", e.what());
                         }
@@ -1940,13 +1945,15 @@ int64_t Core::send_dm(
         _pending_sends.push_back(std::move(pending));
 
         if (callbacks.message_send_status)
-            callbacks.message_send_status(id, MessageSendStatus::awaiting_keys, std::nullopt);
+            callbacks.message_send_status(
+                    id, MessageSendStatus::awaiting_keys, std::nullopt, std::nullopt);
 
         prefetch_pfs_keys(recipient_session_id);
     } else {
         // No cache and no network: fire immediate failure.
         if (callbacks.message_send_status)
-            callbacks.message_send_status(id, MessageSendStatus::no_network, std::nullopt);
+            callbacks.message_send_status(
+                    id, MessageSendStatus::no_network, std::nullopt, std::nullopt);
     }
 
     return id;
@@ -2054,10 +2061,9 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                     out.timestamp = msg.timestamp;
                     out.expiry = msg.expiry;
                     out.sender_session_id = result.sender_session_id;
-                    out.version = 2;
+                    out.encryption = MessageEncryption::v2_pfs;
                     out.content = std::move(result.content);
                     out.pro_signature = result.pro_signature;
-                    out.pfs_encrypted = true;
                     fire_received(std::move(out));
                     decrypted = true;
                     break;
@@ -2081,10 +2087,9 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                     out.timestamp = msg.timestamp;
                     out.expiry = msg.expiry;
                     out.sender_session_id = result.sender_session_id;
-                    out.version = 2;
+                    out.encryption = MessageEncryption::v2_basic;
                     out.content = std::move(result.content);
                     out.pro_signature = result.pro_signature;
-                    // pfs_encrypted remains false (default)
                     fire_received(std::move(out));
                 } catch (const DecryptV2Error&) {
                     // Non-PFS fallback also failed: message cannot be read.
@@ -2104,7 +2109,7 @@ void Core::_handle_direct_messages(std::span<const SwarmMessage> messages) {
                 out.hash = msg.hash;
                 out.timestamp = msg.timestamp;
                 out.expiry = msg.expiry;
-                out.version = 1;
+                out.encryption = MessageEncryption::v1;
                 // Reconstruct the 33-byte (0x05-prefixed) session ID from the x25519 pubkey.
                 out.sender_session_id[0] = std::byte{0x05};
                 std::ranges::copy(decoded.sender_x25519_pubkey, out.sender_session_id.begin() + 1);

@@ -391,8 +391,9 @@ core::callbacks Client::_core_callbacks() {
 
     cb.message_send_status = [this](int64_t id,
                                     core::MessageSendStatus status,
-                                    std::optional<std::string_view> swarm_hash) {
-        _on_send_status(id, status, swarm_hash);
+                                    std::optional<std::string_view> swarm_hash,
+                                    std::optional<core::MessageEncryption> encryption) {
+        _on_send_status(id, status, swarm_hash, encryption);
     };
 
     cb.configs_changed = [this](std::span<const config::Namespace> changed) {
@@ -3778,7 +3779,7 @@ static constexpr auto WIRE_REF_TARGET = R"(
 static const std::string MESSAGE_COLUMNS = R"(
     SELECT m.id, m.swarm_hash, a.session_id, m.outgoing, m.timestamp, m.body, m.send_state,
            m.sync_send_state, m.deleted, m.gallery,
-           ra.session_id, m.reply_timestamp, {}
+           ra.session_id, m.reply_timestamp, {}, m.encryption
     FROM messages m
     JOIN accounts a ON a.id = m.sender
     LEFT JOIN accounts ra ON ra.id = m.reply_author
@@ -3901,7 +3902,8 @@ std::vector<Message> Client::_build_messages(
               gallery,
               reply_author,
               reply_ts,
-              reply_id] =
+              reply_id,
+              encryption] =
                 sqlite::get<
                         int64_t,
                         std::optional<std::string>,
@@ -3915,7 +3917,8 @@ std::vector<Message> Client::_build_messages(
                         int,
                         std::optional<sqlite::blob_guts<b33>>,
                         std::optional<int64_t>,
-                        std::optional<int64_t>>(st);
+                        std::optional<int64_t>,
+                        std::optional<int>>(st);
         out.push_back(Message{
                 .id = id,
                 .conversation = convo,
@@ -3927,6 +3930,9 @@ std::vector<Message> Client::_build_messages(
                                          : std::nullopt,
                 .sync_send_state = sync_send_state
                                          ? std::optional{static_cast<SendState>(*sync_send_state)}
+                                         : std::nullopt,
+                .encryption = encryption ? std::optional{static_cast<core::MessageEncryption>(
+                                                   *encryption)}
                                          : std::nullopt,
                 .hash = std::move(swarm_hash),
                 .gallery = gallery != 0,
@@ -4414,15 +4420,16 @@ void Client::_dispatch_sends(
 
     // send_dm() reports its first status synchronously, i.e. before we knew the id to map it to.
     if (auto stashed = _early_status.extract(core_id)) {
-        auto& [status, hash] = stashed.mapped();
-        _apply_send_status(client_id, status, false, to_self ? opt_view(hash) : std::nullopt);
+        auto& [status, hash, encryption] = stashed.mapped();
+        _apply_send_status(
+                client_id, status, false, to_self ? opt_view(hash) : std::nullopt, encryption);
     }
 
     if (!to_self) {
         auto sync_id = core.send_dm(self, synced, now);
         _sync_sends[sync_id] = client_id;
         if (auto stashed = _early_status.extract(sync_id)) {
-            auto& [status, hash] = stashed.mapped();
+            auto& [status, hash, encryption] = stashed.mapped();
             _apply_send_status(client_id, status, true, opt_view(hash));
         }
     }
@@ -6331,12 +6338,19 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
                 log::warning(cat, "Ignoring a quote with an unparseable author");
         }
 
+        // What this envelope used is what the message was sent with only when it was sent to us:
+        // an incoming message, or a note to self.  Our own message to someone else comes back
+        // encrypted to us, which says nothing of what reached them.
+        std::optional<int> encryption;
+        if (!outgoing || is_me(convo_with))
+            encryption = static_cast<int>(msg.encryption);
+
         inserted = c.prepared_exec(
                            R"(
             INSERT OR IGNORE INTO messages
                 (conversation, msgid, swarm_hash, sender, outgoing, timestamp, body,
-                 send_state, reply_author, reply_timestamp, reply_msgid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 send_state, reply_author, reply_timestamp, reply_msgid, encryption)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )",
                            convo.id,
                            msgid,
@@ -6351,7 +6365,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
                                     : std::optional<int>{},
                            reply_author,
                            reply_ts,
-                           reply_msgid) > 0;
+                           reply_msgid,
+                           encryption) > 0;
         if (inserted) {
             client_id = c.sql.getLastInsertRowid();
             c.prepared_exec(
@@ -6420,7 +6435,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
 void Client::_on_send_status(
         int64_t core_id,
         core::MessageSendStatus status,
-        std::optional<std::string_view> swarm_hash) {
+        std::optional<std::string_view> swarm_hash,
+        std::optional<core::MessageEncryption> encryption) {
     if (auto quiet = _quiet_sends.find(core_id); quiet != _quiet_sends.end()) {
         if (is_terminal(status)) {
             _quiet_sends.erase(quiet);
@@ -6451,21 +6467,23 @@ void Client::_on_send_status(
                 core_id,
                 EarlyStatus{
                         status,
-                        swarm_hash ? std::optional{std::string{*swarm_hash}} : std::nullopt});
+                        swarm_hash ? std::optional{std::string{*swarm_hash}} : std::nullopt,
+                        encryption});
         return;
     }
 
     auto [client_id, own_swarm] = it->second;
     if (is_terminal(status))
         _send_ids.erase(it);
-    _apply_send_status(client_id, status, false, own_swarm ? swarm_hash : std::nullopt);
+    _apply_send_status(client_id, status, false, own_swarm ? swarm_hash : std::nullopt, encryption);
 }
 
 void Client::_apply_send_status(
         int64_t client_id,
         core::MessageSendStatus status,
         bool sync,
-        std::optional<std::string_view> swarm_hash) {
+        std::optional<std::string_view> swarm_hash,
+        std::optional<core::MessageEncryption> encryption) {
     auto state = state_for(status);
     std::optional<ConversationId> convo;
     {
@@ -6487,6 +6505,13 @@ void Client::_apply_send_status(
                                "UPDATE messages SET swarm_hash = ? WHERE id = ? AND swarm_hash IS "
                                "NULL",
                                *swarm_hash,
+                               client_id) > 0;
+
+        if (encryption && !sync)
+            changed |= c.prepared_exec(
+                               "UPDATE messages SET encryption = ?1 WHERE id = ?2 AND encryption "
+                               "IS NOT ?1",
+                               static_cast<int>(*encryption),
                                client_id) > 0;
 
         if (changed) {

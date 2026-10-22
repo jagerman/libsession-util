@@ -3,6 +3,7 @@
 #include <optional>
 #include <session/config/namespaces.hpp>
 #include <session/core/devices.hpp>
+#include <session/core/message_encryption.hpp>
 #include <session/core/swarm_message.hpp>
 #include <session/util.hpp>
 #include <span>
@@ -73,11 +74,9 @@ struct ReceivedMessage {
     sys_ms timestamp;                  ///< Server-reported upload timestamp
     sys_ms expiry;                     ///< Server-reported expiry timestamp
     b33 sender_session_id;             ///< 0x05-prefixed sender session ID
-    int version;                       ///< Protocol version: 1 or 2
+    MessageEncryption encryption;      ///< What its envelope used
     std::vector<std::byte> content;    ///< Decrypted protobuf-encoded payload
     std::optional<b64> pro_signature;  ///< Session Pro signature, if present
-    bool pfs_encrypted = false;        ///< True iff decrypted via PFS+PQ (X-Wing) key derivation;
-                                       ///< false for v1 messages and v2 non-PFS fallback messages.
 };
 
 /// Status of a send operation initiated by Core::send_dm().
@@ -207,10 +206,13 @@ struct callbacks {
     /// - status -- the current state of the send
     /// - swarm_hash -- the hash the swarm assigned the stored message, on `success` and when the
     ///   storage server reported one.  Unset for every other status.
+    /// - encryption -- how the message was encrypted for the recipient it was sent to, on `sending`
+    ///   (when that is decided) and on `success`.  Unset for every other status.
     std::function<void(
             int64_t message_id,
             MessageSendStatus status,
-            std::optional<std::string_view> swarm_hash)>
+            std::optional<std::string_view> swarm_hash,
+            std::optional<MessageEncryption> encryption)>
             message_send_status;
 
     /// Callback fired when merging config messages from the swarm changed one or more of the

@@ -433,6 +433,11 @@ keys, `core.refetch_pfs_keys(session_id)` fetches them however recently they wer
 `pfs_keys_fetched` reports the result, as for a prefetch (in `client::callbacks` too, for a `Client`
 application), and is the cue to read `pfs_key_info` again.
 
+What a message actually used is on the message: `Message::encryption` (`v1`, `v2_basic`, or
+`v2_pfs` for PFS+PQ). For an incoming message it is what its envelope used. For one this device
+sent it is what went to the recipient, unset until Core has encrypted it -- which can wait on
+fetching the recipient's keys -- and unset for messages from before it was recorded.
+
 ### A key that is not the account's
 
 `rogue_account_key` fires when the account's published key -- the one contacts encrypt to -- is
