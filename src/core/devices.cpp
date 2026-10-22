@@ -3551,7 +3551,7 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     // Pushed from here rather than from whatever dirtied the group, so that what goes out is built
     // on top of everything this fetch merged.  A local change made between fetches waits for the
     // next one, which is what stops two devices answering the same update with duelling pushes.
-    push_device_group();
+    push_owed();
     _send_pending_pushes();
 }
 
@@ -3562,12 +3562,11 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
     // The x25519 pubkey for signature verification: session_id() is 0x05 || x25519_pub
     auto x25519_pub = core.globals.session_id().subspan<1>();
 
-    auto c = conn();
     for (const auto& msg : messages) {
         try {
             oxenc::bt_dict_consumer in{msg.data};
-            auto M = in.require_span<unsigned char, mlkem768::PUBLICKEYBYTES>("M");
-            auto X = in.require_span<unsigned char, 32>("X");
+            auto M = in.require_span<std::byte, mlkem768::PUBLICKEYBYTES>("M");
+            auto X = in.require_span<std::byte, 32>("X");
             in.require_signature(
                     "~",
                     [&x25519_pub](std::span<const std::byte> body, std::span<const std::byte> sig) {
@@ -3578,17 +3577,23 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
                                     "failed"};
                     });
 
-            // Look up the key by indicator (indexed) then verify full pubkeys, and mark published.
-            c.prepared_exec(
-                    "UPDATE device_account_keys SET published = 1"
-                    " WHERE key_indicator = ? AND pubkey_mlkem768 = ? AND pubkey_x25519 = ?",
-                    M.first<2>(),
-                    M,
-                    X);
+            _mark_published(M, X);
         } catch (const std::exception& e) {
             log::warning(cat, "Ignoring malformed account pubkey message: {}", e.what());
         }
     }
+}
+
+bool Devices::_mark_published(
+        std::span<const std::byte, 1184> mlkem768_pub, std::span<const std::byte, 32> x25519_pub) {
+    // By indicator first, which is indexed, then the whole of both halves: a message carrying our
+    // X25519 key beside an ML-KEM key that is not ours is not our key.
+    return conn().prepared_exec(
+                   "UPDATE device_account_keys SET published = 1"
+                   " WHERE key_indicator = ? AND pubkey_mlkem768 = ? AND pubkey_x25519 = ?",
+                   mlkem768_pub.first<2>(),
+                   mlkem768_pub,
+                   x25519_pub) > 0;
 }
 
 static const std::string NEEDS_PUSH_SQL =
@@ -3608,9 +3613,14 @@ Devices::NeedsPush Devices::needs_push() {
     // Not for a group that has moved on without us: we cannot read what it holds now, and would
     // push a snapshot of what it held before.  Nor for one gone from the swarm while another is
     // there: pushing would bring it back beside the one the account now has.
-    bool dg = registered && !_displaced() && !_dropped() &&
-              (owed || _own_record().seqno != _held_record()->seqno);
-    return {.device_group = dg, .account_pubkey = bool(ap)};
+    bool member = registered && !_displaced() && !_dropped();
+    bool dg = member && (owed || _own_record().seqno != _held_record()->seqno);
+    // Publishing the key is what has contacts send PFS/PQ messages, so only once every device of
+    // the account has been declared able to read them -- and, as for rotating it, only by a member
+    // in good standing, which is what keeps the key current.
+    // The public form, since this is called from other threads too and the config lives on the
+    // loop.
+    return {.device_group = dg, .account_pubkey = member && ap && core.pfs_enabled()};
 }
 
 void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string hash) {
@@ -3664,50 +3674,90 @@ void Devices::mark_device_group_pushed(const DeviceGroupPush& push, std::string 
     tx.commit();
 }
 
-void Devices::push_device_group() {
+void Devices::push_owed() {
     if (_push_in_flight)
         return;
-    if (!needs_push().device_group)
-        return;
+    auto owed = needs_push();
 
-    DeviceGroupPush push;
-    try {
-        push = build_device_group_message();
-    } catch (const std::exception& e) {
-        log::warning(cat, "Not pushing device group: {}", e.what());
-        return;
+    std::optional<DeviceGroupPush> group;
+    if (owed.device_group) {
+        try {
+            group = build_device_group_message();
+        } catch (const std::exception& e) {
+            log::warning(cat, "Not pushing device group: {}", e.what());
+        }
     }
 
+    struct Pubkey {
+        std::array<std::byte, 1184> mlkem768;
+        std::array<std::byte, 32> x25519;
+    };
+    std::optional<Pubkey> pubkey;
+    if (owed.account_pubkey) {
+        auto current = active_account_keys().front();
+        pubkey = Pubkey{current.mlkem768_pub, current.x25519_pub};
+    }
+
+    if (!group && !pubkey)
+        return;
+
+    // Index-aligned with the results: the group message first, when there is one.
     std::vector<SwarmStore> stores;
-    stores.push_back(
-            {.ns = config::Namespace::Devices,
-             .data = push.message,
-             .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+    if (group)
+        stores.push_back(
+                {.ns = config::Namespace::Devices,
+                 .data = group->message,
+                 .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(DEVICE_GROUP_TTL)});
+    if (pubkey)
+        stores.push_back(
+                {.ns = config::Namespace::AccountPubkeys,
+                 .data = _account_pubkey_message(pubkey->mlkem768, pubkey->x25519),
+                 .ttl = std::chrono::duration_cast<std::chrono::milliseconds>(ACCOUNT_PUBKEY_TTL)});
 
     _push_in_flight = true;
 
-    // Copied out before the call rather than passed as `push.obsolete`: the callback below captures
-    // `push` by move, and the order the two arguments are evaluated in is unspecified, so reading
-    // it inline can hand over an empty list from an already-moved-from struct.
-    auto obsolete = push.obsolete;
+    // Copied out before the call rather than passed as `group->obsolete`: the callback below
+    // captures `group` by move, and the order the two arguments are evaluated in is unspecified, so
+    // reading it inline can hand over an empty list from an already-moved-from struct.  Nothing to
+    // delete for -21, which holds one message and replaces it with each store.
+    auto obsolete = group ? group->obsolete : std::vector<std::string>{};
 
     core._swarm_push(
             std::move(stores),
             std::move(obsolete),
-            [this, alive = std::weak_ptr<int>{_alive}, push = std::move(push)](
+            [this, alive = std::weak_ptr<int>{_alive}, group = std::move(group), pubkey](
                     std::optional<std::vector<SwarmStoreResult>> results) {
                 if (alive.expired())
                     return;
                 _push_in_flight = false;
 
-                if (!results || results->empty() || !results->front().stored) {
-                    log::warning(cat, "Device group push was not stored; will retry");
+                size_t next = 0;
+                auto stored = [&]() -> SwarmStoreResult* {
+                    auto i = next++;
+                    return results && i < results->size() && (*results)[i].stored ? &(*results)[i]
+                                                                                  : nullptr;
+                };
+                bool failed = false;
+                if (group) {
+                    if (auto* r = stored())
+                        mark_device_group_pushed(*group, std::move(r->hash));
+                    else
+                        failed = true;
+                }
+                if (pubkey) {
+                    if (stored())
+                        _mark_published(pubkey->mlkem768, pubkey->x25519);
+                    else
+                        failed = true;
+                }
+
+                if (failed) {
+                    log::warning(cat, "Device group push was not stored in full; will retry");
                     _push_failed();
                     return;
                 }
 
                 _push_stored();
-                mark_device_group_pushed(push, std::move(results->front().hash));
 
                 // A change made while this was in flight found it so and was not pushed; with this
                 // confirmed, nothing else owes it a fetch -- a subscribed device does not poll --
@@ -3816,7 +3866,9 @@ void Devices::_rotate_due_keys() {
 void Devices::_push_soon() {
     // A fetch rather than the push itself: a push goes out only on top of what the swarm holds,
     // which is what stops two devices answering the same update with duelling pushes.
-    if (core.network() && needs_push().device_group)
+    if (!core.network())
+        return;
+    if (auto owed = needs_push(); owed.device_group || owed.account_pubkey)
         core._fetch({config::Namespace::Devices}, nullptr);
 }
 
@@ -3891,8 +3943,11 @@ std::vector<std::byte> Devices::build_account_pubkey_message() {
     auto keys = active_account_keys();
     if (keys.empty())
         throw std::runtime_error{"build_account_pubkey_message: no active account keys"};
-    const auto& k = keys.front();
+    return _account_pubkey_message(keys.front().mlkem768_pub, keys.front().x25519_pub);
+}
 
+std::vector<std::byte> Devices::_account_pubkey_message(
+        std::span<const std::byte, 1184> mlkem768_pub, std::span<const std::byte, 32> x25519_pub) {
     std::vector<std::byte> out(
             2                             // outer dict d...e
             + 3 + bt_bytes_encoded(1184)  // "1:M" + mlkem768_pub
@@ -3901,8 +3956,8 @@ std::vector<std::byte> Devices::build_account_pubkey_message() {
     );
 
     oxenc::bt_dict_producer o{reinterpret_cast<char*>(out.data()), out.size()};
-    o.append("M", k.mlkem768_pub);
-    o.append("X", k.x25519_pub);
+    o.append("M", mlkem768_pub);
+    o.append("X", x25519_pub);
     o.append_signature("~", [seed = core.globals.account_seed()](std::span<const std::byte> body) {
         return xed25519::sign(seed.x25519_key(), body);
     });

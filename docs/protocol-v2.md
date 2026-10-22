@@ -1191,8 +1191,15 @@ The list of all account seeds is then added to the "account_keys" section of the
 payload, including the creation and rotation timestamps (to synchronize with other devices).
 
 This updated device group payload is then re-encrypted for current devices and pushed to the swarm.
-Simultaneously, the rotating client also pushes a device account public key to namespace -21, as
-described above.
+Simultaneously, in the same request, the rotating client also pushes the new account public key to
+namespace -21, as described above -- once the account has enabled PFS/PQ (see "Migration"), and
+not before: publishing the key is what has contacts start sending PFS/PQ messages.
+
+Publishing is otherwise the same as rotating: only a member of a device group in good standing does
+it, and only once a fetch of namespace 21 has been merged.  A member whose current key it has not
+seen on -21 -- neither confirmed by its own store nor fetched back from there -- publishes it after
+its next fetch, on its own if nothing else is owed; so enabling PFS/PQ publishes the current key at
+once, without waiting for a rotation.  A store that fails is retried as a failed group push is.
 
 ### Account Key Rotation timer
 

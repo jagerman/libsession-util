@@ -366,7 +366,7 @@ class Devices final : detail::CoreComponent {
     void init() override;
 
     // Guards against a second push being built before the first is confirmed; see
-    // push_device_group().  `_alive` is what a push callback checks before touching us, since it
+    // push_owed().  `_alive` is what a push callback checks before touching us, since it
     // returns on the network's thread and this component does not outlive its Core.
     bool _push_in_flight = false;
     std::shared_ptr<int> _alive = std::make_shared<int>(0);
@@ -961,9 +961,22 @@ class Devices final : detail::CoreComponent {
     // A push the swarm confirmed: the next failure waits only `PUSH_RETRY_FIRST` again.
     void _push_stored();
 
-    // Fetches the group now if a change of ours owes a push, so that the push following the fetch
-    // carries it: a device subscribed for pushes does not poll, and could otherwise hold the change
-    // until the swarm next had something for it.
+    // The signed account pubkey message for the key with these public halves; see
+    // `build_account_pubkey_message`.
+    std::vector<std::byte> _account_pubkey_message(
+            std::span<const std::byte, 1184> mlkem768_pub,
+            std::span<const std::byte, 32> x25519_pub);
+
+    // Marks the account key with these public halves as one namespace -21 holds, current or
+    // rotated, answering whether there was such a key of ours at all.
+    bool _mark_published(
+            std::span<const std::byte, 1184> mlkem768_pub,
+            std::span<const std::byte, 32> x25519_pub);
+
+    // Fetches the group now if anything is owed a push -- a change of ours, or the account's key
+    // once PFS/PQ is enabled -- so that the push following the fetch carries it: a device
+    // subscribed for pushes does not poll, and could otherwise hold it until the swarm next had
+    // something for it.
     void _push_soon();
 
     // Picks when the device keys made at `created` are to be rotated, and records it.
@@ -1181,6 +1194,11 @@ class Devices final : detail::CoreComponent {
     // Throws if there are no active account keys.
     std::vector<std::byte> build_account_pubkey_message();
 
+    // How long the swarm holds the account pubkey message: as long as a namespace allows, so that a
+    // contact can still find the account's key while all of its devices are away.  A rotation
+    // replaces it long before then, since namespace -21 holds only one message.
+    static constexpr auto ACCOUNT_PUBKEY_TTL = 30 * 24h;
+
     // Flags indicating which messages need to be pushed to the swarm.
     struct NeedsPush {
         bool device_group;    ///< True if an updated device group message needs to be pushed
@@ -1198,7 +1216,10 @@ class Devices final : detail::CoreComponent {
     //   - any account key seed has not yet been distributed via a confirmed push
     //
     // account_pubkey is true when the current active account key has not yet been seen confirmed
-    // on the swarm (i.e. neither we nor another device has pushed it and we've received it back).
+    // on the swarm (i.e. neither we nor another device has pushed it and we've received it back),
+    // this device is a member in good standing as above, and PFS/PQ is enabled for the account
+    // (`Core::pfs_enabled`): publishing the key is what tells contacts to encrypt to it, which
+    // every device of the account must then be able to read.
     NeedsPush needs_push();
 
     // Records that a built device group message reached the swarm: takes the record of ours it
@@ -1206,12 +1227,15 @@ class Devices final : detail::CoreComponent {
     // carried.  `hash` is what the next push names to delete this one.
     void mark_device_group_pushed(const DeviceGroupPush& push, std::string hash);
 
-    // Builds and uploads the device group message, if one is owed and this device is registered.
+    // Builds and uploads whatever `needs_push` says is owed -- the device group message, the
+    // account pubkey message to namespace -21, or both in one request, as after a rotation.  Only
+    // ever called once a fetch has been merged, so that what goes out is built on what the swarm
+    // holds.
     //
     // Does nothing while a push is already in flight: the message is built from a snapshot of the
     // database, so a second one built before the first is confirmed would carry the same records
     // and race it to say what was pushed.
-    void push_device_group();
+    void push_owed();
 };
 
 }  // namespace session::core

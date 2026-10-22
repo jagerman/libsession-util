@@ -410,20 +410,29 @@ TEST_CASE(
     REQUIRE(sent.size() == 1);
     auto reqs = push_requests(*sent[0]);
 
-    // One store and no delete: there is no earlier message of ours to replace yet.
-    REQUIRE(reqs.size() == 1);
+    // The group message and, beside it, the account's key for contacts -- a new account has PFS/PQ
+    // from the start -- and no delete: there is no earlier message of ours to replace yet.
+    REQUIRE(reqs.size() == 2);
     CHECK(reqs[0]["method"] == "store");
     CHECK(reqs[0]["params"]["namespace"] == 21);
     CHECK(reqs[0]["params"]["ttl"] ==
           std::chrono::milliseconds{core::Devices::DEVICE_GROUP_TTL}.count());
+    CHECK(reqs[1]["method"] == "store");
+    CHECK(reqs[1]["params"]["namespace"] == -21);
+    CHECK(reqs[1]["params"]["ttl"] ==
+          std::chrono::milliseconds{core::Devices::ACCOUNT_PUBKEY_TTL}.count());
 
     auto confirm = sent[0]->callback;
     confirm(true,
             false,
             200,
             {},
-            nlohmann::json{{"results", {{{"code", 200}, {"body", {{"hash", "group1"}}}}}}}.dump());
+            nlohmann::json{{"results",
+                            {{{"code", 200}, {"body", {{"hash", "group1"}}}},
+                             {{"code", 200}, {"body", {{"hash", "pubkey1"}}}}}}}
+                    .dump());
     TestHelper::drain(*core);
+    CHECK_FALSE(core->devices.needs_push().account_pubkey);
 
     // Confirmed, so nothing is owed and a second fetch pushes nothing.
     TestHelper::poll(*core);
@@ -444,7 +453,8 @@ TEST_CASE(
     reqs = push_requests(*sent[1]);
 
     // The store, then a delete naming what the first push left in the swarm.  Namespace 21 keeps
-    // every message, so without this the old one sits there for its whole TTL.
+    // every message, so without this the old one sits there for its whole TTL.  No key this time:
+    // the swarm has the current one.
     REQUIRE(reqs.size() == 2);
     CHECK(reqs[0]["method"] == "store");
     CHECK(reqs[1]["method"] == "delete");
@@ -470,10 +480,12 @@ TEST_CASE(
     REQUIRE(sent.size() == 1);
     auto reqs = push_requests(*sent[0]);
 
-    REQUIRE(reqs.size() == 2);
+    // The group message, the account's key, then the delete.
+    REQUIRE(reqs.size() == 3);
     CHECK(reqs[0]["method"] == "store");
-    CHECK(reqs[1]["method"] == "delete");
-    CHECK(reqs[1]["params"]["messages"] == nlohmann::json::array({"theirs1"}));
+    CHECK(reqs[0]["params"]["namespace"] == 21);
+    CHECK(reqs[2]["method"] == "delete");
+    CHECK(reqs[2]["params"]["messages"] == nlohmann::json::array({"theirs1"}));
 }
 
 TEST_CASE(

@@ -781,6 +781,19 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
+    // The same for namespace -21: what the account's key outbox holds, as a fetch of it finds it.
+    static void deliver_pubkey_message(
+            core::Core& core, std::span<const std::byte> data, std::string hash = "pubkey") {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .data = data,
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = clock_now_ms() + core::Devices::ACCOUNT_PUBKEY_TTL};
+            core.devices.parse_account_pubkeys(std::span{&m, 1}, true);
+        });
+    }
+
     // A namespace-21 fetch completing with nothing new, which is still a completed fetch.
     static void finish_fetch(core::Core& core) {
         on_loop(core, [&] { core.devices.parse_device_messages({}, true); });

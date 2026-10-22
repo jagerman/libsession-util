@@ -1713,9 +1713,17 @@ void answer_upload(TempCore& c, MockNetwork& net, bool stored) {
             net,
             "sequence",
             [stored](MockNetwork::SentRequest& r) {
-                auto result = stored ? nlohmann::json{{"code", 200}, {"body", {{"hash", "L1"}}}}
-                                     : nlohmann::json{{"code", 406}, {"body", "refused"}};
-                r.callback(true, false, 200, {}, nlohmann::json{{"results", {result}}}.dump());
+                // One result per store, in order, as the swarm answers: a group push can carry the
+                // account's key beside it.
+                auto results = nlohmann::json::array();
+                for (const auto& req : push_requests(r))
+                    if (req["method"] == "store") {
+                        auto hash = results.empty() ? "L1"s : "L1-{}"_format(results.size());
+                        results.push_back(
+                                stored ? nlohmann::json{{"code", 200}, {"body", {{"hash", hash}}}}
+                                       : nlohmann::json{{"code", 406}, {"body", "refused"}});
+                    }
+                r.callback(true, false, 200, {}, nlohmann::json{{"results", results}}.dump());
             },
             1);
     REQUIRE(answered == 1);
@@ -2490,7 +2498,8 @@ std::pair<std::vector<std::byte>, nlohmann::json> pushed(const MockNetwork::Sent
     std::vector<std::byte> stored;
     nlohmann::json deleted = nlohmann::json::array();
     for (const auto& req : reqs) {
-        if (req["method"] == "store")
+        // Namespace 21's: the account's key for contacts, to -21, can go out beside it.
+        if (req["method"] == "store" && req["params"]["namespace"] == 21)
             stored = to_vector<std::byte>(
                     oxenc::from_base64(req["params"]["data"].get<std::string_view>()));
         else if (req["method"] == "delete")
@@ -2503,8 +2512,9 @@ std::pair<std::vector<std::byte>, nlohmann::json> pushed(const MockNetwork::Sent
 std::vector<MockNetwork::SentRequest*> dissolutions(MockNetwork& net) {
     std::vector<MockNetwork::SentRequest*> out;
     for (auto* p : pushes(net)) {
-        auto stored = pushed(*p).first;
-        if (stored.empty() || oxenc::bt_dict_consumer{stored}.require<std::string_view>("") != "G")
+        auto [stored, deleted] = pushed(*p);
+        if (stored.empty() ? !deleted.empty()
+                           : oxenc::bt_dict_consumer{stored}.require<std::string_view>("") != "G")
             out.push_back(p);
     }
     return out;
@@ -3239,6 +3249,7 @@ TEST_CASE(
     REQUIRE(l.core->devices.membership(await).membership == device::Membership::Forked);
     // Nothing of its own owed, so that the push the fetch sends below is the dissolution's.
     l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G0");
+    TestHelper::deliver_pubkey_message(*l.core, l.core->devices.build_account_pubkey_message());
 
     REQUIRE(l.core->devices.dissolve_group(theirs, await));
     CHECK(pending_pushes(l.core) == 1);
@@ -5223,7 +5234,11 @@ TEST_CASE(
     auto answered = answer_requests(
             *net,
             [](const MockNetwork::SentRequest& r) {
-                return r.request.endpoint == "sequence" && push_requests(r).size() == 2;
+                if (r.request.endpoint != "sequence")
+                    return false;
+                auto [stored, deleted] = pushed(r);
+                return !stored.empty() &&
+                       oxenc::bt_dict_consumer{stored}.require<std::string_view>("") == "T";
             },
             [](MockNetwork::SentRequest& r) {
                 nlohmann::json results = nlohmann::json::array(
@@ -5553,6 +5568,78 @@ TEST_CASE(
 
     CHECK_FALSE(c->devices.needs_push().device_group);
     CHECK(c->devices.devices(true, true, true).at(Linking::id_of(c)).description == "renamed");
+}
+
+namespace {
+// The namespaces a push stores to, in order.
+std::vector<int> stored_namespaces(const MockNetwork::SentRequest& push) {
+    std::vector<int> out;
+    for (const auto& req : push_requests(push))
+        if (req["method"] == "store")
+            out.push_back(req["params"]["namespace"].get<int>());
+    return out;
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - the account's key goes to -21 once PFS/PQ is enabled, by a member",
+        "[core][devices][push][pfs]") {
+    // The applicant is restored, so its account has not enabled PFS/PQ.
+    Linking l;
+    auto* net = attach_mock_network(*l.applicant);
+    TestHelper::finish_fetch(*l.applicant);
+    REQUIRE_FALSE(l.applicant->pfs_enabled());
+
+    // Outside the group the setting is taken, but nothing is published: only a member keeps the
+    // key current.
+    l.applicant->enable_pfs();
+    TestHelper::drain(*l.applicant);
+    CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+
+    // Admitted, and its group message pushed: what is owed then is the key alone, beside nothing.
+    l.admit();
+    TestHelper::finish_fetch(*l.applicant);
+    while (!pushes(*net).empty()) {
+        if (stored_namespaces(*pushes(*net).front()) == std::vector{-21})
+            break;
+        answer_upload(l.applicant, *net, true);
+    }
+    REQUIRE(pushes(*net).size() == 1);
+    CHECK(stored_namespaces(*pushes(*net).front()) == std::vector{-21});
+
+    // Refused, it is tried again as any push is; stored, nothing is owed.
+    answer_upload(l.applicant, *net, false);
+    CHECK(retry_in(l.applicant) == Devices::PUSH_RETRY_FIRST);
+    retry_now(l.applicant, *net);
+    CHECK(stored_namespaces(*pushes(*net).front()) == std::vector{-21});
+    answer_upload(l.applicant, *net, true);
+    CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
+    CHECK_FALSE(TestHelper::push_retry_due(*l.applicant));
+}
+
+TEST_CASE(
+        "Devices - enabling PFS/PQ on a member fetches, and then publishes the key",
+        "[core][devices][push][pfs]") {
+    Linking l;
+    l.admit();
+    auto* net = attach_mock_network(*l.applicant);
+    TestHelper::finish_fetch(*l.applicant);
+    while (!pushes(*net).empty())
+        answer_upload(l.applicant, *net, true);
+    REQUIRE_FALSE(l.applicant->devices.needs_push().device_group);
+    REQUIRE_FALSE(l.applicant->devices.needs_push().account_pubkey);
+
+    // Not waiting for the swarm to send something: the fetch a push follows, asked for now.
+    l.applicant->enable_pfs();
+    REQUIRE(eventually(*l.applicant, [&] {
+        return std::ranges::any_of(net->sent_requests, is_device_fetch);
+    }));
+    REQUIRE(answer_fetch(l.applicant, *net) == 1);
+    REQUIRE(pushes(*net).size() == 1);
+    CHECK(stored_namespaces(*pushes(*net).front()) == std::vector{-21});
+    answer_upload(l.applicant, *net, true);
+    CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
 }
 
 TEST_CASE(
