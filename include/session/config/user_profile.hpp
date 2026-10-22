@@ -360,7 +360,8 @@ class UserProfile : public ConfigBase {
     /// Raises the above.  One-way: lowering it would not make the account readable by devices that
     /// cannot read the newer messages, since contacts that have already fetched its keys go on
     /// using them, so it is refused rather than half-honoured.  Setting the current value is a
-    /// no-op.
+    /// no-op.  An application enables PFS/PQ through `Core::enable_pfs`, which also has the
+    /// account's keys published, rather than through this.
     ///
     /// Inputs:
     /// - `version` -- the new lowest version; at least the current one.

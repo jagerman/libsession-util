@@ -30,6 +30,7 @@
 
 #include "core/swarm_request.hpp"
 #include "session/config/namespaces.hpp"
+#include "session/config/user_profile.hpp"
 #include "session/core/component.hpp"
 
 namespace session::core {
@@ -667,6 +668,23 @@ void Core::fetch_user_profile(std::function<void(bool found)> done) {
             }
         });
     });
+}
+
+void Core::enable_pfs() {
+    call_get([this] {
+        auto& profile = configs.user_profile();
+        if (profile.get_min_message_version() < 2)
+            profile.set_min_message_version(2);
+        devices._push_soon();
+    });
+}
+
+bool Core::pfs_enabled() {
+    return call_get([this] { return _pfs_enabled(); });
+}
+
+bool Core::_pfs_enabled() {
+    return configs.user_profile().get_min_message_version() >= 2;
 }
 
 /// The body of a profile retrieve: one namespace, and no cursor.

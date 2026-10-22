@@ -442,6 +442,9 @@ class Core {
     void _fetch(std::vector<config::Namespace> namespaces, std::function<void(bool)> done);
     std::map<std::vector<config::Namespace>, std::vector<std::function<void(bool)>>> _fetches;
 
+    // `pfs_enabled()` once on the loop.
+    bool _pfs_enabled();
+
     // Sends one round of retrieves to `node` for `namespaces`.  A retrieve is capped by the storage
     // server, so one round may not exhaust a namespace; `round` counts continuations and bounds
     // them.  Every round goes to the same node: the retrieve cursor is stored per (namespace,
@@ -774,6 +777,31 @@ class Core {
     /// to call without waiting on it: what it finds is merged into `configs` like anything a poll
     /// brings in, and the retrieve cursor it records means the next poll carries on from there.
     void fetch_user_profile(std::function<void(bool found)> done);
+
+    /// Enables PFS/PQ for the account: declares that every device of it reads the messages contacts
+    /// send with PFS/PQ encryption, so that the account publishes the keys they encrypt to.
+    ///
+    /// **One-way: there is no disabling it.**  A contact keeps keys it has fetched for weeks after
+    /// they stop being published, so turning it off would take that long to take effect, and the
+    /// only reason to want it off -- adding a device that cannot read these messages -- would not
+    /// be helped by it.  Offer it to the user only while `devices.membership()` is `InGroup`,
+    /// beside the device list they are confirming is complete: a device outside the group, a legacy
+    /// Session client included, stops receiving messages from contacts that switch to the new
+    /// encryption.  A new account has it from the start; see the device groups guide.
+    ///
+    /// Raises the user profile's lowest message version to 2 (a no-op once it is that or more),
+    /// which reaches the account's other devices as any config change does, and has this device
+    /// publish the account's keys to namespace -21 as soon as it can: once it is a member in good
+    /// standing, after a fetch.  Calling it on a device outside its group is allowed; the setting
+    /// still syncs, and publishing waits for a member to do it.
+    ///
+    /// Callable from any thread; the work is done on Core's loop before this returns.  Requires an
+    /// account.
+    void enable_pfs();
+
+    /// Whether PFS/PQ is enabled for the account, by this device or another (see `enable_pfs`).
+    /// Callable from any thread.  Requires an account.
+    bool pfs_enabled();
 
     /// Encrypt and send a direct message to the given recipient.
     ///
