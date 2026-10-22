@@ -782,6 +782,17 @@ class Client : private core::DeviceEvents {
     // accumulate in _early_status forever.
     std::unordered_map<int64_t, int64_t> _sync_sends;  // core send id -> client message id
 
+    // Sync copies not sent yet, by the Core send id of their recipient copy: each waits until that
+    // copy has been encrypted, so that it can carry how (`DataMessage.syncEncryption`), or until
+    // that send ends without being encrypted at all.  Serialised, since only the source file sees
+    // the protobuf types.
+    struct PendingSync {
+        int64_t client_id;
+        std::string synced;
+        sys_ms timestamp;
+    };
+    std::unordered_map<int64_t, PendingSync> _pending_syncs;
+
     // Sends whose outcome nobody is waiting for -- the media-saved notification is the only one so
     // far.  Tracked rather than left unregistered so that their statuses are dropped as they
     // arrive, instead of accumulating in _early_status against ids that will never be claimed.
@@ -1440,8 +1451,9 @@ class Client : private core::DeviceEvents {
             const SessionProtos::DataExtractionNotification& note,
             sys_ms when);
 
-    // Hands a stored message to Core: the recipient's copy and, unless it is a note to self, the
-    // copy for our own swarm.  Shared by the plain and attachment-carrying sends.
+    // Hands a stored message to Core: the recipient's copy, and -- unless it is a note to self --
+    // the copy for our own swarm, once `_release_sync` lets it go.  Shared by the plain and
+    // attachment-carrying sends.
     void _dispatch_sends(
             int64_t client_id,
             const ConversationId& id,
@@ -1449,6 +1461,13 @@ class Client : private core::DeviceEvents {
             const SessionProtos::Content& synced,
             sys_ms now,
             bool to_self);
+
+    // Sends the sync copy waiting on the recipient copy `core_id`, if `status` decides it: an
+    // encryption reported, which the copy then carries, or a send that ended without one.
+    void _release_sync(
+            int64_t core_id,
+            core::MessageSendStatus status,
+            std::optional<core::MessageEncryption> encryption);
 
     // Runs `work` on the loop thread, logging rather than propagating anything it throws: an
     // exception escaping there has no caller to reach and would take the loop with it.

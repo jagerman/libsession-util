@@ -1161,6 +1161,19 @@ constructed as follows:
 
    that is, 1536 + 256×N (e.g. 1536 minimum, but expandable in increments of 256 bytes).
 
+### Our own copy of a sent message
+
+A one-to-one message is sent twice: to the recipient, and to the sender's own swarm so that the
+sender's other devices see it, that copy's DataMessage carrying `syncTarget` to say whose
+conversation it belongs to.  Each copy is encrypted for its own destination, so the copy in our own
+swarm says nothing of how the recipient's was encrypted.  It carries that instead as
+`DataMessage.syncEncryption` (field 1000): 1 for v1, 2 for v2 without PFS (the fallback), 3 for v2
+with PFS+PQ.  It is set only on that copy, never on the recipient's, and only once the recipient's
+copy has been encrypted -- which can wait on fetching the recipient's keys -- so the copy for our
+own swarm is sent after the recipient's is encrypted, not beside it.  A copy without the field (one
+whose recipient's copy was never encrypted, or from a client that does not set it) leaves the other
+devices not knowing, and an unknown value is ignored.
+
 ## Account Key Rotation
 
 Clients rotate the account keys, shared by all devices, 12h+ε after the current one was created.  ε

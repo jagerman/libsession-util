@@ -4418,20 +4418,43 @@ void Client::_dispatch_sends(
             to_self ? core.send_dm(self, synced, now) : core.send_dm(id.session_id(), content, now);
     _send_ids[core_id] = OutgoingSend{client_id, to_self};
 
+    // The sync copy waits to say how the recipient's was encrypted, which Core decides only once it
+    // has the recipient's keys.  Registered before the stash below is drained, since that may be
+    // what releases it.
+    if (!to_self)
+        _pending_syncs[core_id] = PendingSync{client_id, synced.SerializeAsString(), now};
+
     // send_dm() reports its first status synchronously, i.e. before we knew the id to map it to.
     if (auto stashed = _early_status.extract(core_id)) {
         auto& [status, hash, encryption] = stashed.mapped();
         _apply_send_status(
                 client_id, status, false, to_self ? opt_view(hash) : std::nullopt, encryption);
+        _release_sync(core_id, status, encryption);
     }
+}
 
-    if (!to_self) {
-        auto sync_id = core.send_dm(self, synced, now);
-        _sync_sends[sync_id] = client_id;
-        if (auto stashed = _early_status.extract(sync_id)) {
-            auto& [status, hash, encryption] = stashed.mapped();
-            _apply_send_status(client_id, status, true, opt_view(hash));
-        }
+void Client::_release_sync(
+        int64_t core_id,
+        core::MessageSendStatus status,
+        std::optional<core::MessageEncryption> encryption) {
+    auto it = _pending_syncs.find(core_id);
+    if (it == _pending_syncs.end() || !(encryption || is_terminal(status)))
+        return;
+    auto pending = std::move(it->second);
+    _pending_syncs.erase(it);
+
+    // Without the field when the recipient's copy was never encrypted: our other devices still
+    // need the message, and only lack the detail.
+    SessionProtos::Content synced;
+    synced.ParseFromString(pending.synced);
+    if (encryption)
+        synced.mutable_datamessage()->set_syncencryption(static_cast<uint32_t>(*encryption));
+
+    auto sync_id = core.send_dm(core.globals.session_id(), synced, pending.timestamp);
+    _sync_sends[sync_id] = pending.client_id;
+    if (auto stashed = _early_status.extract(sync_id)) {
+        auto& [sync_status, hash, sync_encryption] = stashed.mapped();
+        _apply_send_status(pending.client_id, sync_status, true, opt_view(hash));
     }
 }
 
@@ -6261,7 +6284,7 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
     auto msgid = msgid_of(content);
 
     bool created = false, inserted = false, renamed = false, contact_changed = false,
-         approved_them = false;
+         approved_them = false, encryption_filled = false;
     int64_t client_id = 0;
     std::vector<std::string> arrived_urls;
     {
@@ -6340,10 +6363,16 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
 
         // What this envelope used is what the message was sent with only when it was sent to us:
         // an incoming message, or a note to self.  Our own message to someone else comes back
-        // encrypted to us, which says nothing of what reached them.
+        // encrypted to us, which says nothing of what reached them; the device that sent it says
+        // that in the copy, if it knew.
         std::optional<int> encryption;
         if (!outgoing || is_me(convo_with))
             encryption = static_cast<int>(msg.encryption);
+        else if (auto e = data.syncencryption();
+                 data.has_syncencryption() &&
+                 e >= static_cast<uint32_t>(core::MessageEncryption::v1) &&
+                 e <= static_cast<uint32_t>(core::MessageEncryption::v2_pfs))
+            encryption = static_cast<int>(e);
 
         inserted = c.prepared_exec(
                            R"(
@@ -6386,6 +6415,19 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
             )",
                         convo.id,
                         epoch_ms(ts));
+        } else if (outgoing && encryption && msgid) {
+            // Our own message already here, as on the device that sent it: what the copy says
+            // fills in only what was never recorded, and never replaces what was.
+            if (auto filled = c.prepared_maybe_get<int64_t>(
+                        "UPDATE messages SET encryption = ? WHERE conversation = ? AND timestamp "
+                        "= ? AND msgid = ? AND encryption IS NULL RETURNING id",
+                        *encryption,
+                        convo.id,
+                        epoch_ms(ts),
+                        *msgid)) {
+                client_id = *filled;
+                encryption_filled = true;
+            }
         }
 
         // Skipped for a self-send: the LokiProfile on one of those is our own, which belongs to the
@@ -6423,6 +6465,8 @@ void Client::_on_message_received(core::ReceivedMessage&& msg) {
         _auto_download(convo_id, client_id);
         _emit_message(true, client_id);
     }
+    if (encryption_filled)
+        _emit_message(false, client_id);
     if (inserted || renamed)
         _touch(convo_id);
 
@@ -6476,6 +6520,7 @@ void Client::_on_send_status(
     if (is_terminal(status))
         _send_ids.erase(it);
     _apply_send_status(client_id, status, false, own_swarm ? swarm_hash : std::nullopt, encryption);
+    _release_sync(core_id, status, encryption);
 }
 
 void Client::_apply_send_status(

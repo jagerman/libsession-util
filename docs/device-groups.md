@@ -436,7 +436,10 @@ application), and is the cue to read `pfs_key_info` again.
 What a message actually used is on the message: `Message::encryption` (`v1`, `v2_basic`, or
 `v2_pfs` for PFS+PQ). For an incoming message it is what its envelope used. For one this device
 sent it is what went to the recipient, unset until Core has encrypted it -- which can wait on
-fetching the recipient's keys -- and unset for messages from before it was recorded.
+fetching the recipient's keys -- and unset for messages from before it was recorded. The account's
+other devices learn it from our own copy of the message, which says how the recipient's was
+encrypted, so for a message sent elsewhere it appears once that copy arrives, and not at all for one
+sent by a client that does not say.
 
 ### A key that is not the account's
 
