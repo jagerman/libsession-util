@@ -4500,6 +4500,7 @@ TEST_CASE(
         "[core][devices][rotation]") {
     Linking l;
     CHECK_FALSE(l.applicant->devices.scheduled_account_rotation());
+    CHECK(l.applicant->devices.account_rotation_schedule().empty());
 
     l.admit();
     TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
@@ -4517,6 +4518,24 @@ TEST_CASE(
                                 {*l.core->devices.next_account_rotation(),
                                  *l.applicant->devices.next_account_rotation(),
                                  *third->devices.next_account_rotation()}));
+
+    // The whole schedule: one slot per member, earliest first, each member's its own time, and the
+    // same list on every member.
+    auto schedule = l.core->devices.account_rotation_schedule();
+    REQUIRE(schedule.size() == 3);
+    CHECK(std::ranges::is_sorted(schedule, {}, &decltype(schedule)::value_type::second));
+    CHECK(schedule.front().second == *scheduled);
+    CHECK(l.applicant->devices.account_rotation_schedule() == schedule);
+    std::set<device::Id> ids;
+    for (const auto& [id, at] : schedule)
+        ids.insert(id);
+    CHECK(ids == std::set{Linking::id_of(l.core), l.applicant_id(), third_id});
+    for (auto* member : {&l.core, &l.applicant, &third}) {
+        auto id = Linking::id_of(*member);
+        auto mine = std::ranges::find(schedule, id, &decltype(schedule)::value_type::first);
+        REQUIRE(mine != schedule.end());
+        CHECK(mine->second == *(*member)->devices.next_account_rotation());
+    }
 
     // The third leaves, holding the current key, so the other two replace it early -- each at a
     // moment of its own.  What they show the user stays one time, and the schedule's.

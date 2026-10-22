@@ -3930,15 +3930,23 @@ std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotat
     return scheduled;
 }
 
-std::optional<std::chrono::system_clock::time_point> Devices::scheduled_account_rotation() {
+std::vector<std::pair<device::Id, std::chrono::system_clock::time_point>>
+Devices::account_rotation_schedule() {
+    std::vector<std::pair<device::Id, std::chrono::system_clock::time_point>> out;
     auto basis = _rotation_basis();
     if (!basis)
-        return std::nullopt;
-    std::optional<std::chrono::system_clock::time_point> first;
+        return out;
     for (const auto& device : basis->registered)
-        if (auto t = _rotation_slot(*basis, device); !first || t < *first)
-            first = t;
-    return first;
+        out.emplace_back(device, _rotation_slot(*basis, device));
+    std::ranges::sort(out, {}, &decltype(out)::value_type::second);
+    return out;
+}
+
+std::optional<std::chrono::system_clock::time_point> Devices::scheduled_account_rotation() {
+    auto schedule = account_rotation_schedule();
+    if (schedule.empty())
+        return std::nullopt;
+    return schedule.front().second;
 }
 
 std::optional<sys_ms> Devices::_early_account_rotation(int64_t key) {

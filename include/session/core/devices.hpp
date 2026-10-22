@@ -1180,16 +1180,22 @@ class Devices final : detail::CoreComponent {
     // while this device is replacing the key early.
     std::optional<std::chrono::system_clock::time_point> next_account_rotation();
 
-    // When the group's next scheduled account key rotation falls: the earliest of every registered
-    // device's slot, each reckoned as `next_account_rotation` reckons this device's.  Every member
-    // computes the same time from the same group, so this is the one to show a user.  The rotation
-    // happens then only if the device whose slot it is is online to make it; otherwise the next
-    // slot's device does.
+    // Every registered device's slot to rotate the account key, each reckoned as
+    // `next_account_rotation` reckons this device's, earliest first.  Every member computes the
+    // same list from the same group.  The group rotates at the earliest slot whose device is online
+    // then to make it.
     //
-    // Early replacement is not included: when and whether a device replaces the key early is its
-    // own (each picks its own jittered moment, and the remover goes at once), so no time including
-    // it could be the same on every device.  Nullopt for a device that is not a member of a group
-    // in good standing, or with no active key.
+    // Early replacement is not in it: when and whether a device replaces the key early is its own
+    // (each picks its own jittered moment, and the remover goes at once), so no list including it
+    // could be the same on every device; this device's is in `next_account_rotation`.  Empty for a
+    // device that is not a member of a group in good standing, or with no active key.
+    std::vector<std::pair<device::Id, std::chrono::system_clock::time_point>>
+    account_rotation_schedule();
+
+    // When the group's next scheduled account key rotation falls: the first slot of
+    // `account_rotation_schedule`, and so the same on every member -- the one to show a user.  The
+    // rotation happens then only if the device whose slot it is is online to make it; otherwise
+    // the next slot's device does.  Nullopt where the schedule is empty.
     std::optional<std::chrono::system_clock::time_point> scheduled_account_rotation();
 
     bool account_rotation_due() {

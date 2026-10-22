@@ -413,7 +413,8 @@ whether it is on, whichever device turned it on.
 To show when the account's key next changes, use `devices.scheduled_account_rotation()`, which is
 the same on every device of the group. It changes then only if the device whose turn it is is
 online; `next_account_rotation()` is this device's own turn, and may be earlier while it is
-replacing the key early.
+replacing the key early. To list every device's turn, in order, use
+`devices.account_rotation_schedule()`: the key changes at the first of them whose device is online.
 
 ### A key that is not the account's
 
