@@ -2420,6 +2420,8 @@ bool Devices::_confirm_link() {
         hash = std::move(h);
     }
     receive_device_group_message(admission, hash, true);
+    if (_member())
+        _reread_account_pubkeys();
     _flush_events();
     return true;
 }
@@ -3163,6 +3165,7 @@ void Devices::_forget_group() {
     core.globals.erase(displaced_key);
     core.globals.erase(dropped_key);
     core.globals.erase(dissolved_key);
+    core.globals.erase(suspect_pubkeys_key);
 }
 
 bool Devices::_displaced() {
@@ -3191,6 +3194,8 @@ void Devices::_note_read(sys_ms t) {
         if (auto at = core.globals.get_integer(key); at && ms >= *at) {
             core.globals.erase(key);
             log::info(cat, "This device can read its device group again");
+            if (_member())
+                _reread_account_pubkeys();
         }
 }
 
@@ -3281,6 +3286,7 @@ device::GroupId Devices::_start_device_group() {
     // The account can have only one group, and the user starting this one with others in view is
     // choosing it over them.  Not news to this device, which is making the choice.
     _dissolve_all_but(*group);
+    _reread_account_pubkeys();
 
     _devices_changed = true;
     _rebaseline_membership();
@@ -3560,8 +3566,13 @@ void Devices::parse_device_messages(std::span<const SwarmMessage> messages, bool
     push_owed();
     _send_pending_pushes();
 
-    // Keys seen on -21 whose fetch failed, or that were waiting across a restart.
-    _verify_suspects();
+    // Keys seen on -21 whose fetch failed, or that were waiting across a restart -- unless this
+    // device is no longer a member: whatever it lost good standing to, it has no keys to judge them
+    // by now, and one it held while away could be rotated out of reach by the time it is back.
+    if (_member())
+        _verify_suspects();
+    else
+        core.globals.erase(suspect_pubkeys_key);
 }
 
 void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool /*is_final*/) {
@@ -3570,6 +3581,11 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
 
     // The x25519 pubkey for signature verification: session_id() is 0x05 || x25519_pub
     auto x25519_pub = core.globals.session_id().subspan<1>();
+
+    // Only a member in good standing judges what -21 holds.  A device outside the group holds none
+    // of its keys, or stale ones, so every key of its group would look like none of the account's;
+    // it reads -21 again from the start once it is a member (see `_reread_account_pubkeys`).
+    bool member = _member();
 
     for (const auto& msg : messages) {
         try {
@@ -3586,7 +3602,7 @@ void Devices::parse_account_pubkeys(std::span<const SwarmMessage> messages, bool
                                     "failed"};
                     });
 
-            if (_mark_published(M, X))
+            if (_mark_published(M, X) || !member)
                 continue;
 
             // Not ours, as far as we know yet.  Whatever PFS/PQ says: a seed holder publishing a
@@ -3624,11 +3640,23 @@ void Devices::_verify_suspects() {
             });
 }
 
+void Devices::_reread_account_pubkeys() {
+    // The retrieve cursor would otherwise resume past whatever -21 held before now, and a key
+    // published before this device could judge it -- a rogue one included -- would never be judged.
+    conn().prepared_exec(
+            "DELETE FROM swarm_hashes WHERE namespace = ?",
+            static_cast<int16_t>(config::Namespace::AccountPubkeys));
+}
+
 void Devices::_judge_suspects() {
     auto held = core.globals.get_blob(suspect_pubkeys_key);
     if (!held)
         return;
     core.globals.erase(suspect_pubkeys_key);
+
+    // No longer a member, so no longer holding the keys to judge them by; read again on rejoining.
+    if (!_member())
+        return;
 
     constexpr size_t X_SIZE = 32, M_SIZE = mlkem768::PUBLICKEYBYTES;
     bool rogue = false;

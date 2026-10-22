@@ -781,6 +781,22 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         });
     }
 
+    // Leaves `hash` as where the next retrieve of `ns` from `node` resumes, as a poll that returned
+    // it would.
+    static void record_swarm_cursor(
+            core::Core& core,
+            const network::service_node& node,
+            config::Namespace ns,
+            std::string hash) {
+        on_loop(core, [&] {
+            core::SwarmMessage m{
+                    .hash = std::move(hash),
+                    .timestamp = clock_now_ms(),
+                    .expiry = clock_now_ms() + std::chrono::hours{24}};
+            core._record_swarm_cursor(node.remote_pubkey, ns, std::span{&m, 1});
+        });
+    }
+
     // Sets `core`'s rogue_account_key callback after the fact, for a Core built with other
     // callbacks of its own.
     static void set_rogue_account_key(core::Core& core, std::function<void()> f) {

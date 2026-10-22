@@ -426,7 +426,13 @@ over the rogue one at once. It deletes nothing, since whoever has the phrase can
 It fires whether or not PFS/PQ is enabled -- a seed holder can publish a key either way, and
 contacts encrypt to whatever they find -- and may fire again for the same key. It is never raised
 for a key another of the user's devices has just rotated to: that is checked against the device
-group before anything is reported. One case need not be an attack: a `Forked` account whose other
+group before anything is reported.
+
+Only a device that is in its group (`InGroup` or `Forked`) can raise it. One outside the group --
+restored and not yet linked, asking to join, or removed, displaced, dropped or dissolved -- holds
+none of the group's keys to compare against, so it never reports. It does not miss a key published
+in the meantime, though: on joining, a device reads the account's published key again from the
+start, and judges it then. One case need not be an attack: a `Forked` account whose other
 group publishes its own key. That is still a device holding the phrase outside this group, but it
 may well be the user's own; settle the fork (see "Forks") and the alert has its explanation.
 

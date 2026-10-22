@@ -1422,9 +1422,20 @@ account's means that someone outside the account's devices holds the seed.  It i
 same class as the others a seed holder can make (see "Displaced devices"), and answered the same
 way: by making it seen.
 
-Every device checks each key it finds on -21 against the account keys it holds, current and rotated
-alike, whatever `v` says: a seed holder publishing a key need not have set it, and contacts encrypt
-to whatever they find.  A key that is none of them:
+Every member of a device group in good standing checks each key it finds on -21 against the account
+keys it holds, current and rotated alike, whatever `v` says: a seed holder publishing a key need not
+have set it, and contacts encrypt to whatever they find.  Only such a member judges.  A device
+outside the group -- one that has never joined, is asking to, or was removed, displaced, dropped or
+dissolved -- holds none of its group's keys, or stale ones, and could not tell a rogue key from its
+group's own; it judges nothing, and forgets any key it was still checking when it stops being a
+member, since a key seen then may have been rotated away for good by the time it is back.
+
+So that a key published before a device could judge it is still seen, a device that becomes a
+member in good standing -- starting a group, having its admission confirmed, or reading its group
+again after being displaced or dropped -- forgets where its retrieves of -21 had reached, and its
+next poll reads what -21 holds from the start.
+
+A key that is none of the member's:
 
 - **Is not judged on sight.**  A key another device of the account has just rotated to reaches -21
   and namespace 21 in separate stores, and a device can see the -21 one first: in one poll whose

@@ -979,6 +979,10 @@ class Devices final : detail::CoreComponent {
     // waiting, or no network to fetch with.
     void _verify_suspects();
 
+    // Has the next poll read namespace -21 from the start, for a device that has just become a
+    // member in good standing: the first point at which it can judge what -21 holds.
+    void _reread_account_pubkeys();
+
     // What that fetch decides: a key now known was a rotation; one still unknown is rogue, which
     // `callbacks::rogue_account_key` reports and, with PFS/PQ enabled, our own key is published
     // over.

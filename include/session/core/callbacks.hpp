@@ -226,6 +226,10 @@ struct callbacks {
     /// moment before its group message reaches this device, so a key not yet known is checked again
     /// after a fetch of the device group, and reported only if it is still unknown then.  May fire
     /// more than once for the same key, if it is seen again.
+    ///
+    /// Only on a device that is a member of its group in good standing (`InGroup` or `Forked`): one
+    /// outside it holds none of the group's keys to compare against.  A device that becomes a
+    /// member reads -21 again from the start, so a key published before then is still judged.
     std::function<void()> rogue_account_key;
 };
 

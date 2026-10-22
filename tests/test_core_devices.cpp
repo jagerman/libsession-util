@@ -5734,6 +5734,87 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - a device outside its group does not judge what -21 holds",
+        "[core][devices][pfs][rogue]") {
+    Linking l;
+    int alerts = 0;
+    TestHelper::set_rogue_account_key(*l.applicant, [&alerts] { alerts++; });
+    std::vector<std::byte> key;
+
+    SECTION("restored, with its account's group in view: the group's own key") {
+        // Holding no account keys at all, so every key of its group is one it does not hold.
+        l.show_group();
+        REQUIRE(l.applicant->devices.membership(await).membership ==
+                device::Membership::DeviceGroupVisible);
+        key = l.core->devices.build_account_pubkey_message();
+    }
+    SECTION("removed: a key it does not hold") {
+        l.admit();
+        REQUIRE(l.core->devices.remove_device(l.applicant_id(), await));
+        TestHelper::deliver_device_message(
+                *l.applicant,
+                l.core->devices.build_device_group_message().message,
+                in(10min),
+                "G2");
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Removed);
+        key = foreign_pubkey_message(l.core);
+    }
+
+    auto* net = attach_mock_network(*l.applicant);
+    TestHelper::deliver_pubkey_message(*l.applicant, key, "P1");
+    TestHelper::drain(*l.applicant);
+    CHECK(alerts == 0);
+    CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+}
+
+TEST_CASE(
+        "Devices - a device reads -21 again once admitted, and judges it then",
+        "[core][devices][pfs][rogue]") {
+    Linking l;
+    int alerts = 0;
+    TestHelper::set_rogue_account_key(*l.applicant, [&alerts] { alerts++; });
+    auto* net = attach_mock_network(*l.applicant);
+    net->current_node.remote_pubkey[0] = std::byte{0xAA};
+    auto cursor = [&] {
+        return TestHelper::namespace_last_hash(
+                *l.applicant,
+                static_cast<int16_t>(config::Namespace::AccountPubkeys),
+                net->current_node.remote_pubkey);
+    };
+    // Answers every fetch of the group asked for, so that a key held over from before would be
+    // judged by the time this returns.
+    auto settle = [&] {
+        while (std::ranges::any_of(net->sent_requests, is_device_fetch))
+            answer_fetch(l.applicant, *net);
+        while (!pushes(*net).empty())
+            answer_upload(l.applicant, *net, true);
+    };
+
+    bool rogue = GENERATE(false, true);
+    auto key =
+            rogue ? foreign_pubkey_message(l.core) : l.core->devices.build_account_pubkey_message();
+
+    // Seen while asking, and passed by the retrieve cursor, as a poll leaves it.
+    TestHelper::deliver_pubkey_message(*l.applicant, key, "P1");
+    TestHelper::record_swarm_cursor(
+            *l.applicant, net->current_node, config::Namespace::AccountPubkeys, "P1");
+    REQUIRE(cursor() == "P1");
+
+    // Admitted: the cursor is gone, so the next poll reads -21 from the start -- and nothing from
+    // before is held over to be judged.
+    l.admit();
+    CHECK_FALSE(cursor());
+    TestHelper::finish_fetch(*l.applicant);
+    settle();
+    CHECK(alerts == 0);
+
+    // What the re-read finds, judged now that it holds the group's keys.
+    TestHelper::deliver_pubkey_message(*l.applicant, key, "P1");
+    settle();
+    CHECK(alerts == (rogue ? 1 : 0));
+}
+
+TEST_CASE(
         "Devices - two fetches of the same namespace asked at once are one request",
         "[core][devices][fetch]") {
     TempCore c;
