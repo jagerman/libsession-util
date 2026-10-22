@@ -3675,11 +3675,18 @@ void Devices::_verify_suspects() {
 }
 
 void Devices::_reread_account_pubkeys() {
-    // The retrieve cursor would otherwise resume past whatever -21 held before now, and a key
-    // published before this device could judge it -- a rogue one included -- would never be judged.
+    // Forgetting the cursor is what makes the next read of -21 a full one: it would otherwise
+    // resume past whatever -21 held before now, and a key published before this device could judge
+    // it -- a rogue one included -- would never be judged.
     conn().prepared_exec(
             "DELETE FROM swarm_hashes WHERE namespace = ?",
             static_cast<int16_t>(config::Namespace::AccountPubkeys));
+
+    // And the fetch is what makes there be a next read: a device subscribed for pushes does not
+    // poll, and -21 sends it nothing until something new lands there.  Without a network the first
+    // poll once one is attached reads it.
+    if (core.network())
+        core._fetch({config::Namespace::AccountPubkeys}, nullptr);
 }
 
 void Devices::_judge_suspects() {

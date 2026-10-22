@@ -1603,21 +1603,31 @@ using Asked = std::optional<Expected<Devices::OutgoingLinkRequest>>;
 
 // Whether `r` is the fetch of the device namespace alone that asking to join begins with, rather
 // than an ordinary poll.
-bool is_device_fetch(const MockNetwork::SentRequest& r) {
+// A fetch of namespace `ns` alone, as Devices asks for one outside the polling schedule.
+bool is_fetch_of(const MockNetwork::SentRequest& r, int ns) {
     if (r.request.endpoint != "batch")
         return false;
     auto reqs = push_requests(r);
-    return reqs.size() == 1 && reqs[0]["params"]["namespace"] == 21;
+    return reqs.size() == 1 && reqs[0]["params"]["namespace"] == ns;
+}
+
+bool is_device_fetch(const MockNetwork::SentRequest& r) {
+    return is_fetch_of(r, 21);
+}
+
+bool is_pubkey_fetch(const MockNetwork::SentRequest& r) {
+    return is_fetch_of(r, -21);
 }
 
 using Held = std::vector<std::pair<std::vector<std::byte>, std::string>>;
 
-// Answers the fetch asking to join begins with, as a swarm holding `held` -- messages and their
-// hashes -- beyond what the device already has; or fails it, as an unreachable swarm would.
-size_t answer_fetch(TempCore& c, MockNetwork& net, const Held& held = {}, bool reached = true) {
+// Answers a fetch of `ns`, as a swarm holding `held` -- messages and their hashes -- beyond what
+// the device already has; or fails it, as an unreachable swarm would.
+size_t answer_fetch_of(
+        int ns, TempCore& c, MockNetwork& net, const Held& held = {}, bool reached = true) {
     auto answered = answer_requests(
             net,
-            is_device_fetch,
+            [ns](const MockNetwork::SentRequest& r) { return is_fetch_of(r, ns); },
             [&](MockNetwork::SentRequest& r) {
                 if (!reached)
                     return r.callback(false, true, 0, {}, std::nullopt);
@@ -1630,6 +1640,12 @@ size_t answer_fetch(TempCore& c, MockNetwork& net, const Held& held = {}, bool r
             1);
     TestHelper::drain(*c);
     return answered;
+}
+
+// The same for the group's own namespace: the fetch asking to join begins with, and the one every
+// push follows.
+size_t answer_fetch(TempCore& c, MockNetwork& net, const Held& held = {}, bool reached = true) {
+    return answer_fetch_of(21, c, net, held, reached);
 }
 
 TEST_CASE(
@@ -5872,6 +5888,45 @@ TEST_CASE(
     TestHelper::drain(*l.applicant);
     CHECK(alerts == 0);
     CHECK_FALSE(std::ranges::any_of(net->sent_requests, is_device_fetch));
+}
+
+TEST_CASE(
+        "Devices - a device fetches -21 itself on becoming a member",
+        "[core][devices][pfs][rogue]") {
+    Linking l;
+    int alerts = 0;
+    TestHelper::set_rogue_account_key(*l.applicant, [&alerts] { alerts++; });
+    auto* net = attach_mock_network(*l.applicant);
+    auto settle = [&] {
+        while (std::ranges::any_of(net->sent_requests, is_device_fetch))
+            answer_fetch(l.applicant, *net);
+        while (!pushes(*net).empty())
+            answer_upload(l.applicant, *net, true);
+    };
+
+    bool rogue = GENERATE(false, true);
+    std::vector<std::byte> key;
+    SECTION("admitted") {
+        l.admit();
+        key = rogue ? foreign_pubkey_message(l.core)
+                    : l.core->devices.build_account_pubkey_message();
+    }
+    SECTION("starting a group") {
+        TestHelper::finish_fetch(*l.applicant);
+        l.applicant->devices.start_device_group(await);
+        key = rogue ? foreign_pubkey_message(l.applicant)
+                    : l.applicant->devices.build_account_pubkey_message();
+    }
+
+    // Nothing polls here, as nothing does on a device subscribed for pushes: the read is asked for
+    // at once, and what it finds is judged as a member.
+    REQUIRE(eventually(*l.applicant, [&] {
+        return std::ranges::any_of(net->sent_requests, is_pubkey_fetch);
+    }));
+    REQUIRE(answer_fetch_of(-21, l.applicant, *net, {{key, "P1"}}) == 1);
+    settle();
+    CHECK(alerts == (rogue ? 1 : 0));
+    CHECK(l.applicant->devices.account_keys().front().published == !rogue);
 }
 
 TEST_CASE(

@@ -1432,8 +1432,10 @@ member, since a key seen then may have been rotated away for good by the time it
 
 So that a key published before a device could judge it is still seen, a device that becomes a
 member in good standing -- starting a group, having its admission confirmed, or reading its group
-again after being displaced or dropped -- forgets where its retrieves of -21 had reached, and its
-next poll reads what -21 holds from the start.
+again after being displaced or dropped -- forgets where its retrieves of -21 had reached, and
+fetches -21 itself at once, reading what it holds from the start.  It fetches rather than waiting
+for its next poll because a device subscribed for pushes does not poll, and -21 would send it
+nothing until something new landed there.
 
 A key that is none of the member's:
 

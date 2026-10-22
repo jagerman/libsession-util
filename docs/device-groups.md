@@ -440,7 +440,7 @@ group before anything is reported.
 Only a device that is in its group (`InGroup` or `Forked`) can raise it. One outside the group --
 restored and not yet linked, asking to join, or removed, displaced, dropped or dissolved -- holds
 none of the group's keys to compare against, so it never reports. It does not miss a key published
-in the meantime, though: on joining, a device reads the account's published key again from the
+in the meantime, though: on joining, a device fetches the account's published key again, from the
 start, and judges it then. One case need not be an attack: a `Forked` account whose other
 group publishes its own key. That is still a device holding the phrase outside this group, but it
 may well be the user's own; settle the fork (see "Forks") and the alert has its explanation.

@@ -229,7 +229,7 @@ struct callbacks {
     ///
     /// Only on a device that is a member of its group in good standing (`InGroup` or `Forked`): one
     /// outside it holds none of the group's keys to compare against.  A device that becomes a
-    /// member reads -21 again from the start, so a key published before then is still judged.
+    /// member fetches -21 again from the start, so a key published before then is still judged.
     std::function<void()> rogue_account_key;
 };
 
