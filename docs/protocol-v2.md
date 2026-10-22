@@ -502,11 +502,12 @@ well delete any of the account's messages, publish account keys of its own in pl
 account's, register a device of its own in the group (see "Removed devices"), or dissolve every
 group the account has.  The protocol does not try to prevent any of them, and could not: the
 account's user, restoring onto a new device, must be able to do each one.  What it does for those
-that reach the device group is make them seen: a device added is announced to every member, a
-dissolution leaves each device of the group dissolved and saying so, and a forged displacement is
-no quieter than a real one -- every member alerts its user, as a possible attack, and the user
-decides what happened.  The forger gains nothing else by it: the devices stop acting for their
-group, rather than starting to trust anything new.
+that reach the device group, or the key contacts encrypt to, is make them seen: a device added is
+announced to every member, a dissolution leaves each device of the group dissolved and saying so, a
+key published in place of the account's is reported by every device that sees it (see "Rogue
+keys"), and a forged displacement is no quieter than a real one -- every member alerts its user, as
+a possible attack, and the user decides what happened.  The forger gains nothing else by it: the
+devices stop acting for their group, rather than starting to trust anything new.
 
 ### Group identifier
 
@@ -1375,11 +1376,77 @@ pubkey message exists as an indication that the client's devices supports the ne
 message format.
 
 As a result, clients *must not* publish PFS+PQ records until all of their devices are upgraded to
-support PFS.  This, unfortunately, is currently made complicated by the fact that multi-device
-Session accounts are not fully aware of how many devices are using the account (= one of the goals
-of this redesign), and so this may require manual user intervention.
+support PFS.  The device group records which devices an account has, but only ever the upgraded
+ones: a device that has never joined a group is invisible to it.  So whether every device of an
+existing account is upgraded is the user's to declare, and the declaration is recorded as follows.
 
-Details TBD.
+## The account's message version
+
+Whether every device of an account reads PFS/PQ messages is recorded in the account's user profile
+config, under the key `v`: the lowest message protocol version every device of the account can
+read.  Absent means 1.  2 means that every device reads PFS/PQ messages, and is what allows the
+account to publish its key to namespace -21.
+
+It lives in the user profile rather than in the device group: the profile reaches every device of
+the account, old clients included, which keep keys they do not understand; it merges as any other
+key does; and it outlives the group being dissolved or replaced.  The group payload cannot be read
+by a device until it is admitted, and dies with the group.
+
+A device publishes the account's key to -21 only while all of these hold: `v` is 2 or more, the
+device is a member of a device group in good standing, and a fetch of namespace 21 has been merged
+(see "Account Key Rotation").  `v` decides publishing and nothing else: every device fetches -21 and
+checks what it holds (see "Rogue keys" below), whatever `v` says.
+
+- **New accounts** set `v` to 2 when the account is created, since the account's only device is a
+  current one.  An account restored from its recovery phrase sets nothing: what the account says
+  arrives from the swarm.
+- **Existing accounts opt in.**  The user first builds the device group up -- links every device
+  they use, so that a device not in the group is one they are prepared to have miss PFS/PQ messages
+  -- and then enables PFS/PQ on a device in the group.  Enabling sets `v` to 2, which reaches the
+  account's other devices as any config change does, and has the enabling device publish the
+  current account key after its next fetch, without waiting for a rotation.
+- **It is one-way.**  `v` is never lowered, and clients offer no way to lower it.  A contact that
+  has fetched the account's key goes on using it for as long as its cache keeps it (see "Account
+  keys"), whether or not -21 still holds it, so turning PFS/PQ off would take that long to reach
+  contacts; and the only reason to want it off, adding a device that cannot read PFS/PQ messages,
+  would not be helped by it.
+
+The cutoff is narrow and gradual.  It applies to one-to-one messages only: groups and communities
+have encryption of their own.  Messages received before enabling stay readable.  Contacts switch to
+PFS/PQ as they fetch the account's key, not all at once.
+
+## Rogue keys
+
+Nothing but the account seed is needed to publish to -21, so a key there that is none of the
+account's means that someone outside the account's devices holds the seed.  It is a forgery in the
+same class as the others a seed holder can make (see "Displaced devices"), and answered the same
+way: by making it seen.
+
+Every device checks each key it finds on -21 against the account keys it holds, current and rotated
+alike, whatever `v` says: a seed holder publishing a key need not have set it, and contacts encrypt
+to whatever they find.  A key that is none of them:
+
+- **Is not judged on sight.**  A key another device of the account has just rotated to reaches -21
+  and namespace 21 in separate stores, and a device can see the -21 one first: in one poll whose
+  21 retrieve reports more and finishes in a later round, one message at a time through a
+  subscription, or with a poll landing between the two stores.  So the device records the key as
+  suspect and fetches namespace 21, and only once a fetch sent after the key was seen has drained
+  does it decide.  A key that has become known by then was a rotation, and is nothing.  One still
+  unknown is rogue.  A suspect is kept across a restart, since -21 is not handed out twice: a
+  retrieve resumes after the last message it returned.
+- **If rogue, is reported to the user**, who is told that the recovery phrase is in someone else's
+  hands.  If `v` is 2 or more, the device also takes its own current key as unpublished, so that its
+  next push -- made at once -- puts the account's key back over the rogue one.
+- **Is never deleted.**  Deleting it would be a tug-of-war with a holder of the seed, who can
+  publish again; as with every other forgery, the protocol makes it seen rather than trying to
+  prevent it.
+
+What this leaves open is a swarm member that lags on 21 as well as on -21: the window of the race
+itself, accepted rather than closed with a timer.
+
+An account that has forked (see "One group per account") has two groups each publishing its own key,
+and each sees the other's as rogue.  That is what it is -- a holder of the seed outside this
+group -- and it is settled as any fork is, by the user keeping one group.
 
 
 # Push notifications

@@ -57,6 +57,10 @@ pure virtual, so none can be left out by accident:
 | `devices_replaced(device::map)` | The group's device list changed. Redraw the device screen. |
 | `membership_changed(Membership)` | Where this device stands, or the groups it can see, changed -- or became known. The same value can arrive again when only `others` changed. Re-read `membership()` and act on it. `Approved` is the cue to bring up the new device's confirmation, wherever the user is. |
 
+One more belongs with these but is not a `DeviceEvents` method: `rogue_account_key`, a plain
+function in the same `callbacks` struct, which fires when the account's published key has been
+replaced by someone else (see "PFS/PQ").
+
 Pass a pointer to your implementation as `callbacks::devices`: `client::callbacks` for a `Client`
 application, `core::callbacks` for one using `Core` directly. It must outlive the `Client` (or
 `Core`), and for a `Client` also any delivery its dispatcher still holds. A `Client` delivers these
@@ -130,6 +134,9 @@ unchanged, and the next start (or the device screen) offers the choice again.
   words). A new account gets its group at once and becomes `InGroup` with the first fetch.
 - **Restored account:** `globals.restore_account(seed)`. No group is created. The first fetch
   makes the state `DeviceGroupVisible` (join one) or `NoGroup`.
+
+A new account has PFS/PQ enabled from the start; a restored one keeps whatever the account says,
+which for an account made before PFS/PQ is off until the user turns it on (see "PFS/PQ").
 
 ## Joining a group (the new device)
 
@@ -374,6 +381,54 @@ may tell it. Leaving gives the device a new identity, as joining the group again
 it can ask to join any group afterwards, the one it left included. `leave_group` answers false if
 there is no group to leave. A device cannot ask to join a group while it is in one
 (`err::already_registered`): leaving comes first.
+
+## PFS/PQ
+
+Contacts send PFS/PQ messages to an account only once it publishes a key for them to encrypt to,
+and it publishes one only once every device of it is declared able to read them. A new account has
+that from the start. One restored from its recovery phrase may have older devices, and the user
+turns it on by hand.
+
+**When to offer it.** Only while `membership()` is `InGroup`, and only while `core.pfs_enabled()`
+is false. Put "Enable PFS/PQ" beside the device list, as the step after the user has linked every
+device they use: the list they are looking at is the list they are confirming is complete. Do not
+offer it from any other state, nor before the user has had the chance to link their devices.
+
+**What to tell them first**, and have them confirm:
+
+> Once enabled, PFS/PQ cannot be disabled. Clients that are not in your device group, including
+> legacy Session clients, will not be able to receive messages from contacts who use the new
+> PFS/PQ encryption to send to you.
+
+It helps to say what it does not touch: it applies to one-to-one messages only (groups and
+communities have their own encryption); messages already received stay readable; and contacts
+switch gradually, as they next fetch the account's key, rather than all at once.
+
+**Then call `core.enable_pfs()`.** It records the setting in the account's profile, which reaches
+the other devices as any setting does, and publishes the account's key straight away. There is no
+call to turn it off, and no setting to offer for it: a contact that has fetched the key goes on
+using it whatever the account later publishes, so off would not mean off. `pfs_enabled()` says
+whether it is on, whichever device turned it on.
+
+### A key that is not the account's
+
+`rogue_account_key` fires when the account's published key -- the one contacts encrypt to -- is
+one that none of the account's devices made. Only someone holding the recovery phrase can publish
+one, so treat it as the forged Displaced alert is treated (see "Other alerts"): critical, brought up
+so it cannot be missed, and kept as a warning the user can reopen once dismissed. Say plainly that
+**someone else has the recovery phrase**: "Someone has published a key for your account that none
+of your devices made. Only someone with your recovery phrase can do this." What to do about it is
+the same: start afresh from a device they trust and treat the phrase as compromised.
+
+libsession has already done what it can: where PFS/PQ is enabled, the account's own key goes back
+over the rogue one at once. It deletes nothing, since whoever has the phrase can publish again.
+
+It fires whether or not PFS/PQ is enabled -- a seed holder can publish a key either way, and
+contacts encrypt to whatever they find -- and may fire again for the same key. It is never raised
+for a key another of the user's devices has just rotated to: that is checked against the device
+group before anything is reported. One case need not be an attack: a `Forked` account whose other
+group publishes its own key. That is still a device holding the phrase outside this group, but it
+may well be the user's own; settle the fork (see "Forks") and the alert has its explanation.
 
 ## Do not
 
