@@ -247,3 +247,94 @@ TEST_CASE("prefetch_pfs_keys handles malformed responses gracefully", "[core][pf
         CHECK_FALSE(TestHelper::pfs_cache_entry(*c, sid).has_value());
     }
 }
+
+TEST_CASE("pfs_key_info reports the cache as it stands, and fetches nothing", "[core][pfs]") {
+    TempCore c;
+    auto* mock_net = attach_mock_network(*c);
+    TempCore remote;
+    b33 sid;
+    std::ranges::copy(remote->globals.session_id(), sid.begin());
+    auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*remote);
+
+    auto none = c->pfs_key_info(sid);
+    CHECK(none.state == core::PfsKeyState::none);
+    CHECK_FALSE(none.x25519_pub);
+    CHECK_FALSE(none.fetched_at);
+
+    SECTION("a key, through its ages") {
+        TestHelper::seed_pfs_cache(*c, sid, x25519, mlkem768);
+        auto info = c->pfs_key_info(sid);
+        CHECK(info.state == core::PfsKeyState::fresh);
+        CHECK(info.x25519_pub == x25519);
+        CHECK(info.mlkem768_pub == mlkem768);
+        REQUIRE(info.fetched_at);
+        CHECK_FALSE(info.nak_at);
+
+        ScopedClockOffset later{core::Core::PFS_KEY_FRESH_DURATION + 1s};
+        CHECK(c->pfs_key_info(sid).state == core::PfsKeyState::stale);
+        later.advance(core::Core::PFS_KEY_EXPIRY_DURATION - core::Core::PFS_KEY_FRESH_DURATION);
+        info = c->pfs_key_info(sid);
+        CHECK(info.state == core::PfsKeyState::expired);
+        // Still what this device last saw them publish.
+        CHECK(info.x25519_pub == x25519);
+    }
+
+    SECTION("a NAK, until it lapses") {
+        TestHelper::seed_pfs_nak(*c, sid);
+        auto info = c->pfs_key_info(sid);
+        CHECK(info.state == core::PfsKeyState::nak);
+        CHECK(info.nak_at);
+        CHECK_FALSE(info.x25519_pub);
+
+        ScopedClockOffset later{core::Core::PFS_KEY_NAK_DURATION + 1s};
+        info = c->pfs_key_info(sid);
+        CHECK(info.state == core::PfsKeyState::none);
+        CHECK(info.nak_at);
+    }
+
+    CHECK(mock_net->sent_requests.empty());
+}
+
+TEST_CASE("refetch_pfs_keys fetches whatever the cache says, once at a time", "[core][pfs]") {
+    std::vector<core::PfsKeyFetch> fetched;
+    core::callbacks cbs;
+    cbs.pfs_keys_fetched = [&](std::span<const std::byte, 33>, core::PfsKeyFetch r) {
+        fetched.push_back(r);
+    };
+    TempCore c{cbs};
+    TempCore remote;
+    b33 sid;
+    std::ranges::copy(remote->globals.session_id(), sid.begin());
+    auto remote_msg = remote->devices.build_account_pubkey_message();
+
+    CHECK_THROWS_AS(c->refetch_pfs_keys(sid), std::logic_error);
+    auto* mock_net = attach_mock_network(*c);
+
+    SECTION("despite a fresh key") {
+        auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*remote);
+        TestHelper::seed_pfs_cache(*c, sid, x25519, mlkem768);
+        c->refetch_pfs_keys(sid);
+        CHECK(mock_net->sent_requests.size() == 1);
+    }
+
+    SECTION("despite a recent NAK") {
+        TestHelper::seed_pfs_nak(*c, sid);
+        c->refetch_pfs_keys(sid);
+        CHECK(mock_net->sent_requests.size() == 1);
+    }
+
+    SECTION("joining one in flight, from either") {
+        c->refetch_pfs_keys(sid);
+        c->refetch_pfs_keys(sid);
+        CHECK(c->prefetch_pfs_keys(sid) == core::PfsKeyStatus::fetching);
+        REQUIRE(mock_net->sent_requests.size() == 1);
+
+        // One answer, one report; and the next asks again.
+        mock_net->sent_requests[0].callback(
+                true, false, 200, {}, make_pubkey_response(remote_msg).dump());
+        mock_net->sent_requests.clear();
+        CHECK(fetched == std::vector{core::PfsKeyFetch::new_key});
+        c->refetch_pfs_keys(sid);
+        CHECK(mock_net->sent_requests.size() == 1);
+    }
+}

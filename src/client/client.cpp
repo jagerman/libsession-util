@@ -409,6 +409,15 @@ core::callbacks Client::_core_callbacks() {
             _emit([](const callbacks& cbs) { cbs.rogue_account_key(); });
         };
 
+    // Copied: what Core lends is valid for its call only, and the delivery comes later.
+    if (_cbs->pfs_keys_fetched)
+        cb.pfs_keys_fetched = [this](std::span<const std::byte, 33> session_id,
+                                     core::PfsKeyFetch result) {
+            b33 sid;
+            std::ranges::copy(session_id, sid.begin());
+            _emit([sid, result](const callbacks& cbs) { cbs.pfs_keys_fetched(sid, result); });
+        };
+
     return cb;
 }
 

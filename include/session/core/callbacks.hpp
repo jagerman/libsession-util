@@ -24,6 +24,32 @@ enum class PfsKeyStatus {
 };
 
 /// Result passed to the pfs_keys_fetched callback when a background fetch completes.
+/// Where a contact's cached PFS/PQ keys stand, as `Core::pfs_key_info` reports them without
+/// fetching anything.
+enum class PfsKeyState {
+    none,     ///< Nothing cached: never fetched, or a NAK that has lapsed.
+    nak,      ///< The last fetch found no keys, within PFS_KEY_NAK_DURATION.
+    fresh,    ///< Keys fetched within PFS_KEY_FRESH_DURATION.
+    stale,    ///< Keys fetched within PFS_KEY_EXPIRY_DURATION, but no longer fresh.
+    expired,  ///< Keys fetched longer ago than PFS_KEY_EXPIRY_DURATION.
+};
+
+/// What `Core::pfs_key_info` reports of a contact's cached PFS/PQ keys.
+///
+/// `fetched_at` and `nak_at` are stamped by Core's clock (`session::clock_now`, which corrects for
+/// the network's offset from this machine's), so compare them with that and never with
+/// `std::chrono::system_clock`: the two can differ by however far off this machine's clock is.
+struct PfsKeyInfo {
+    PfsKeyState state;
+    /// The keys last fetched, whatever their age: what this device last saw the contact publish.
+    std::optional<std::array<std::byte, 32>> x25519_pub;
+    std::optional<std::array<std::byte, 1184>> mlkem768_pub;
+    /// When those keys were fetched.
+    std::optional<std::chrono::sys_seconds> fetched_at;
+    /// When a fetch last found no keys at all.
+    std::optional<std::chrono::sys_seconds> nak_at;
+};
+
 enum class PfsKeyFetch {
     new_key,    ///< A key was retrieved and stored (new or changed from the previous cache entry)
     unchanged,  ///< Keys were retrieved but match what was already cached

@@ -115,6 +115,28 @@ TEST_CASE("Client: a rogue account key arrives through the dispatcher", "[client
     CHECK(alerts == 1);
 }
 
+TEST_CASE(
+        "Client: a finished PFS key fetch arrives through the dispatcher", "[client][callbacks]") {
+    std::vector<std::function<void()>> queued;
+    std::vector<std::pair<b33, core::PfsKeyFetch>> fetched;
+    callbacks cbs;
+    cbs.pfs_keys_fetched = [&fetched](std::span<const std::byte, 33> sid, core::PfsKeyFetch r) {
+        b33 id;
+        std::ranges::copy(sid, id.begin());
+        fetched.emplace_back(id, r);
+    };
+    TempClient c{std::move(cbs)};
+    c->set_dispatcher([&](std::function<void()> job) { queued.push_back(std::move(job)); });
+
+    SenderKeys contact;
+    TestHelper::finish_pfs_fetch(c->core, contact.session_id, core::PfsKeyFetch::new_key);
+    sync(*c);
+    CHECK(fetched.empty());
+    REQUIRE(queued.size() == 1);
+    queued.front()();
+    CHECK(fetched == std::vector{std::pair{contact.session_id, core::PfsKeyFetch::new_key}});
+}
+
 TEST_CASE("Client: Core is usable directly through the Client", "[client][callbacks]") {
     TempClient c;
 

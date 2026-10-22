@@ -419,6 +419,20 @@ To list the account's keys -- when each was made and replaced, until when it is 
 is published -- use `devices.account_keys()`, never `active_account_keys()`, which hands out their
 secret halves.
 
+### Showing encryption
+
+What a contact's messages will be sent with is decided by the PFS/PQ keys this device has cached
+for them. `core.pfs_key_info(session_id)` reads that cache without fetching anything: its `state`
+(`fresh` and `stale` keys are usable; `expired` ones are to be fetched again before they are used;
+`nak` and `none` mean the contact has published none this device knows of), the keys themselves,
+and when they were fetched. Those times are by Core's clock, which corrects for the network's
+offset from this machine's: show an age by comparing them with `session::clock_now()`, never with
+`std::chrono::system_clock`. Draw a padlock from it, and call `prefetch_pfs_keys` as the user starts
+typing so that it is current by the time they send. For a user who asks to refresh a contact's
+keys, `core.refetch_pfs_keys(session_id)` fetches them however recently they were fetched;
+`pfs_keys_fetched` reports the result, as for a prefetch (in `client::callbacks` too, for a `Client`
+application), and is the cue to read `pfs_key_info` again.
+
 ### A key that is not the account's
 
 `rogue_account_key` fires when the account's published key -- the one contacts encrypt to -- is

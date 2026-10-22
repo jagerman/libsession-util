@@ -149,6 +149,13 @@ struct callbacks {
     /// recovery phrase.  See `core::callbacks::rogue_account_key` for when it fires and what to
     /// tell the user.  Delivered through the dispatcher like everything above.
     std::function<void()> rogue_account_key;
+
+    /// A fetch of a contact's PFS/PQ keys finished, started by `Core::prefetch_pfs_keys` or
+    /// `Core::refetch_pfs_keys`; see `core::callbacks::pfs_keys_fetched`.  The cue to read
+    /// `Core::pfs_key_info` again for whatever shows the contact's encryption.  Delivered through
+    /// the dispatcher like everything above.
+    std::function<void(std::span<const std::byte, 33> session_id, core::PfsKeyFetch result)>
+            pfs_keys_fetched;
 };
 
 }  // namespace session::client

@@ -11,6 +11,7 @@
 #include <session/sodium_array.hpp>
 #include <session/sqlite.hpp>
 #include <session/types.hpp>
+#include <set>
 
 #include "core/callbacks.hpp"
 #include "core/configs.hpp"
@@ -548,6 +549,11 @@ class Core {
     // Stores a NAK (no keys found) for a remote session_id in the pfs_key_cache.
     void _store_pfs_nak(std::span<const std::byte, 33> session_id);
 
+    // Fetches `session_id`'s keys from its swarm, unless a fetch of them is already in flight,
+    // which then answers for both.  On the loop; `_pfs_fetch_done` ends it.
+    void _fetch_pfs_keys(const b33& session_id);
+    std::set<b33> _pfs_fetching;
+
     // Monotonic message ID counter for send_dm().
     int64_t _next_message_id{1};
 
@@ -723,6 +729,19 @@ class Core {
     /// - nak     -- a recent fetch returned no keys; re-fetching is suppressed for
     ///              PFS_KEY_NAK_DURATION (1h).
     PfsKeyStatus prefetch_pfs_keys(std::span<const std::byte, 33> session_id);
+
+    /// What this device has cached of a contact's PFS/PQ keys, by the same thresholds
+    /// `prefetch_pfs_keys` judges them by -- for showing, not for deciding to fetch: a plain read,
+    /// which fetches nothing, safe from any thread.  The keys are there whenever any were ever
+    /// fetched, expired ones included, since they are what this device last saw the contact
+    /// publish.
+    PfsKeyInfo pfs_key_info(std::span<const std::byte, 33> session_id);
+
+    /// Fetches a contact's PFS/PQ keys now, however fresh what is cached, and however recently a
+    /// fetch found none: for a user asking to refresh them.  Completes through `pfs_keys_fetched`
+    /// as a prefetch does, and is the same fetch as one already in flight for that contact, from
+    /// either.  Callable from any thread.  Throws std::logic_error if no network is attached.
+    void refetch_pfs_keys(std::span<const std::byte, 33> session_id);
 
     /// Sets the polling interval used when a network object is attached.  The default is 20s.
     ///

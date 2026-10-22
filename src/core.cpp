@@ -1350,68 +1350,94 @@ void Core::_handle_server_push(std::string_view endpoint, std::span<const std::b
     receive_messages({&msg, 1}, static_cast<config::Namespace>(ns_val), true);
 }
 
+namespace {
+
+    // How a pfs_key_cache row stands now: the one place the cache's thresholds are applied.
+    PfsKeyState pfs_key_state(std::optional<int64_t> fetched_at, std::optional<int64_t> nak_at) {
+        auto now = clock_now_s();
+        if (fetched_at) {
+            auto age = now - from_epoch_s(*fetched_at);
+            return age < Core::PFS_KEY_FRESH_DURATION  ? PfsKeyState::fresh
+                 : age < Core::PFS_KEY_EXPIRY_DURATION ? PfsKeyState::stale
+                                                       : PfsKeyState::expired;
+        }
+        if (nak_at && now - from_epoch_s(*nak_at) < Core::PFS_KEY_NAK_DURATION)
+            return PfsKeyState::nak;
+        return PfsKeyState::none;
+    }
+
+}  // namespace
+
 PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
-    // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
-    // could make the loop thread the last owner and run ~Network there.
-    auto* net = _network.get();
-    if (!net)
+    if (!_network)
         throw std::logic_error{"prefetch_pfs_keys called without a network object"};
 
-    // One copy of session_id for async use; subsequently moved into lambdas.
     b33 sid;
     std::ranges::copy(session_id, sid.begin());
 
-    // Skip the fetch if the cached entry is still fresh, or a recent NAK suppresses retrying.
-    // Otherwise determine whether we have a stale (but usable) key or no key at all.
-    auto status = PfsKeyStatus::fetching;
-    {
-        auto conn = db.conn();
-        if (auto row = conn.prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
-                    "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?", sid)) {
-            auto [fetched_at, nak_at] = *row;
-            if (fetched_at) {
-                auto age = clock_now_s() - from_epoch_s(*fetched_at);
-                if (age < PFS_KEY_FRESH_DURATION) {
-                    log::debug(
-                            cat,
-                            "prefetch_pfs_keys: cached key for {} is still fresh ({} old), "
-                            "skipping",
-                            session_id,
-                            age);
-                    return PfsKeyStatus::fresh;
-                }
-                log::debug(
-                        cat,
-                        "prefetch_pfs_keys: cached key for {} is stale ({} old), re-fetching",
-                        session_id,
-                        age);
-                status = PfsKeyStatus::stale;
-            } else if (nak_at) {
-                auto age = clock_now_s() - from_epoch_s(*nak_at);
-                if (age < PFS_KEY_NAK_DURATION) {
-                    log::debug(
-                            cat,
-                            "prefetch_pfs_keys: recent NAK for {} ({} old), skipping",
-                            session_id,
-                            age);
-                    return PfsKeyStatus::nak;
-                }
-                log::debug(
-                        cat,
-                        "prefetch_pfs_keys: expired NAK for {} ({} old), re-fetching",
-                        session_id,
-                        age);
-            }
-        } else {
-            log::debug(cat, "prefetch_pfs_keys: no cached key for {}, fetching", session_id);
-        }
+    std::optional<int64_t> fetched_at, nak_at;
+    if (auto row = db.conn().prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
+                "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?", sid))
+        std::tie(fetched_at, nak_at) = *row;
+
+    // Skip the fetch if the cached entry is still fresh, or a recent NAK suppresses retrying.  A
+    // key past fresh, however old, is reported stale: it is what a send uses until the fetch
+    // replaces it.
+    auto state = pfs_key_state(fetched_at, nak_at);
+    if (state == PfsKeyState::fresh || state == PfsKeyState::nak) {
+        log::debug(cat, "prefetch_pfs_keys: fresh key or recent NAK for {}, skipping", session_id);
+        return state == PfsKeyState::fresh ? PfsKeyStatus::fresh : PfsKeyStatus::nak;
+    }
+    log::debug(cat, "prefetch_pfs_keys: nothing fresh cached for {}, fetching", session_id);
+    call_get([this, &sid] { _fetch_pfs_keys(sid); });
+    return state == PfsKeyState::none ? PfsKeyStatus::fetching : PfsKeyStatus::stale;
+}
+
+PfsKeyInfo Core::pfs_key_info(std::span<const std::byte, 33> session_id) {
+    using X = sqlite::blob_guts<b32>;
+    using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
+    PfsKeyInfo info{.state = PfsKeyState::none};
+    auto row = db.conn()
+                       .prepared_maybe_get<
+                               std::optional<int64_t>,
+                               std::optional<int64_t>,
+                               std::optional<X>,
+                               std::optional<M>>(
+                               "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
+                               " FROM pfs_key_cache WHERE session_id = ?",
+                               session_id);
+    if (!row)
+        return info;
+    auto& [fetched_at, nak_at, pk_x, pk_m] = *row;
+    info.state = pfs_key_state(fetched_at, nak_at);
+    if (pk_x && pk_m) {
+        info.x25519_pub = static_cast<const b32&>(*pk_x);
+        info.mlkem768_pub = static_cast<const std::array<std::byte, 1184>&>(*pk_m);
+    }
+    if (fetched_at)
+        info.fetched_at = from_epoch_s(*fetched_at);
+    if (nak_at)
+        info.nak_at = from_epoch_s(*nak_at);
+    return info;
+}
+
+void Core::refetch_pfs_keys(std::span<const std::byte, 33> session_id) {
+    if (!_network)
+        throw std::logic_error{"refetch_pfs_keys called without a network object"};
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+    call_get([this, &sid] { _fetch_pfs_keys(sid); });
+}
+
+void Core::_fetch_pfs_keys(const b33& session_id) {
+    if (!_pfs_fetching.insert(session_id).second) {
+        log::debug(cat, "PFS key fetch for {} already in flight; joining it", session_id);
+        return;
     }
 
     // The swarm is indexed by the x25519 pubkey — the session_id without its 0x05 prefix.
     network::x25519_pubkey x25519_pub;
-    std::ranges::copy(session_id.subspan<1>(), x25519_pub.begin());
-
-    auto now_ms = epoch_ms(clock_now_ms());
+    std::ranges::copy(std::span{session_id}.subspan<1>(), x25519_pub.begin());
 
     // AccountPubkeys (-21) allows unauthenticated retrieve: no signature needed.
     nlohmann::json params = {
@@ -1423,7 +1449,7 @@ PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) 
             x25519_pub,
             "retrieve",
             [body = params.dump()](const network::service_node&) { return to_vector(body); },
-            [this, sid = std::move(sid)](SwarmResponse res) {
+            [this, sid = session_id](SwarmResponse res) {
                 if (!res.ok() || !res.body) {
                     log::warning(
                             cat,
@@ -1438,7 +1464,6 @@ PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) 
 
                 return _handle_pfs_response(sid, std::move(*res.body));
             });
-    return status;
 }
 
 bool Core::_store_pfs_keys(
@@ -1825,6 +1850,10 @@ void Core::_do_send_dm(
 }
 
 void Core::_pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetch result) {
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+    _pfs_fetching.erase(sid);
+
     if (callbacks.pfs_keys_fetched) {
         try {
             callbacks.pfs_keys_fetched(session_id, result);

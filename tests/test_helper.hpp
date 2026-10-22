@@ -807,6 +807,12 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         on_loop(core, [&] { core.callbacks.rogue_account_key(); });
     }
 
+    // Ends a PFS key fetch for `session_id` as its answer would, firing pfs_keys_fetched.
+    static void finish_pfs_fetch(
+            core::Core& core, std::span<const std::byte, 33> session_id, core::PfsKeyFetch r) {
+        on_loop(core, [&] { core._pfs_fetch_done(session_id, r); });
+    }
+
     // The same for namespace -21: what the account's key outbox holds, as a fetch of it finds it.
     static void deliver_pubkey_message(
             core::Core& core, std::span<const std::byte> data, std::string hash = "pubkey") {
