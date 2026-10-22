@@ -509,6 +509,9 @@ class Devices final : detail::CoreComponent {
     // a rotation by anyone stands it down.  Nullopt if there is no reason to.
     std::optional<sys_ms> _early_account_rotation(int64_t key);
 
+    // Discards the account keys rotated away more than ACCOUNT_KEY_RETENTION ago.
+    void _prune_account_keys();
+
     // What every device's account key rotation slot is reckoned from: the active key, and the
     // devices of the group.  Nullopt for a device that is not a member in good standing, or with
     // no active key.
@@ -1092,6 +1095,29 @@ class Devices final : detail::CoreComponent {
         std::chrono::sys_seconds created;
         std::optional<std::chrono::sys_seconds> rotated;
     };
+
+    // What an application may show of an account key: its public halves and its history, and never
+    // its secret.
+    struct AccountKeyInfo {
+        std::array<std::byte, 32> x25519_pub;
+        std::array<std::byte, 1184> mlkem768_pub;
+        std::chrono::sys_seconds created;
+        // When a newer key replaced it; unset for the current key.
+        std::optional<std::chrono::sys_seconds> rotated;
+        // When it is discarded, ACCOUNT_KEY_RETENTION after it was rotated away; unset for the
+        // current key, which is kept for as long as it is current.
+        std::optional<std::chrono::sys_seconds> retained_until;
+        // Whether it has been seen on namespace -21, where contacts find the key to encrypt to:
+        // confirmed stored there by this device's push, or fetched back from there.
+        bool published;
+    };
+
+    // The account keys this device holds, as `active_account_keys` returns them -- current first,
+    // then the rotated ones newest first, after discarding those past their retention -- without
+    // their secret halves: what an application lists, which must never be `active_account_keys`.
+    // Unlike that, never makes a key where there is none.  A plain read of the database, safe from
+    // any thread.
+    std::vector<AccountKeyInfo> account_keys();
 
     // How long after rotation to keep an old account key.  14 days is the maximum 1-to-1 message
     // TTL, plus 24h for sender key update lag, plus 24h safety margin.

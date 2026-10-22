@@ -5799,6 +5799,48 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - account_keys lists the account's keys without their secrets",
+        "[core][devices][pfs]") {
+    TempCore c;
+    auto first = c->devices.active_account_keys().front();
+    {
+        // Later than the first, so that the new key is the current one rather than a tie.
+        ScopedClockOffset later{1min};
+        c->devices.rotate_account_keys();
+    }
+    auto current = c->devices.active_account_keys().front();
+    REQUIRE(current.x25519_pub != first.x25519_pub);
+
+    // Current first, then the rotated one, which is kept for its retention after it was replaced.
+    auto keys = c->devices.account_keys();
+    REQUIRE(keys.size() == 2);
+    CHECK(keys[0].x25519_pub == current.x25519_pub);
+    CHECK(keys[0].mlkem768_pub == current.mlkem768_pub);
+    CHECK(keys[0].created == current.created);
+    CHECK_FALSE(keys[0].rotated);
+    CHECK_FALSE(keys[0].retained_until);
+    CHECK(keys[1].x25519_pub == first.x25519_pub);
+    CHECK(keys[1].created == first.created);
+    REQUIRE(keys[1].rotated);
+    CHECK(*keys[1].retained_until ==
+          *keys[1].rotated +
+                  std::chrono::duration_cast<std::chrono::seconds>(Devices::ACCOUNT_KEY_RETENTION));
+
+    // Seen on -21: that key, and only that one.
+    CHECK_FALSE(keys[0].published);
+    TestHelper::deliver_pubkey_message(*c, c->devices.build_account_pubkey_message());
+    keys = c->devices.account_keys();
+    CHECK(keys[0].published);
+    CHECK_FALSE(keys[1].published);
+
+    // Past its retention the rotated one is gone.
+    ScopedClockOffset later{Devices::ACCOUNT_KEY_RETENTION + 1h};
+    keys = c->devices.account_keys();
+    REQUIRE(keys.size() == 1);
+    CHECK(keys[0].x25519_pub == current.x25519_pub);
+}
+
+TEST_CASE(
         "Devices - a device outside its group does not judge what -21 holds",
         "[core][devices][pfs][rogue]") {
     Linking l;

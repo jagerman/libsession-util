@@ -415,6 +415,9 @@ the same on every device of the group. It changes then only if the device whose 
 online; `next_account_rotation()` is this device's own turn, and may be earlier while it is
 replacing the key early. To list every device's turn, in order, use
 `devices.account_rotation_schedule()`: the key changes at the first of them whose device is online.
+To list the account's keys -- when each was made and replaced, until when it is kept, and whether it
+is published -- use `devices.account_keys()`, never `active_account_keys()`, which hands out their
+secret halves.
 
 ### A key that is not the account's
 

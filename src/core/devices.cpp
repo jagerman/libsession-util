@@ -342,9 +342,7 @@ std::vector<Devices::AccountKeys> Devices::active_account_keys(
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
-    c.prepared_exec(
-            "DELETE FROM device_account_keys WHERE rotated < ?",
-            epoch_seconds(clock_now_s() - ACCOUNT_KEY_RETENTION));
+    _prune_account_keys();
 
     std::vector<AccountKeys> keys;
     bool have_active = false;
@@ -395,6 +393,42 @@ std::vector<Devices::AccountKeys> Devices::active_account_keys(
         return active_account_keys();
     }
 
+    return keys;
+}
+
+void Devices::_prune_account_keys() {
+    conn().prepared_exec(
+            "DELETE FROM device_account_keys WHERE rotated < ?",
+            epoch_seconds(clock_now_s() - ACCOUNT_KEY_RETENTION));
+}
+
+std::vector<Devices::AccountKeyInfo> Devices::account_keys() {
+    auto c = conn();
+    SQLite::Transaction tx{c.sql};
+    _prune_account_keys();
+
+    std::vector<AccountKeyInfo> keys;
+    for (auto [created, rotated, published, pk_ml, pk_x] : c.prepared_results<
+                                                           int64_t,
+                                                           std::optional<int64_t>,
+                                                           int,
+                                                           sqlite::blobn<mlkem768::PUBLICKEYBYTES>,
+                                                           sqlite::blobn<32>>(
+                 "SELECT created, rotated, published, pubkey_mlkem768, pubkey_x25519"
+                 " FROM device_account_keys"
+                 " ORDER BY rotated DESC NULLS FIRST, created DESC")) {
+        auto& k = keys.emplace_back();
+        std::memcpy(k.x25519_pub.data(), pk_x.data(), pk_x.size());
+        std::memcpy(k.mlkem768_pub.data(), pk_ml.data(), pk_ml.size());
+        k.created = std::chrono::sys_seconds{std::chrono::seconds{created}};
+        if (rotated) {
+            k.rotated.emplace(std::chrono::seconds{*rotated});
+            k.retained_until = *k.rotated + std::chrono::duration_cast<std::chrono::seconds>(
+                                                    ACCOUNT_KEY_RETENTION);
+        }
+        k.published = published != 0;
+    }
+    tx.commit();
     return keys;
 }
 
