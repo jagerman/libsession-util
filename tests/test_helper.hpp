@@ -390,6 +390,65 @@ inline size_t answer_requests(
             max);
 }
 
+/// A MockNetwork whose routing can carry the storage servers' pushes, so that a drained poll goes
+/// on to subscribe -- as the default, onion requests, never does.
+inline MockNetwork* attach_push_network(core::Core& core) {
+    network::config::Config config;
+    config.router = network::opt::router::Type::direct;
+    return attach_mock_network(core, std::move(config));
+}
+
+/// Answers the oldest captured poll batch: each namespace with what `held` has for it (message and
+/// hash), the rest with nothing.  Or fails it, as an unreachable member would.  Returns whether
+/// there was one.
+inline bool answer_batch(
+        MockNetwork& net,
+        const std::map<int, std::vector<std::pair<std::vector<std::byte>, std::string>>>& held = {},
+        bool reached = true) {
+    return answer_requests(
+                   net,
+                   "batch",
+                   [&](MockNetwork::SentRequest& r) {
+                       if (!reached)
+                           return r.callback(false, true, 0, {}, std::nullopt);
+                       auto results = nlohmann::json::array();
+                       // Bound first: ranging over a temporary's element would read it after it
+                       // has gone.
+                       auto batch = parse_json(*r.request.body);
+                       for (const auto& req : batch["requests"]) {
+                           auto body = retrieved_body();
+                           if (auto it = held.find(req["params"]["namespace"].get<int>());
+                               it != held.end())
+                               for (const auto& [data, hash] : it->second)
+                                   body["messages"].push_back(retrieved_message(data, hash));
+                           results.push_back({{"code", 200}, {"body", std::move(body)}});
+                       }
+                       r.callback(
+                               true,
+                               false,
+                               200,
+                               {},
+                               nlohmann::json{{"results", std::move(results)}}.dump());
+                   },
+                   1) == 1;
+}
+
+/// Answers the polls pending (a caller polls first) until drained, and accepts the subscription
+/// that follows, as a storage server does: from here nothing polls.  Leaves the poll Core sends on
+/// subscribing -- the one that closes the gap between draining and the subscription taking effect
+/// -- unanswered, for the caller.  Returns whether there was a subscription to accept.
+inline bool subscribe(MockNetwork& net) {
+    while (answer_batch(net)) {
+    }
+    return answer_requests(
+                   net,
+                   "monitor",
+                   [](MockNetwork::SentRequest& r) {
+                       r.callback(true, false, 200, {}, "d7:successi1ee");
+                   },
+                   1) == 1;
+}
+
 /// Answers every captured store, and returns how many there were -- which is itself worth asserting
 /// on, since an outgoing message is two stores and a note to self is one.
 inline size_t answer_stores(MockNetwork& net, bool accepted) {
@@ -507,6 +566,23 @@ class TestHelper {
     /// test's own thread would answer its first member and leave the rest of the walk queued.
     static void poll(core::Core& core) {
         core.call_get([&core] { core._poll(); });
+    }
+
+    // When Core's own retry of a failed poll fires (unset with none scheduled), firing it now, and
+    // whether the poll timer is running -- which it is not while subscribed.
+    static std::optional<sys_ms> poll_retry_due(core::Core& core) {
+        return core.call_get([&core] { return core._poll_retry_due; });
+    }
+    static void fire_poll_retry(core::Core& core) {
+        core.call_get([&core] {
+            if (core._poll_retry_timer)
+                core._jq.wake(core._poll_retry_timer);
+        });
+        // A wake runs the timer on a later turn of the loop; wait for it.
+        drain(core);
+    }
+    static bool polling(core::Core& core) {
+        return core.call_get([&core] { return static_cast<bool>(core._poll_timer); });
     }
 
     /// Runs `f` on Core's loop and hands back what it returned.

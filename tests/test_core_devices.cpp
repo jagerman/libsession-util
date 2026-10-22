@@ -5891,6 +5891,39 @@ TEST_CASE(
 }
 
 TEST_CASE(
+        "Devices - an admission stored as the asking device subscribed arrives all the same",
+        "[core][devices][linking][poll]") {
+    Linking l;
+    auto* net = attach_push_network(*l.applicant);
+    auto group = l.show_group();
+    Asked got;
+    request_link(l.applicant, group, got);
+    auto request = uploaded(*net);
+    answer_upload(l.applicant, *net, true);
+    REQUIRE(got);
+    REQUIRE(got->has_value());
+
+    // The asking device drains its swarm and subscribes, so that nothing polls from here.
+    TestHelper::poll(*l.applicant);
+    REQUIRE(subscribe(*net));
+    REQUIRE_FALSE(TestHelper::polling(*l.applicant));
+
+    // Approved in the moment between: too late for the draining poll, too early to be pushed.
+    TestHelper::deliver_device_message(*l.core, request, (*got)->expires, "L1");
+    REQUIRE(l.core->devices.accept_request(l.events.added.back().id, await));
+    auto admission = l.core->devices.build_device_group_message().message;
+
+    // The poll that closes that gap fails, which once left the device waiting for a restart.
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
+
+    // Core polls again by itself, and the admission is there.
+    TestHelper::fire_poll_retry(*l.applicant);
+    REQUIRE(answer_batch(*net, {{21, {{admission, "G1"}}}}));
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Approved);
+}
+
+TEST_CASE(
         "Devices - a device fetches -21 itself on becoming a member",
         "[core][devices][pfs][rogue]") {
     Linking l;

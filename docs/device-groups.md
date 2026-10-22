@@ -84,6 +84,13 @@ leaving and starting groups, so there is no need to set it again after any of th
 `device_info()` reads back what it publishes; the device list (`devices()`) shows what the group
 holds for it, which catches up once a push carrying a change has reached the swarm.
 
+Fetching from the swarm is Core's too, and needs nothing from the application once a network is
+attached: Core polls, and where the routing can carry them it subscribes for pushes instead and
+stops polling. A fetch that fails then -- with no poll coming to retry it -- is retried by Core
+itself, with a full poll after `Core::POLL_RETRY_FIRST`, doubling up to `Core::POLL_RETRY_MAX`
+while it keeps failing. So an application never needs to poll by hand to recover a request,
+an approval, or anything else the swarm holds for it.
+
 ## Startup: membership drives everything
 
 Call `membership()` at startup. Until the first fetch from the swarm completes it answers

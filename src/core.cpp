@@ -123,7 +123,7 @@ Core::~Core() {
     // would reach it; stopping `_jq` below cancels them too, but only once the Network is already
     // gone.  On the loop because the ids are only ever touched there.
     call_get([this] {
-        for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer})
+        for (auto* timer : {&_poll_timer, &_sub_timer, &_probe_timer, &_poll_retry_timer})
             _remove_timer(*timer);
     });
 
@@ -237,6 +237,10 @@ void Core::_update_polling() {
         _poll_timer = _jq.add_timer(_poll_interval, [this] { _poll(); });
     else if (!_network)
         _remove_timer(_poll_timer);
+
+    // Polling again retries for itself; without a network there is nothing to retry with.
+    if (_poll_timer || !_network)
+        _cancel_poll_retry();
 }
 
 void Core::set_poll_interval(std::chrono::milliseconds interval) {
@@ -608,6 +612,45 @@ void Core::_poll() {
     _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, std::nullopt);
 }
 
+void Core::_poll_settled(bool ok) {
+    if (ok)
+        _poll_backoff = POLL_RETRY_FIRST;
+    else
+        _arm_poll_retry();
+}
+
+void Core::_arm_poll_retry() {
+    // Once a subscription has stopped the polling nothing else would poll again: the notification
+    // that prompted a fetch is spent, and a message the failed request would have fetched -- an
+    // admission, a pushed group message, one stored between draining and subscribing -- would wait
+    // for a restart.  The fetches some callers schedule for themselves (a push retry, the -21
+    // re-read) predate this, and are redundant with it rather than needed.
+    if (_poll_timer || !_network || _poll_retry_due)
+        return;
+    if (!_poll_retry_timer)
+        _poll_retry_timer = _jq.add_wakeable([this] {
+            _jq.stop(_poll_retry_timer);
+            _poll_retry_due.reset();
+            if (_poll_timer || !_network)
+                return;
+            log::debug(cat, "Retrying the swarm poll that failed");
+            // A full poll rather than whatever failed: it covers that, and anything else lost.
+            // How it ends comes back through _poll_settled like any poll's.
+            _send_poll({POLL_NAMESPACES.begin(), POLL_NAMESPACES.end()}, 0, std::nullopt);
+        });
+    log::info(cat, "A swarm poll failed while not polling; polling again in {}", _poll_backoff);
+    _poll_retry_due = clock_now_ms() + _poll_backoff;
+    _jq.repeat(_poll_retry_timer, _poll_backoff);
+    _poll_backoff = std::min(_poll_backoff * 2, POLL_RETRY_MAX);
+}
+
+void Core::_cancel_poll_retry() {
+    if (_poll_retry_timer)
+        _jq.stop(_poll_retry_timer);
+    _poll_retry_due.reset();
+    _poll_backoff = POLL_RETRY_FIRST;
+}
+
 void Core::fetch_user_profile(std::function<void(bool found)> done) {
     // Non-owning: the Network is ours alone, and callbacks below must not keep it alive -- doing so
     // could make the loop thread the last owner and run ~Network there.
@@ -826,6 +869,7 @@ void Core::_send_poll(
                             res.timeout ? "timed out"
                             : res.body  ? *res.body
                                         : "request failed");
+                    _poll_settled(false);
                     if (done)
                         done(false);
                     return;
@@ -1002,7 +1046,12 @@ void Core::_handle_poll_response(
         std::function<void(bool)> done) {
 
     const auto& sn_pubkey = node.remote_pubkey;
-    auto finish = [&done](bool drained) {
+    // A namespace the node did not answer is a failure for retrying's sake -- whatever it held is
+    // still to be fetched -- though the namespaces that were answered are drained, which is what
+    // `done` reports.
+    bool all_answered = true;
+    auto finish = [this, &done, &all_answered](bool drained) {
+        _poll_settled(drained && all_answered);
         if (done)
             done(drained);
     };
@@ -1023,13 +1072,17 @@ void Core::_handle_poll_response(
         auto configs_held = configs.batch();
 
         auto& results = *it;
+        if (results.size() < namespaces.size())
+            all_answered = false;
         for (size_t i = 0; i < namespaces.size() && i < results.size(); ++i) {
             auto ns = namespaces[i];
             auto ns_val = static_cast<int16_t>(ns);
 
             auto got = decode_retrieved(results[i], ns_val);
-            if (!got)
+            if (!got) {
+                all_answered = false;
                 continue;
+            }
 
             const auto& swarm_messages = got->messages;
             receive_messages(swarm_messages, ns, !got->more);

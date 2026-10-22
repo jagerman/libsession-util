@@ -517,3 +517,39 @@ TEST_CASE(
 
     CHECK(pushes(*mock_net).size() == 2);
 }
+
+TEST_CASE("Poll: a poll that fails while subscribed is retried by Core itself", "[core][poll]") {
+    TempCore core;
+    auto* net = attach_push_network(*core);
+    TestHelper::poll(*core);
+    REQUIRE(subscribe(*net));
+    REQUIRE_FALSE(TestHelper::polling(*core));
+    auto retry_in = [&]() -> std::chrono::milliseconds {
+        auto due = TestHelper::poll_retry_due(*core);
+        return due ? std::chrono::ceil<std::chrono::seconds>(*due - clock_now_ms()) : 0ms;
+    };
+
+    // The poll sent on subscribing fails, and nothing would poll again: the retry is Core's.
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == core::Core::POLL_RETRY_FIRST);
+
+    // A full poll, whatever failed; failing again, the next waits twice as long.
+    TestHelper::fire_poll_retry(*core);
+    REQUIRE(polls(*net).size() == 1);
+    CHECK(namespaces_in(*polls(*net)[0]->request.body).size() > 1);
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == 2 * core::Core::POLL_RETRY_FIRST);
+
+    // Answered: nothing more to retry, and a fetch failing after that waits only the first again.
+    TestHelper::fire_poll_retry(*core);
+    REQUIRE(answer_batch(*net));
+    CHECK_FALSE(TestHelper::poll_retry_due(*core));
+    TestHelper::fetch(*core, {config::Namespace::Devices}, nullptr);
+    REQUIRE(answer_batch(*net, {}, false));
+    CHECK(retry_in() == core::Core::POLL_RETRY_FIRST);
+
+    // The subscription lost, polling takes over, and polling retries for itself.
+    net->on_connection_lost(net->current_node.remote_pubkey);
+    CHECK(TestHelper::polling(*core));
+    CHECK_FALSE(TestHelper::poll_retry_due(*core));
+}

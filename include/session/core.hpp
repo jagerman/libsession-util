@@ -352,6 +352,19 @@ class Core {
     void _update_polling();
     void _poll();
 
+    // Every poll and fetch ends here, once, whatever asked for it: `ok` resets the retry backoff,
+    // and a failure arms the retry when nothing else is polling.
+    void _poll_settled(bool ok);
+
+    // Schedules a full poll after the current backoff, unless the poll timer is running (its next
+    // tick is the retry) or one is already scheduled; see the definition.
+    void _arm_poll_retry();
+    void _cancel_poll_retry();
+    quic::TimerID _poll_retry_timer;
+    // When the scheduled retry fires; unset while none is.
+    std::optional<sys_ms> _poll_retry_due;
+    std::chrono::milliseconds _poll_backoff = POLL_RETRY_FIRST;
+
     /// The outcome of a swarm request.
     struct SwarmResponse {
         bool timeout;
@@ -708,6 +721,13 @@ class Core {
     /// that queue as it is torn down, and holds the loop at least as long as the queue: a queue has
     /// to go before its loop does.
     const std::shared_ptr<quic::Loop>& disk_loop() { return _disk_loop; }
+
+    /// How long a poll or fetch of our own swarm that failed while nothing is polling -- a
+    /// subscription having stopped the polling -- waits before Core polls again by itself: the
+    /// first, doubling with each failure in a row up to the most, and back to the first on any poll
+    /// that succeeds.  While polling, the next poll is the retry.
+    static constexpr std::chrono::milliseconds POLL_RETRY_FIRST = 10s;
+    static constexpr std::chrono::milliseconds POLL_RETRY_MAX = 5min;
 
     /// How long a cached PFS key is considered fresh (no re-fetch needed).
     static constexpr auto PFS_KEY_FRESH_DURATION = 24h;
