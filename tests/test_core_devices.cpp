@@ -4496,6 +4496,52 @@ device::Info planted_record() {
 }  // namespace
 
 TEST_CASE(
+        "Devices - the group's scheduled account rotation is the same on every member",
+        "[core][devices][rotation]") {
+    Linking l;
+    CHECK_FALSE(l.applicant->devices.scheduled_account_rotation());
+
+    l.admit();
+    TempCore third{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+    join(l, third);
+    auto third_id = Linking::id_of(third);
+    // The existing device's push, confirmed: what delivered the key to the third.
+    l.core->devices.mark_device_group_pushed(l.core->devices.build_device_group_message(), "G1");
+
+    // One time, whichever member asks: the earliest of the three devices' own.
+    auto scheduled = l.core->devices.scheduled_account_rotation();
+    REQUIRE(scheduled);
+    CHECK(l.applicant->devices.scheduled_account_rotation() == scheduled);
+    CHECK(third->devices.scheduled_account_rotation() == scheduled);
+    CHECK(*scheduled == std::min(
+                                {*l.core->devices.next_account_rotation(),
+                                 *l.applicant->devices.next_account_rotation(),
+                                 *third->devices.next_account_rotation()}));
+
+    // The third leaves, holding the current key, so the other two replace it early -- each at a
+    // moment of its own.  What they show the user stays one time, and the schedule's.
+    auto leaver = l.core->devices.devices(true, true, true).at(third_id);
+    leaver.state = device::State::Left;
+    leaver.kicked = clock_now_s();
+    auto group = l.core->devices.devices(true, true, true);
+    group.at(third_id) = leaver;
+    auto farewell = TestHelper::encrypt_device_data(third->devices, group);
+    TestHelper::deliver_device_message(*l.core, farewell, in(10min), "G-left");
+    TestHelper::deliver_device_message(*l.applicant, farewell, in(10min), "G-left");
+
+    auto now_scheduled = l.core->devices.scheduled_account_rotation();
+    REQUIRE(now_scheduled);
+    CHECK(l.applicant->devices.scheduled_account_rotation() == now_scheduled);
+    CHECK(*now_scheduled >
+          clock_now() + Devices::KEY_ROTATION_PERIOD - Devices::KEY_ROTATION_JITTER);
+    for (auto* member : {&l.core, &l.applicant}) {
+        auto own = *(*member)->devices.next_account_rotation();
+        CHECK(own <= clock_now() + Devices::KEY_ROTATION_JITTER);
+        CHECK(own < *now_scheduled);
+    }
+}
+
+TEST_CASE(
         "Devices - a removed device can add a device until the members' keys move on",
         "[core][devices][removal][attack]") {
     DeviceEventsRecorder third_events;

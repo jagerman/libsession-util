@@ -410,6 +410,11 @@ call to turn it off, and no setting to offer for it: a contact that has fetched 
 using it whatever the account later publishes, so off would not mean off. `pfs_enabled()` says
 whether it is on, whichever device turned it on.
 
+To show when the account's key next changes, use `devices.scheduled_account_rotation()`, which is
+the same on every device of the group. It changes then only if the device whose turn it is is
+online; `next_account_rotation()` is this device's own turn, and may be earlier while it is
+replacing the key early.
+
 ### A key that is not the account's
 
 `rogue_account_key` fires when the account's published key -- the one contacts encrypt to -- is

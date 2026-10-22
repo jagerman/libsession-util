@@ -509,6 +509,22 @@ class Devices final : detail::CoreComponent {
     // a rotation by anyone stands it down.  Nullopt if there is no reason to.
     std::optional<sys_ms> _early_account_rotation(int64_t key);
 
+    // What every device's account key rotation slot is reckoned from: the active key, and the
+    // devices of the group.  Nullopt for a device that is not a member in good standing, or with
+    // no active key.
+    struct RotationBasis {
+        int64_t key_id;
+        std::chrono::sys_seconds created;
+        cleared_b32 seed;
+        std::vector<device::Id> registered;
+    };
+    std::optional<RotationBasis> _rotation_basis();
+
+    // When `device`'s turn to rotate the account key falls, by the spec's "Account Key Rotation
+    // timer": the same on every device that computes it from the same basis.
+    std::chrono::system_clock::time_point _rotation_slot(
+            const RotationBasis& basis, const device::Id& device);
+
     // Brings our next device key rotation forward to within KEY_ROTATION_JITTER, unless it is due
     // sooner already: on a removal, so that what the removed device knows of our keys goes stale.
     void _pull_in_device_rotation();
@@ -1159,7 +1175,22 @@ class Devices final : detail::CoreComponent {
     // was made, offset within KEY_ROTATION_JITTER as the spec's "Account Key Rotation timer" says;
     // or sooner, if the current key reached a device no longer in the group (see "Rotating early").
     // Nullopt for a device that is not a member of a group in good standing.
+    //
+    // This device's own time: at most `scheduled_account_rotation()`, and earlier than it only
+    // while this device is replacing the key early.
     std::optional<std::chrono::system_clock::time_point> next_account_rotation();
+
+    // When the group's next scheduled account key rotation falls: the earliest of every registered
+    // device's slot, each reckoned as `next_account_rotation` reckons this device's.  Every member
+    // computes the same time from the same group, so this is the one to show a user.  The rotation
+    // happens then only if the device whose slot it is is online to make it; otherwise the next
+    // slot's device does.
+    //
+    // Early replacement is not included: when and whether a device replaces the key early is its
+    // own (each picks its own jittered moment, and the remover goes at once), so no time including
+    // it could be the same on every device.  Nullopt for a device that is not a member of a group
+    // in good standing, or with no active key.
+    std::optional<std::chrono::system_clock::time_point> scheduled_account_rotation();
 
     bool account_rotation_due() {
         auto t = next_account_rotation();

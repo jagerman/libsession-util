@@ -3874,50 +3874,71 @@ void Devices::push_owed() {
             });
 }
 
-std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotation() {
+std::optional<Devices::RotationBasis> Devices::_rotation_basis() {
     auto c = conn();
     SQLite::Transaction tx{c.sql};
 
     if (!_member())
         return std::nullopt;
 
-    int64_t key_id = 0;
-    int64_t t_created = 0;
-    std::optional<cleared_b32> active_seed;
+    std::optional<RotationBasis> basis;
     for (auto [id, created, seed] : c.prepared_results<int64_t, int64_t, sqlite::blobn<32>>(
                  "SELECT id, created, seed FROM device_account_keys"
                  " WHERE rotated IS NULL ORDER BY created DESC LIMIT 1")) {
-        key_id = id;
-        t_created = created;
-        std::memcpy(active_seed.emplace().data(), seed.data(), seed.size());
+        auto& b = basis.emplace();
+        b.key_id = id;
+        b.created = std::chrono::sys_seconds{std::chrono::seconds{created}};
+        std::memcpy(b.seed.data(), seed.data(), seed.size());
     }
-    if (!active_seed)
+    if (!basis)
         return std::nullopt;
 
-    auto N = c.prepared_get<int64_t>(
-            "SELECT count(*) FROM devices WHERE state = ?",
-            static_cast<int>(device::State::Registered));
+    for (auto id : c.prepared_results<sqlite::blob_guts<device::Id>>(
+                 "SELECT unique_id FROM devices WHERE state = ?",
+                 static_cast<int>(device::State::Registered)))
+        basis->registered.push_back(id);
 
     tx.commit();
+    return basis;
+}
 
+std::chrono::system_clock::time_point Devices::_rotation_slot(
+        const RotationBasis& basis, const device::Id& device) {
     // u is a per-device uniform random value in [0,1], derived deterministically from the device
     // ID and current account key seed so that each device independently computes a consistent
     // rotation schedule.
     std::array<std::byte, 8> hash_out;
-    hash::blake2b_key_pers(hash_out, *active_seed, PERS_ACC_KEY_ROT, self_id);
+    hash::blake2b_key_pers(hash_out, basis.seed, PERS_ACC_KEY_ROT, device);
     double u = oxenc::load_little_to_host<uint64_t>(hash_out.data()) / 0x1p64;
 
     // With N registered devices, the minimum of their N individual offsets is uniformly
     // distributed in [PERIOD - JITTER/2, PERIOD + JITTER/2].
+    auto N = static_cast<double>(basis.registered.size());
     auto offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
             (KEY_ROTATION_PERIOD - KEY_ROTATION_JITTER / 2) +
-            KEY_ROTATION_JITTER * (1.0 - std::pow(u, static_cast<double>(N))));
-    std::chrono::system_clock::time_point scheduled =
-            std::chrono::sys_seconds{std::chrono::seconds{t_created}} + offset;
+            KEY_ROTATION_JITTER * (1.0 - std::pow(u, N)));
+    return basis.created + offset;
+}
 
-    if (auto early = _early_account_rotation(key_id))
+std::optional<std::chrono::system_clock::time_point> Devices::next_account_rotation() {
+    auto basis = _rotation_basis();
+    if (!basis)
+        return std::nullopt;
+    auto scheduled = _rotation_slot(*basis, self_id);
+    if (auto early = _early_account_rotation(basis->key_id))
         return std::min(scheduled, std::chrono::system_clock::time_point{*early});
     return scheduled;
+}
+
+std::optional<std::chrono::system_clock::time_point> Devices::scheduled_account_rotation() {
+    auto basis = _rotation_basis();
+    if (!basis)
+        return std::nullopt;
+    std::optional<std::chrono::system_clock::time_point> first;
+    for (const auto& device : basis->registered)
+        if (auto t = _rotation_slot(*basis, device); !first || t < *first)
+            first = t;
+    return first;
 }
 
 std::optional<sys_ms> Devices::_early_account_rotation(int64_t key) {
