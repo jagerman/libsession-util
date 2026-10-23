@@ -319,8 +319,9 @@ namespace device {
         /// tombstone names this one: the account has forked, and an account can have only one
         /// group.  Nothing is wrong with this group, which goes on working; the user decides, here
         /// or on another device, whether to keep it, dissolving the others
-        /// (`Devices::dissolve_group`), or to leave it for another (`Devices::leave_group`, then
-        /// `Devices::request_link`).
+        /// (`Devices::dissolve_group`), to leave it for another (`Devices::leave_group`, then
+        /// `Devices::request_link`), or to start over, dissolving both
+        /// (`Devices::start_device_group`).
         Forked,
         /// No longer in a device group: its group is gone from the swarm while another group is
         /// there, or has moved on to keys it does not hold without showing why.  It was removed,
@@ -793,18 +794,32 @@ class Devices final : detail::CoreComponent {
     void membership(result_function<device::MembershipState> cb);
     device::MembershipState membership(await_t);
 
-    // Starts a new device group with this device as its only member, and answers its identifier.
-    // For any device not in a group.  Any group in the swarm is dissolved: an account has only one,
-    // and the user starting another over those in view is choosing it over them -- the one a
-    // `Removed`, `Displaced` or `Dropped` device was in included, which it leaves first, taking a
-    // new device id.  A device `Requesting` or `Approved` withdraws its request.  The group starts
-    // with a newly generated account key, whatever the device held before.
+    // Starts over from this device: a new device group with this device as its only member, and
+    // answers its identifier.  From any state but `Unknown`.  Every group in view is dissolved,
+    // since an account has only one and the user starting another is choosing it over all of them:
+    // their messages are deleted from the swarm, one tombstone names them all, and each is
+    // remembered as dissolved.  Their devices learn of it from the tombstone, become `Dissolved`,
+    // and have to ask to join the new group.  A device that was in a group, whether a member or
+    // `Removed`, `Displaced` or `Dropped` from it, leaves it as any leaving does, taking a new
+    // device id and device keys.  A device `Requesting` or `Approved` withdraws its request.  The
+    // group starts with a newly generated account key, whatever the device held before.
     //
-    // Fails with `err::already_registered` for a device already in a group, and
-    // `err::membership_unknown` before the first fetch of this run: starting a group is the user's
-    // decision, made from what the swarm holds.
-    void start_device_group(result_function<device::GroupId> cb);
-    device::GroupId start_device_group(await_t);
+    // `replacing` is the groups the user confirmed replacing: what `membership()` listed, its
+    // `group` and its `others`, as shown to them -- empty when it listed none.  Only those are
+    // dissolved.  If a group in view now is not among them -- one that appeared after the user was
+    // shown the list -- nothing at all is done and the call fails with `err::groups_changed`, for
+    // the application to show the list again.  One in `replacing` no longer in view, lapsed or
+    // dissolved meanwhile, is gone either way, and is ignored.
+    //
+    // The dissolution, the new identity and the start are committed together; the tombstone goes
+    // out as a leave's departure does, retried after fetches and across restarts, and is not
+    // reported on.
+    //
+    // Fails with `err::membership_unknown` before the first fetch of this run, before anything
+    // else: starting a group is the user's decision, made from what the swarm holds.
+    void start_device_group(
+            std::vector<device::GroupId> replacing, result_function<device::GroupId> cb);
+    device::GroupId start_device_group(std::vector<device::GroupId> replacing, await_t);
 
     // Keeps this device's group over another in the swarm, which the user has chosen to do from
     // `Forked`: deletes the other's messages from the swarm, publishes a tombstone naming it, and
@@ -842,7 +857,7 @@ class Devices final : detail::CoreComponent {
   private:
     bool _remove_device(std::span<const std::byte, device::ID_SIZE> id);
     device::MembershipState _membership();
-    device::GroupId _start_device_group();
+    device::GroupId _start_device_group(const std::vector<device::GroupId>& replacing);
 
     // Removed from its group, displaced from it, or dropped (see Membership::Dropped): still
     // holding the group, but no longer in it.
@@ -959,6 +974,10 @@ class Devices final : detail::CoreComponent {
     // Queues our departure from the group `devs` holds, or its dissolution if no one else is in it,
     // inside the caller's transaction.
     void _queue_departure(device::map& devs);
+
+    // The hashes of our group's messages that our state was merged from: what replacing or
+    // dissolving the group deletes from the swarm.
+    std::vector<std::string> _merged_hashes();
 
     bool _confirm_link();
 

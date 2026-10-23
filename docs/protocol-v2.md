@@ -825,9 +825,14 @@ does, by choosing one group, which **dissolves** the others, and always from a p
 knowledge: on a device that can see what it is choosing between.  Dissolving is only ever the effect
 of that choice, and a device dissolves groups in exactly these cases:
 
-1. **Starting a group while others are in view.**  A device outside a group that starts one, while
-   groups it could have asked to join are in the swarm, is choosing its new group over them, and
-   dissolves them.
+1. **Starting a group.**  A device that starts one is choosing its new group over every group in
+   view, and dissolves them all -- its own included, when it starts from inside a group -- but
+   only the groups its user confirmed replacing: if another has come into view since the user was
+   shown them, starting is refused and nothing is dissolved, for the user to be asked again.
+   Starting over is the one step: there is nothing to leave first, since the group it was in is
+   dissolved with the rest.  It dissolves its own as a sole member leaving does, deleting the
+   messages it merged and naming the group in the tombstone, and takes a new device ID, so that
+   the devices still in that group learn from the tombstone that it is gone.
 2. **Completing a join while others are in view.**  A device that sees more than one group and asks
    to join one is choosing it over the rest, and once it is admitted -- the user having confirmed
    the SAS -- it dissolves them.
@@ -851,7 +856,7 @@ user decides, on this device or another.  It asks its user, showing when the oth
 active -- the `time` of its newest message -- which tells a live set of devices ("an hour ago")
 from a stale leftover ("two months ago").  The user keeps this group, dissolving the other, or
 leaves it for the other: leaving it (see "Leaving a group") and asking to join the other, as any
-device outside a group does.
+device outside a group does.  Or the user starts over from this device, dissolving both.
 
 A device in a group whose messages are gone from the swarm, while another group's are there, is
 **dropped**: no longer in a device group, and unable to tell why.  Its group's messages leave the

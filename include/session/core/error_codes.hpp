@@ -27,4 +27,8 @@ inline constexpr std::string_view unknown_group = "device.unknown_group";
 /// depends on it.  See `Devices::membership`.
 inline constexpr std::string_view membership_unknown = "device.membership_unknown";
 
+/// The device groups in view are not the ones the user confirmed: one has appeared since they were
+/// shown.  Nothing was done.  Read `Devices::membership` again and have the user confirm again.
+inline constexpr std::string_view groups_changed = "device.groups_changed";
+
 }  // namespace session::core::err

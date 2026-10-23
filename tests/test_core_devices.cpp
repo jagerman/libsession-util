@@ -1750,6 +1750,21 @@ device::State own_state(TempCore& c) {
     return c->devices.device_info(await).first.state;
 }
 
+// What `membership()` lists as the groups starting one would replace: its group and its others.
+std::vector<device::GroupId> in_view(const device::MembershipState& state) {
+    std::vector<device::GroupId> out;
+    if (state.group)
+        out.push_back(*state.group);
+    for (const auto& g : state.others)
+        out.push_back(g.id);
+    return out;
+}
+
+// Starts a group as an application does once its user has confirmed replacing what is in view.
+device::GroupId start_over(TempCore& c) {
+    return c->devices.start_device_group(in_view(c->devices.membership(await)), await);
+}
+
 }  // namespace
 
 TEST_CASE(
@@ -2485,7 +2500,7 @@ TEST_CASE(
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
 
     // Until it starts or joins a group.
-    l.applicant->devices.start_device_group(await);
+    start_over(l.applicant);
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
 }
 
@@ -2983,7 +2998,7 @@ TEST_CASE(
     auto held_before = l.applicant->devices.active_account_keys().front().x25519_pub;
     auto* net = attach_mock_network(*l.applicant);
 
-    auto mine = l.applicant->devices.start_device_group(await);
+    auto mine = start_over(l.applicant);
     CHECK(mine != theirs);
 
     // With a key of its own, not whatever it held before.
@@ -3024,19 +3039,14 @@ TEST_CASE(
     Linking l;
 
     // Before any fetch, nothing is known of what the swarm holds.
-    CHECK(failure_code([&] { l.applicant->devices.start_device_group(await); }) ==
-          err::membership_unknown);
-
-    // Already in one.
-    TestHelper::finish_fetch(*l.core);
-    CHECK(failure_code([&] { l.core->devices.start_device_group(await); }) ==
-          err::already_registered);
+    CHECK(failure_code([&] { start_over(l.applicant); }) == err::membership_unknown);
 
     // Requesting: starting a group instead withdraws the request.
+    TestHelper::finish_fetch(*l.core);
     l.show_group();
     TestHelper::build_link_request(*l.applicant, *l.core);
     REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Requesting);
-    l.applicant->devices.start_device_group(await);
+    start_over(l.applicant);
     CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
     CHECK(own_state(l.applicant) == device::State::Registered);
 }
@@ -3375,7 +3385,7 @@ TEST_CASE(
     TestHelper::finish_fetch(*l.applicant);
 
     // A group of its own: the first record of it carries the description.
-    l.applicant->devices.start_device_group(await);
+    start_over(l.applicant);
     auto own = record_in(
             l.applicant->devices,
             l.applicant->devices.build_device_group_message().message,
@@ -3715,7 +3725,7 @@ TEST_CASE(
 
     // Out of the group it was removed from first, and so, under the rule for starting a group
     // with others in view, dissolving it: nothing of that group comes along.
-    auto mine = l.applicant->devices.start_device_group(await);
+    auto mine = start_over(l.applicant);
     CHECK(mine != theirs);
     CHECK(l.applicant_id() != old_id);
     auto state = l.applicant->devices.membership(await);
@@ -5072,7 +5082,7 @@ TEST_CASE(
     // What is left is to start again -- its own doing, so not reported -- and to ask to join that.
     // The other, Dissolved until it joins or starts a group, stays so on seeing the new one, and is
     // told of it: there is now a group to offer joining.
-    auto mine = l.core->devices.start_device_group(await);
+    auto mine = start_over(l.core);
     CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
     CHECK(l.events.membership == std::vector{device::Membership::Dissolved});
     TestHelper::deliver_device_message(
@@ -5180,6 +5190,185 @@ TEST_CASE(
     CHECK(l.core->devices.membership(await).membership == device::Membership::InGroup);
 }
 
+namespace {
+struct by_value {
+    bool operator()(const device::GroupId& a, const device::GroupId& b) const {
+        return a.value < b.value;
+    }
+};
+using GroupSet = std::set<device::GroupId, by_value>;
+
+GroupSet dissolved_ids(TempCore& c) {
+    GroupSet out;
+    for (auto id :
+         c->database().conn().prepared_results<sqlite::blob_guts<std::array<std::byte, 8>>>(
+                 "SELECT group_id FROM device_dissolved_groups"))
+        out.insert(device::GroupId{id});
+    return out;
+}
+
+GroupSet listed(const device::MembershipState& state) {
+    auto groups = in_view(state);
+    return {groups.begin(), groups.end()};
+}
+}  // namespace
+
+TEST_CASE(
+        "Devices - a member starting a group dissolves its own, and its devices are told",
+        "[core][devices][dissolve][membership]") {
+    Linking l;
+    l.admit();
+    auto old_group = *TestHelper::group_id(*l.applicant);
+    auto old_id = l.applicant_id();
+    auto old_key = l.applicant->devices.active_account_keys().front().x25519_pub;
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "G2");
+    auto before = l.applicant->devices.membership(await);
+    REQUIRE(before.membership == device::Membership::InGroup);
+    REQUIRE(listed(before) == GroupSet{old_group});
+
+    auto* net = attach_mock_network(*l.applicant);
+    auto mine = l.applicant->devices.start_device_group(in_view(before), await);
+
+    // A new group, under a new identity and a new account key, with nothing of the old.
+    CHECK(mine != old_group);
+    CHECK(l.applicant_id() != old_id);
+    CHECK(l.applicant->devices.active_account_keys().front().x25519_pub != old_key);
+    auto state = l.applicant->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.group == mine);
+    CHECK(state.others.empty());
+    auto devs = l.applicant->devices.devices(true, true, true);
+    REQUIRE(devs.size() == 1);
+    CHECK(devs.begin()->first == l.applicant_id());
+
+    // The old group dissolved as its sole member leaving would: its messages deleted, and a
+    // tombstone naming it -- exactly what membership() listed.
+    CHECK(dissolved_ids(l.applicant) == listed(before));
+    REQUIRE(dissolutions(*net).size() == 1);
+    auto [tombstone, deleted] = pushed(*dissolutions(*net).front());
+    CHECK(oxenc::bt_dict_consumer{tombstone}.require<std::string_view>("") == "T");
+    CHECK(std::ranges::find(deleted, "G2") != deleted.end());
+
+    // The other member, told, has no group; it sees the new one to ask to join.
+    TestHelper::deliver_device_message(*l.core, tombstone, in(10min), "T1");
+    CHECK(l.core->devices.membership(await).membership == device::Membership::Dissolved);
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "N1");
+    auto theirs = l.core->devices.membership(await);
+    CHECK(theirs.membership == device::Membership::Dissolved);
+    REQUIRE(theirs.others.size() == 1);
+    CHECK(theirs.others[0].id == mine);
+}
+
+TEST_CASE(
+        "Devices - a forked device starting a group dissolves both",
+        "[core][devices][dissolve][membership]") {
+    Linking l;
+    TestHelper::start_device_group(*l.applicant);
+    TestHelper::deliver_device_message(
+            *l.applicant, l.core->devices.build_device_group_message().message, in(10min), "A1");
+    TestHelper::deliver_device_message(
+            *l.core, l.applicant->devices.build_device_group_message().message, in(10min), "B1");
+    auto ours = *TestHelper::group_id(*l.core);
+    auto theirs = *TestHelper::group_id(*l.applicant);
+    auto before = l.core->devices.membership(await);
+    REQUIRE(before.membership == device::Membership::Forked);
+    REQUIRE(listed(before) == GroupSet{ours, theirs});
+
+    auto* net = attach_mock_network(*l.core);
+    auto mine = l.core->devices.start_device_group(in_view(before), await);
+    CHECK(mine != ours);
+    CHECK(mine != theirs);
+    CHECK(dissolved_ids(l.core) == listed(before));
+    auto state = l.core->devices.membership(await);
+    CHECK(state.membership == device::Membership::InGroup);
+    CHECK(state.others.empty());
+
+    // One tombstone naming both, and the other group's device told by it.
+    auto tombstone = latest_tombstone(*net);
+    TestHelper::deliver_device_message(*l.applicant, tombstone, in(10min), "T1");
+    CHECK(l.applicant->devices.membership(await).membership == device::Membership::Dissolved);
+}
+
+TEST_CASE(
+        "Devices - starting a group dissolves only what the user confirmed replacing",
+        "[core][devices][dissolve][membership]") {
+    Linking l;
+    l.admit();
+    auto own = *TestHelper::group_id(*l.applicant);
+    auto confirmed = in_view(l.applicant->devices.membership(await));
+    REQUIRE(confirmed == std::vector{own});
+    auto* net = attach_mock_network(*l.applicant);
+
+    SECTION("a group appearing after the user was shown the list: refused, and nothing done") {
+        TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+        TestHelper::start_device_group(*other);
+        auto newcomer = *TestHelper::group_id(*other);
+        TestHelper::deliver_device_message(
+                *l.applicant, other->devices.build_device_group_message().message, in(10min), "B1");
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::Forked);
+
+        auto old_id = l.applicant_id();
+        auto old_key = l.applicant->devices.active_account_keys().front().x25519_pub;
+        auto queued = pending_pushes(l.applicant);
+        CHECK(failure_code([&] { l.applicant->devices.start_device_group(confirmed, await); }) ==
+              err::groups_changed);
+
+        auto state = l.applicant->devices.membership(await);
+        CHECK(state.membership == device::Membership::Forked);
+        CHECK(state.group == own);
+        CHECK(l.applicant_id() == old_id);
+        CHECK(l.applicant->devices.active_account_keys().front().x25519_pub == old_key);
+        CHECK(dissolved_ids(l.applicant).empty());
+        CHECK(pending_pushes(l.applicant) == queued);
+        CHECK(dissolutions(*net).empty());
+
+        // Shown again, and confirmed with the newcomer: as any start.
+        auto mine = l.applicant->devices.start_device_group({own, newcomer}, await);
+        CHECK(dissolved_ids(l.applicant) == GroupSet{own, newcomer});
+        CHECK(l.applicant->devices.membership(await).group == mine);
+    }
+
+    SECTION("one confirmed that is no longer in view: gone either way, and no matter") {
+        TempCore other{core::predefined_seed{std::span<const std::byte, 32>{l.seed}}};
+        TestHelper::start_device_group(*other);
+        confirmed.push_back(*TestHelper::group_id(*other));
+
+        auto mine = l.applicant->devices.start_device_group(confirmed, await);
+        CHECK(dissolved_ids(l.applicant) == GroupSet{own});
+        CHECK(l.applicant->devices.membership(await).group == mine);
+    }
+}
+
+TEST_CASE(
+        "Devices - starting a group with none in view confirms an empty list",
+        "[core][devices][membership]") {
+    Linking l;
+    TestHelper::finish_fetch(*l.applicant);
+
+    SECTION("none there: started") {
+        REQUIRE(l.applicant->devices.membership(await).membership == device::Membership::NoGroup);
+        auto mine = l.applicant->devices.start_device_group({}, await);
+        CHECK(l.applicant->devices.membership(await).group == mine);
+        CHECK(dissolved_ids(l.applicant).empty());
+    }
+
+    SECTION("one there after all: refused, until it is confirmed") {
+        auto theirs = l.show_group();
+        REQUIRE(l.applicant->devices.membership(await).membership ==
+                device::Membership::DeviceGroupVisible);
+        CHECK(failure_code([&] { l.applicant->devices.start_device_group({}, await); }) ==
+              err::groups_changed);
+        CHECK(l.applicant->devices.membership(await).membership ==
+              device::Membership::DeviceGroupVisible);
+
+        l.applicant->devices.start_device_group({theirs}, await);
+        CHECK(l.applicant->devices.membership(await).membership == device::Membership::InGroup);
+        CHECK(dissolved_ids(l.applicant) == GroupSet{theirs});
+    }
+}
+
 TEST_CASE(
         "Devices - a join to a revived group is undone when a kept group's device returns",
         "[core][devices][dissolve]") {
@@ -5251,7 +5440,7 @@ TEST_CASE(
     // starter's own doing, so not reported to it.
     l.events.membership.clear();
     other_events.membership.clear();
-    l.core->devices.start_device_group(await);
+    start_over(l.core);
     auto state = l.core->devices.membership(await);
     CHECK(state.membership == device::Membership::InGroup);
     CHECK(state.others.empty());
@@ -6024,7 +6213,7 @@ TEST_CASE(
     }
     SECTION("starting a group") {
         TestHelper::finish_fetch(*l.applicant);
-        l.applicant->devices.start_device_group(await);
+        start_over(l.applicant);
         key = rogue ? foreign_pubkey_message(l.applicant)
                     : l.applicant->devices.build_account_pubkey_message();
     }

@@ -1824,14 +1824,11 @@ bool Devices::_leave_group() {
 }
 
 void Devices::_queue_departure(device::map& devs) {
-    auto c = conn();
     bool others = std::ranges::any_of(devs, [this](const auto& d) {
         return d.first != self_id && d.second.state == device::State::Registered;
     });
 
-    std::vector<std::string> messages;
-    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
-        messages.push_back(std::move(hash));
+    auto messages = _merged_hashes();
 
     // With nobody left the group is dissolved rather than departed: its messages deleted, and a
     // tombstone naming it.  Deleting alone would leave the devices of any other group on the
@@ -1851,6 +1848,13 @@ void Devices::_queue_departure(device::map& devs) {
     self.state = device::State::Left;
     self.kicked = clock_now_s();
     _queue_push(encrypt_device_data(devs), std::move(messages));
+}
+
+std::vector<std::string> Devices::_merged_hashes() {
+    std::vector<std::string> hashes;
+    for (auto hash : conn().prepared_results<std::string>("SELECT hash FROM device_group_merged"))
+        hashes.push_back(std::move(hash));
+    return hashes;
 }
 
 bool Devices::_record_group(const SwarmMessage& msg) {
@@ -3273,53 +3277,101 @@ void Devices::_adopt_identity(const device::Id& id) {
     _ended.clear();
 }
 
-void Devices::start_device_group(result_function<device::GroupId> cb) {
-    async([this] { return _start_device_group(); }, std::move(cb));
+void Devices::start_device_group(
+        std::vector<device::GroupId> replacing, result_function<device::GroupId> cb) {
+    async([this, replacing = std::move(replacing)] { return _start_device_group(replacing); },
+          std::move(cb));
 }
 
-device::GroupId Devices::start_device_group(await_t) {
-    return jq().call_get([this] { return _start_device_group(); });
+device::GroupId Devices::start_device_group(std::vector<device::GroupId> replacing, await_t) {
+    return jq().call_get([this, &replacing] { return _start_device_group(replacing); });
 }
 
-device::GroupId Devices::_start_device_group() {
+device::GroupId Devices::_start_device_group(const std::vector<device::GroupId>& replacing) {
     assert(on_loop());
-    switch (_membership().membership) {
+    auto state = _membership();
+    bool leaving = false;
+    switch (state.membership) {
         case device::Membership::Unknown:
             throw session::error{
                     err::membership_unknown,
                     "Cannot start a group before a fetch has shown what the swarm holds"};
         case device::Membership::InGroup:
         case device::Membership::Forked:
-            throw session::error{err::already_registered, "This device is already in a group"};
         case device::Membership::Removed:
         case device::Membership::Displaced:
-        case device::Membership::Dropped:
-            // Leaving the group it is no longer in, as any leaving does, under a new id -- after
-            // which that group is one in view like any other.
-            _new_identity();
-            break;
+        case device::Membership::Dropped: leaving = true; break;
         case device::Membership::Requesting:
-        case device::Membership::Approved: _withdraw_own_request(); break;
+        case device::Membership::Approved:
         case device::Membership::NoGroup:
         case device::Membership::DeviceGroupVisible:
         case device::Membership::Dissolved: break;
     }
 
-    // Whatever it held before is no group's, the group starts with a fresh key, and an admission on
-    // anything it asked before would take it straight back out.
-    _forget_group();
-    _forget_own_requests();
+    // The account can have only one group, and the user starting this one is choosing it over
+    // every one in view, ours included.  Taken from `state`, so that it is what `membership()`
+    // lists for an application to show before the call.  Not news to this device, which is making
+    // the choice.
+    std::vector<device::GroupId> dissolved;
+    if (state.group)
+        dissolved.push_back(*state.group);
+    for (const auto& other : state.others)
+        dissolved.push_back(other.id);
 
-    _mark_group_owed();
+    // But only if the user chose it over each of them: one that appeared after they were shown the
+    // list is one they never saw, and dissolving it would be dissolving a group nobody chose to.
+    // Checked before anything changes, so that the refusal leaves everything as it was.
+    if (!std::ranges::all_of(dissolved, [&](const auto& g) {
+            return std::ranges::find(replacing, g) != replacing.end();
+        }))
+        throw session::error{
+                err::groups_changed,
+                "The device groups in view are not the ones confirmed for replacing"};
+
+    // Leaving whatever group it was in, as any leaving does, under a new id and new device keys.
+    if (leaving)
+        rotate_device_keys();
+
+    // Committed together, so that a crash cannot leave the groups dissolved under an identity that
+    // goes on as theirs, or a new identity with the old group still standing.  The group itself is
+    // owed rather than made here, since making it opens transactions of its own; `establish_group`
+    // finishes it after a crash as well as now.
+    device::Id id;
+    {
+        auto c = conn();
+        SQLite::Transaction tx{c.sql};
+        // Our own group's messages too, as a sole member leaving deletes them; only a member in
+        // good standing speaks for its group, which is when `state.group` is set.
+        if (!dissolved.empty())
+            _queue_dissolution(
+                    dissolved, state.group ? _merged_hashes() : std::vector<std::string>{});
+        if (state.membership == device::Membership::Requesting ||
+            state.membership == device::Membership::Approved)
+            _withdraw_own_request();
+
+        // Whatever it held before is no group's, the group starts with a fresh key, and an
+        // admission on anything it asked before would take it straight back out.
+        if (leaving) {
+            id = _forget_identity();
+        } else {
+            _forget_group();
+            _forget_own_requests();
+        }
+        _mark_group_owed();
+        tx.commit();
+    }
+    if (leaving)
+        _adopt_identity(id);
+    if (!dissolved.empty())
+        log::info(cat, "Dissolved {} device group(s) to start a new one", dissolved.size());
+
     establish_group();
     auto group = _group_id();
     if (!group)
         throw std::logic_error{"Started a group but it has no identifier"};
     log::info(cat, "Started a new device group");
 
-    // The account can have only one group, and the user starting this one with others in view is
-    // choosing it over them.  Not news to this device, which is making the choice.
-    _dissolve_all_but(*group);
+    _send_pending_pushes();
     _reread_account_pubkeys();
 
     _devices_changed = true;
@@ -4120,8 +4172,7 @@ Devices::DeviceGroupPush Devices::build_device_group_message() {
     for (const auto& [id, info] : devs)
         if (info.state == device::State::Registered)
             push.recipients.push_back(id);
-    for (auto hash : c.prepared_results<std::string>("SELECT hash FROM device_group_merged"))
-        push.obsolete.push_back(std::move(hash));
+    push.obsolete = _merged_hashes();
 
     push.message = encrypt_device_data(devs);
     return push;

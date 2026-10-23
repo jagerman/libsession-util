@@ -124,7 +124,7 @@ the table below is `request_link(others.front().id)`, or a choice among them if 
 `NoGroup` is deliberately the user's decision. It cannot be told apart from a group that expired
 while all of the account's devices were offline for 30 days, and starting a group in that case
 forks the account. An application that really does want to start a group automatically can call
-`start_device_group` without asking, but that is its choice, not libsession's.
+`start_device_group({})` without asking, but that is its choice, not libsession's.
 
 On a restored account, say at the "Start a new one" choice what it costs: **messages sent to the
 account before this restore cannot be recovered on this device** unless one of the account's other
@@ -274,8 +274,8 @@ of their own, and the design answers that, as it answers everything a holder of 
 by telling the user rather than by preventing it: the user sees it, and the user decides. Offer,
 with the notice, what to do about a device they don't recognise: remove it (`remove_device`); and if
 the recovery phrase itself may be in someone else's hands, start afresh from a device they trust --
-`leave_group`, then `start_device_group`, which dissolves the old group (see "Starting a group") --
-and treat the recovery phrase as compromised.
+`start_device_group`, which dissolves every group in view, this device's own included (see
+"Starting over") -- and treat the recovery phrase as compromised.
 
 To remove a device, call `remove_device(id)` behind a confirmation that makes its permanence clear:
 **a removed device can never rejoin under the same identity**. It can only come back as a new
@@ -333,7 +333,7 @@ a device that started a group of its own by mistake months ago ("two months ago"
   one of their other devices if they don't recognise what now holds it. If several of their
   devices show this at once, no restore explains it: the recovery phrase is in someone else's
   hands, and the user should start afresh from a device they trust (`start_device_group`, which
-  dissolves the group in view) and treat the phrase as compromised.
+  dissolves every group in view; see "Starting over") and treat the phrase as compromised.
 - **Removed** (`membership_changed(Removed)`). Tell the user. If they want the device back, offer
   to link it again, to the group it was removed from (in `others`), or to start a group; the call
   gives it a new identity, and it then joins like any new device. Messages and the account's
@@ -353,19 +353,37 @@ a device that started a group of its own by mistake months ago ("two months ago"
 
 ## Starting a group
 
-`start_device_group()` creates a group with this device as its only member. It is valid from any
-state outside a group. A device `Requesting` or `Approved` drops its request; one `Removed`,
-`Displaced` or `Dropped` takes a new identity first, and the group it was in is then one in view
-like any other. It fails with `err::membership_unknown` before the first fetch, and
-`err::already_registered` from a group.
+`start_device_group(replacing)` creates a group with this device as its only member. It is valid
+from every state but `Unknown`: it fails with `err::membership_unknown` before the first fetch. A
+device `Requesting` or `Approved` drops its request; one that was in a group -- a member, or
+`Removed`, `Displaced` or `Dropped` from it -- leaves it under a new identity, as any leaving does.
 
-From `DeviceGroupVisible` (or anywhere else with groups in `others`), starting a group **dissolves
-every group in view**: an account has only one, and the user is choosing the new group over them.
-Their devices become `Dissolved` and have to link to the new group. Make that the warning on the
-"Start a new device group instead" choice, and say what is lost: **messages that reached the
-existing devices only, encrypted to keys this device does not hold, cannot be recovered afterwards**
-unless another device still holds those keys. This device is not alerted about anything: the choice
-was its user's.
+Starting a group **dissolves every group in view**, this device's own included: an account has only
+one, and the user is choosing the new group over all of them. `replacing` is the groups the user
+confirmed that for, and the call refuses to dissolve any other (see "Starting over"). Their devices become `Dissolved` and
+have to link to the new group. Make that the warning on the "Start a new device group instead"
+choice, and say what is lost: **messages that reached the existing devices only, encrypted to keys
+this device does not hold, cannot be recovered afterwards** unless another device still holds those
+keys. This device is not alerted about anything: the choice was its user's.
+
+### Starting over
+
+From any state, `start_device_group(replacing)` is the one call that starts over from this device:
+there is no leaving first. What it dissolves is what `membership()` lists -- `group`, this device's
+own group when it is a member in good standing, and every group in `others` -- so read
+`membership()` again right before the confirmation screen and list them all, by emoji, creation
+time and when each was last active, with this device's own marked. Their messages are deleted from
+the swarm and one tombstone names them all, sent and retried as a leave's departure is; the devices
+still in them learn of it from the tombstone, become `Dissolved`, and have to link to the new group.
+Offer the alternative beside it: linking this device to one of the groups listed instead
+(`request_link`, which from a group needs `leave_group` first), which keeps that group and its
+devices.
+
+Pass as `replacing` exactly the groups the confirmation screen listed -- an empty list when it
+listed none. A group can appear between the screen and the call; libsession will not dissolve one
+the user never saw. If any group then in view is not in `replacing`, the call does nothing at all
+and fails with `err::groups_changed`: read `membership()` again and show the list again for the
+user to confirm. A group in `replacing` that has gone from view meanwhile is simply ignored.
 
 ## Leaving a group
 
@@ -486,7 +504,8 @@ one, so treat it as the forged Displaced alert is treated (see "Other alerts"): 
 so it cannot be missed, and kept as a warning the user can reopen once dismissed. Say plainly that
 **someone else has the recovery phrase**: "Someone has published a key for your account that none
 of your devices made. Only someone with your recovery phrase can do this." What to do about it is
-the same: start afresh from a device they trust and treat the phrase as compromised.
+the same: start afresh from a device they trust (`start_device_group`; see "Starting over") and
+treat the phrase as compromised.
 
 libsession has already done what it can: where PFS/PQ is enabled, the account's own key goes back
 over the rogue one at once. It deletes nothing, since whoever has the phrase can publish again.
