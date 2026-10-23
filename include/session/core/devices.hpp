@@ -987,7 +987,8 @@ class Devices final : detail::CoreComponent {
             std::span<const std::byte, 32> x25519_pub);
 
     // Marks the account key with these public halves as one namespace -21 holds, current or
-    // rotated, answering whether there was such a key of ours at all.
+    // rotated, answering whether there was such a key of ours at all.  The current one is also
+    // recorded as our own session id's PFS/PQ key (see `Core::_cache_own_pfs_key`).
     bool _mark_published(
             std::span<const std::byte, 1184> mlkem768_pub,
             std::span<const std::byte, 32> x25519_pub);
@@ -1119,8 +1120,10 @@ class Devices final : detail::CoreComponent {
     // any thread.
     std::vector<AccountKeyInfo> account_keys();
 
-    // How long after rotation to keep an old account key.  14 days is the maximum 1-to-1 message
-    // TTL, plus 24h for sender key update lag, plus 24h safety margin.
+    // How long after rotation to keep an old account key: the 14-day maximum 1-to-1 message TTL,
+    // plus how long a sender may go on encrypting to a key after it is replaced -- within
+    // Core::PFS_KEY_REFRESH (6h) normally, but up to Core::PFS_KEY_FAILED_GRACE (48h) for a sender
+    // whose lookups keep failing.  That worst case is the whole 16 days, with no margin beyond it.
     static constexpr auto ACCOUNT_KEY_RETENTION = 16 * 24h;
 
     // How often account and device keys rotate, and the window each rotation is spread over.  An

@@ -1293,7 +1293,8 @@ Account keys in general must be preserved (in the device group config) for 16 da
 have been rotated away so that an offline device is able to decrypt any incoming messages that may
 still be in the swarm: the 1-to-1 message max TTL of 14 days, plus how long a sender may go on
 encrypting to a key after it is replaced.  That is normally under the 6h refresh, but up to 48h for
-a sender whose lookups keep failing (see "Account keys").
+a sender whose lookups keep failing (see "Account keys"), and that worst case takes the whole 16
+days, with no margin beyond it.
 
 ### Rotating early
 

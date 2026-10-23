@@ -564,6 +564,14 @@ class Core {
     // to send with.
     bool _store_pfs_failed(std::span<const std::byte, 33> session_id);
 
+    // The account's current key, seen on -21 by Devices: recorded for our own session id as the
+    // keys a lookup of it found, which is what such a lookup would find, so that our own copies of
+    // what we send are encrypted to it from now rather than from the next lookup.  Never throws: a
+    // cache that could not be written is only a lookup still to come.
+    void _cache_own_pfs_key(
+            std::span<const std::byte, 32> x25519_pub,
+            std::span<const std::byte, 1184> mlkem768_pub);
+
     // Fetches `session_id`'s keys from its swarm, unless a fetch of them is already in flight,
     // which then answers for both.  On the loop; `_pfs_fetch_done` ends it.
     void _fetch_pfs_keys(const b33& session_id);

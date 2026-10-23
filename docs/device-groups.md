@@ -405,11 +405,14 @@ offer it from any other state, nor before the user has had the chance to link th
 
 > Once enabled, PFS/PQ cannot be disabled. Clients that are not in your device group, including
 > legacy Session clients, will not be able to receive messages from contacts who use the new
-> PFS/PQ encryption to send to you.
+> PFS/PQ encryption to send to you, nor the messages you send from your other devices.
 
 It helps to say what it does not touch: it applies to one-to-one messages only (groups and
 communities have their own encryption); messages already received stay readable; and contacts
-switch gradually, as they next fetch the account's key, rather than all at once.
+switch gradually, as they next fetch the account's key, rather than all at once. The account's own
+devices switch at once: the copy of each message they send that goes to the account's other devices
+is PFS/PQ encrypted as soon as any of them sees the key published, so a device outside the group
+stops being able to read those then.
 
 **Then call `core.enable_pfs()`.** It records the setting in the account's profile, which reaches
 the other devices as any setting does, and publishes the account's key straight away. There is no

@@ -894,6 +894,15 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
 
     // Sets `core`'s rogue_account_key callback after the fact, for a Core built with other
     // callbacks of its own.
+    static void set_message_send_status(
+            core::Core& core,
+            std::function<
+                    void(int64_t,
+                         core::MessageSendStatus,
+                         std::optional<std::string_view>,
+                         std::optional<core::MessageEncryption>)> f) {
+        on_loop(core, [&] { core.callbacks.message_send_status = std::move(f); });
+    }
     static void set_rogue_account_key(core::Core& core, std::function<void()> f) {
         on_loop(core, [&] { core.callbacks.rogue_account_key = std::move(f); });
     }

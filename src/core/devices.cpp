@@ -3737,12 +3737,22 @@ bool Devices::_mark_published(
         std::span<const std::byte, 1184> mlkem768_pub, std::span<const std::byte, 32> x25519_pub) {
     // By indicator first, which is indexed, then the whole of both halves: a message carrying our
     // X25519 key beside an ML-KEM key that is not ours is not our key.
-    return conn().prepared_exec(
-                   "UPDATE device_account_keys SET published = 1"
-                   " WHERE key_indicator = ? AND pubkey_mlkem768 = ? AND pubkey_x25519 = ?",
-                   mlkem768_pub.first<2>(),
-                   mlkem768_pub,
-                   x25519_pub) > 0;
+    auto current = conn().prepared_maybe_get<int>(
+            "UPDATE device_account_keys SET published = 1"
+            " WHERE key_indicator = ? AND pubkey_mlkem768 = ? AND pubkey_x25519 = ?"
+            " RETURNING rotated IS NULL",
+            mlkem768_pub.first<2>(),
+            mlkem768_pub,
+            x25519_pub);
+    if (!current)
+        return false;
+
+    // The current key on -21 is exactly what a lookup of our own session id would find, so every
+    // device that sees it, not only the one that published it, sends its copies of what it sends
+    // to it at once.  A rotated-away one says nothing about what to encrypt to.
+    if (*current)
+        core._cache_own_pfs_key(x25519_pub, mlkem768_pub);
+    return true;
 }
 
 static const std::string NEEDS_PUSH_SQL =

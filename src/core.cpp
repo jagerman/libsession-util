@@ -1618,6 +1618,15 @@ void Core::_store_pfs_empty(std::span<const std::byte, 33> session_id) {
     });
 }
 
+void Core::_cache_own_pfs_key(
+        std::span<const std::byte, 32> x25519_pub, std::span<const std::byte, 1184> mlkem768_pub) {
+    try {
+        _store_pfs_keys(globals.session_id(), x25519_pub, mlkem768_pub);
+    } catch (const std::exception& e) {
+        log::warning(cat, "Unable to cache our own published account key: {}", e.what());
+    }
+}
+
 bool Core::_store_pfs_failed(std::span<const std::byte, 33> session_id) {
     auto now = clock_now_s();
     bool usable = false;

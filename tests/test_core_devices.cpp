@@ -5723,6 +5723,84 @@ TEST_CASE(
     CHECK_FALSE(l.applicant->devices.needs_push().account_pubkey);
 }
 
+TEST_CASE(
+        "Devices - the account's current key seen on -21 is what our own copies go to at once",
+        "[core][devices][pfs]") {
+    Linking l;
+    l.admit();
+    auto own_keys = [&] { return l.applicant->pfs_key_info(l.applicant->globals.session_id()); };
+    REQUIRE(own_keys().state == core::PfsKeyState::none);
+
+    std::vector<std::optional<core::MessageEncryption>> sent;
+    TestHelper::set_message_send_status(
+            *l.applicant, [&](int64_t, core::MessageSendStatus s, auto, auto encryption) {
+                if (s == core::MessageSendStatus::sending)
+                    sent.push_back(encryption);
+            });
+    auto send_to_self = [&] {
+        l.applicant->send_dm(
+                l.applicant->globals.session_id(),
+                std::as_bytes(std::span{"7801"_hex_b}),
+                clock_now_ms());
+    };
+
+    SECTION("stored there by this device") {
+        auto* net = attach_mock_network(*l.applicant);
+        TestHelper::finish_fetch(*l.applicant);
+        while (!pushes(*net).empty())
+            answer_upload(l.applicant, *net, true);
+        l.applicant->enable_pfs();
+        REQUIRE(eventually(*l.applicant, [&] {
+            return std::ranges::any_of(net->sent_requests, is_device_fetch);
+        }));
+        REQUIRE(answer_fetch(l.applicant, *net) == 1);
+        REQUIRE(pushes(*net).size() == 1);
+
+        // Not before the swarm has it.
+        CHECK(own_keys().state == core::PfsKeyState::none);
+        answer_upload(l.applicant, *net, true);
+
+        auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*l.applicant);
+        auto info = own_keys();
+        CHECK(info.state == core::PfsKeyState::usable);
+        CHECK(info.x25519_pub == x25519);
+        CHECK(info.mlkem768_pub == mlkem768);
+        REQUIRE(info.confirmed_at);
+        CHECK(info.cache_expiry == *info.confirmed_at + Core::PFS_KEY_REFRESH);
+
+        net->sent_requests.clear();
+        send_to_self();
+        CHECK(sent ==
+              std::vector<std::optional<core::MessageEncryption>>{core::MessageEncryption::v2_pfs});
+        CHECK_FALSE(std::ranges::any_of(net->sent_requests, [](const auto& r) {
+            return r.request.endpoint == "retrieve";
+        }));
+    }
+
+    SECTION("stored there by another device, and fetched") {
+        TestHelper::deliver_pubkey_message(
+                *l.applicant, l.core->devices.build_account_pubkey_message(), "P1");
+
+        auto [x25519, mlkem768] = TestHelper::active_account_pubkeys(*l.core);
+        auto info = own_keys();
+        CHECK(info.state == core::PfsKeyState::usable);
+        CHECK(info.x25519_pub == x25519);
+        CHECK(info.mlkem768_pub == mlkem768);
+
+        send_to_self();
+        CHECK(sent ==
+              std::vector<std::optional<core::MessageEncryption>>{core::MessageEncryption::v2_pfs});
+    }
+
+    SECTION("a key rotated away since: nothing") {
+        auto old = l.applicant->devices.build_account_pubkey_message();
+        ScopedClockOffset later{1min};
+        l.applicant->devices.rotate_account_keys();
+        TestHelper::deliver_pubkey_message(*l.applicant, old, "P1");
+        CHECK(own_keys().state == core::PfsKeyState::none);
+    }
+}
+
 namespace {
 // A key published to -21 under the account's seed by a device that is none of ours: a seed holder
 // elsewhere, with keys of its own.
