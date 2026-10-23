@@ -456,7 +456,7 @@ reads them without looking anything up. Its `state` is one of:
 | `state` | Meaning |
 |---|---|
 | `usable` | A key is held and current: messages are PFS/PQ encrypted to it, with no lookup. |
-| `refresh_due` | A key is held, and the next send looks the contact up again first. It is still used unless that lookup brings another: after a failed lookup for 48h from `confirmed_at`, and after one that found nothing for 29 days. |
+| `refresh_due` | A key is held, and the next send looks the contact up again first. It is still used unless that lookup brings another: after a failed lookup for 24h from `confirmed_at`, and after one that found nothing for 29 days. |
 | `nak` | A lookup found no keys within the last hour: messages use the non-PFS encryption until the next is due. |
 | `none` | Nothing held, and a send looks up first and waits: never looked up, or the last lookup failed, or found nothing over an hour ago. |
 

@@ -762,8 +762,10 @@ class Core {
     /// a burst of sends makes one lookup rather than one each, short enough to retry soon.
     static constexpr auto PFS_KEY_FAILED_HOLD = 1min;
     /// How long after its `confirmed_at` a held key is still used when a lookup fails.  Past this a
-    /// send waits for a lookup that succeeds.
-    static constexpr auto PFS_KEY_FAILED_GRACE = 48h;
+    /// send waits for a lookup that succeeds.  Bounds, with PFS_KEY_REFRESH, how long a sender goes
+    /// on encrypting to a key the account has replaced, which `Devices::ACCOUNT_KEY_RETENTION` has
+    /// to cover.
+    static constexpr auto PFS_KEY_FAILED_GRACE = 24h;
     /// How long after its `confirmed_at` a held key survives a lookup that finds nothing, and is
     /// re-confirmed by it.  The account's keys are published with a TTL of
     /// `Devices::ACCOUNT_PUBKEY_TTL`, and an account replacing its key publishes the new one, so

@@ -1139,11 +1139,14 @@ class Devices final : detail::CoreComponent {
     // any thread.
     std::vector<AccountKeyInfo> account_keys();
 
-    // How long after rotation to keep an old account key: the 14-day maximum 1-to-1 message TTL,
-    // plus how long a sender may go on encrypting to a key after it is replaced -- within
-    // Core::PFS_KEY_REFRESH (6h) normally, but up to Core::PFS_KEY_FAILED_GRACE (48h) for a sender
-    // whose lookups keep failing.  That worst case is the whole 16 days, with no margin beyond it.
-    static constexpr auto ACCOUNT_KEY_RETENTION = 16 * 24h;
+    // How long after rotation to keep an old account key, so that a message encrypted to it can
+    // still be read for as long as it can be in the swarm.  A sender may go on encrypting to a key
+    // after it is replaced, within Core::PFS_KEY_REFRESH (6h) normally and up to
+    // Core::PFS_KEY_FAILED_GRACE (24h) when its lookups keep failing; the message then lasts the
+    // swarm's TTL.  16 days in all.
+    static constexpr auto ACCOUNT_KEY_RETENTION = 14 * 24h  // the maximum 1-to-1 message TTL
+                                                + 24h       // Core::PFS_KEY_FAILED_GRACE
+                                                + 24h;      // margin for clock skew, late storage
 
     // How often account and device keys rotate, and the window each rotation is spread over.  An
     // account key's offset within the window is skewed so that the earliest of N devices' is

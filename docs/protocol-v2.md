@@ -1037,10 +1037,10 @@ set these:
   - *Nothing found:* if the entry holds keys confirmed within the last 29 days, they are still the
     account's, as below: `confirmed_at = now`, `cache_expiry = now + 1h`, and they are used.
     Otherwise any keys are dropped, `cache_expiry = now + 1h`, and the message is sent non-PFS.
-  - *The lookup failed:* if the entry holds keys confirmed within the last 48h,
+  - *The lookup failed:* if the entry holds keys confirmed within the last 24h,
     `cache_expiry = now + 1m` and they are used.  The minute keeps a burst of sends from making a
     lookup each while still trying again soon, and since `confirmed_at` is untouched the fallback
-    runs out 48h after the last confirmation.  Otherwise the message is not sent: a client that
+    runs out 24h after the last confirmation.  Otherwise the message is not sent: a client that
     cannot reach the contact's swarm to look the keys up cannot deposit a message there either.  It
     waits, and the lookup is retried with a backoff (10s, doubling to 5 minutes) until one succeeds
     or finds nothing.
@@ -1297,14 +1297,14 @@ have fetched the quickly replaced key.
 Account keys in general must be preserved (in the device group config) for 16 days *after* they
 have been rotated away so that an offline device is able to decrypt any incoming messages that may
 still be in the swarm: the 1-to-1 message max TTL of 14 days, plus how long a sender may go on
-encrypting to a key after it is replaced.  That is normally under the 6h refresh, but up to 48h for
-a sender whose lookups keep failing (see "Account keys"), and that worst case takes the whole 16
-days, with no margin beyond it.
+encrypting to a key after it is replaced -- normally under the 6h refresh, but up to 24h for a
+sender whose lookups keep failing (see "Account keys") -- plus 24h of margin for clock skew and
+late storage.
 
 ### Rotating early
 
 An account key can be replaced before its time, though not retired: contacts go on using it until
-they next look (within 6h, or up to 48h for one whose lookups fail) and every device keeps it for 16
+they next look (within 6h, or up to 24h for one whose lookups fail) and every device keeps it for 16
 days after it is rotated away.  Replacing it early buys one
 thing, that link requests stop being honoured under it (see "Initiating a device link"), and is done
 for one reason: **the current account key was delivered to a device that is no longer a member**.
