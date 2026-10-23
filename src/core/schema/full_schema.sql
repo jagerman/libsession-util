@@ -333,21 +333,27 @@ CREATE TABLE swarm_hashes (
 
 CREATE INDEX swarm_hashes_cursor ON swarm_hashes(namespace, node, id DESC);
 
--- Cache of remote account public keys (X25519 + ML-KEM-768) used for PFS+PQ message encryption.
--- Keys are considered fresh for PFS_KEY_FRESH_DURATION (24h) and expire after
--- PFS_KEY_EXPIRY_DURATION (48h); stale entries (24-48h old) are still usable as a fallback.
+-- What this device knows of a contact's account public keys (X25519 + ML-KEM-768), which PFS+PQ
+-- messages to them are encrypted to; see the spec's "Account keys" for the rule this keeps.  Until
+-- cache_expiry a send uses what the row says -- the keys, or none -- without looking again; past
+-- it, the next send or prefetch looks up first, and the outcome sets the row.
 --
--- nak_at is set whenever a successful fetch returns no valid keys, and is never cleared.  It
--- suppresses re-fetching for PFS_KEY_NAK_DURATION (1h) when no valid keys exist.  When valid
--- keys are present nak_at may coexist with them (the keys are still usable as a fallback).
+-- All times are unix seconds.  A row is written by every completed lookup, so checked_at is always
+-- set.  The keys and confirmed_at are present or absent together: confirmed_at is the last time a
+-- lookup said this key is current, by finding it or by finding nothing while it was recent enough
+-- still to be.  A keyless row within cache_expiry is a lookup that found nothing.
+--
 -- In SQLite, CHECK constraints with a NULL argument evaluate to NULL (not FALSE), so the length
 -- checks do not reject NULL pubkeys.
 CREATE TABLE pfs_key_cache (
     session_id BLOB NOT NULL PRIMARY KEY CHECK(length(session_id) = 33),
-    fetched_at INTEGER,           -- unix timestamp (seconds) of last fetch with valid keys; NULL if none
-    nak_at INTEGER,               -- unix timestamp of last fetch returning no keys; NULL if none
+    checked_at INTEGER NOT NULL,     -- when the last lookup completed, whatever it found
+    confirmed_at INTEGER,            -- when a lookup last said the keys below are current
+    cache_expiry INTEGER NOT NULL,   -- when the next lookup is due
     pubkey_x25519 BLOB CHECK(length(pubkey_x25519) = 32),
-    pubkey_mlkem768 BLOB CHECK(length(pubkey_mlkem768) = 1184)
+    pubkey_mlkem768 BLOB CHECK(length(pubkey_mlkem768) = 1184),
+    CHECK((pubkey_x25519 IS NULL) = (pubkey_mlkem768 IS NULL)),
+    CHECK((pubkey_x25519 IS NULL) = (confirmed_at IS NULL))
 ) STRICT;
 
 CREATE TABLE pro_revocations (

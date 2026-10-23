@@ -428,17 +428,44 @@ secret halves.
 
 ### Showing encryption
 
-What a contact's messages will be sent with is decided by the PFS/PQ keys this device has cached
-for them. `core.pfs_key_info(session_id)` reads that cache without fetching anything: its `state`
-(`fresh` and `stale` keys are usable; `expired` ones are to be fetched again before they are used;
-`nak` and `none` mean the contact has published none this device knows of), the keys themselves,
-and when they were fetched. Those times are by Core's clock, which corrects for the network's
-offset from this machine's: show an age by comparing them with `session::clock_now()`, never with
-`std::chrono::system_clock`. Draw a padlock from it, and call `prefetch_pfs_keys` as the user starts
-typing so that it is current by the time they send. For a user who asks to refresh a contact's
-keys, `core.refetch_pfs_keys(session_id)` fetches them however recently they were fetched;
-`pfs_keys_fetched` reports the result, as for a prefetch (in `client::callbacks` too, for a `Client`
-application), and is the cue to read `pfs_key_info` again.
+What a contact's messages will be sent with is decided by the PFS/PQ keys this device holds for
+them, kept by the rule the protocol spec sets out under "Account keys". `core.pfs_key_info(session_id)`
+reads them without looking anything up. Its `state` is one of:
+
+| `state` | Meaning |
+|---|---|
+| `usable` | A key is held and current: messages are PFS/PQ encrypted to it, with no lookup. |
+| `refresh_due` | A key is held, and the next send looks the contact up again first. It is still used unless that lookup brings another: after a failed lookup for 48h from `confirmed_at`, and after one that found nothing for 29 days. |
+| `nak` | A lookup found no keys within the last hour: messages use the non-PFS encryption until the next is due. |
+| `none` | Nothing held, and a send looks up first and waits: never looked up, or the last lookup failed, or found nothing over an hour ago. |
+
+Beside the keys themselves, it carries:
+
+- `checked_at` -- when the last lookup of this contact completed, whatever it found: a key, nothing,
+  or no answer because it failed. With no key held, it is what "checked 5 minutes ago, no PFS/PQ
+  keys" reports.
+- `confirmed_at` -- the last time a lookup said this key is current: when it was found, or when a
+  later lookup found nothing while it was recent enough that the account cannot have replaced it.
+  This is the "last confirmed" to show. Set exactly when a key is held.
+- `cache_expiry` -- when the next lookup is due.
+- `fetching` -- whether a lookup of this contact is in flight, whatever started it: a prefetch, a
+  refetch, or a send waiting on the keys.
+
+Those times are by Core's clock, which corrects for the network's offset from this machine's: show an
+age by comparing them with `session::clock_now()`, never with `std::chrono::system_clock`. A padlock
+is right for `usable`, and for `refresh_due` unless `confirmed_at` is older than
+`Core::PFS_KEY_EMPTY_GRACE` (29 days), the one case in which the lookup can leave the contact without
+a key. Call `prefetch_pfs_keys` as the user starts typing, so that a send need not wait on the
+lookup. For a user who asks to refresh a contact's keys, `core.refetch_pfs_keys(session_id)` looks
+them up whatever the cache says; `pfs_keys_fetched` reports the result of every lookup, whatever
+started it (in `client::callbacks` too, for a `Client` application), and is the cue to read
+`pfs_key_info` again.
+
+A message is never sent with weaker encryption because a lookup failed. When it fails with no key
+recent enough to fall back on, the message waits -- `SendState::pending`, as while any lookup is in
+flight -- and the lookup is retried, from 10 seconds apart up to 5 minutes, until one succeeds or
+finds nothing; a contact's swarm that cannot be reached to look keys up could not take the message
+either.
 
 What a message actually used is on the message: `Message::encryption` (`v1`, `v2_basic`, or
 `v2_pfs` for PFS+PQ). For an incoming message it is what its envelope used. For one this device

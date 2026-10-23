@@ -552,25 +552,38 @@ class Core {
     // Handles a PFS fetch response
     void _handle_pfs_response(std::span<const std::byte, 33> sid, std::string body);
 
-    // Stores PFS keys for a remote session_id in the pfs_key_cache.  Returns true if the keys
-    // differ from the previously cached entry (or no entry existed).
+    // What each outcome of a lookup does to the contact's pfs_key_cache row, by the rule on the
+    // PFS_KEY_* constants.  A lookup that found keys: returns whether they differ from those held.
     bool _store_pfs_keys(
             std::span<const std::byte, 33> session_id,
             std::span<const std::byte, 32> x25519_pub,
             std::span<const std::byte, 1184> mlkem768_pub);
-
-    // Stores a NAK (no keys found) for a remote session_id in the pfs_key_cache.
-    void _store_pfs_nak(std::span<const std::byte, 33> session_id);
+    // A lookup that found nothing.
+    void _store_pfs_empty(std::span<const std::byte, 33> session_id);
+    // A lookup that failed; see _pfs_fetch_done.  Returns whether a held key is still recent enough
+    // to send with.
+    bool _store_pfs_failed(std::span<const std::byte, 33> session_id);
 
     // Fetches `session_id`'s keys from its swarm, unless a fetch of them is already in flight,
     // which then answers for both.  On the loop; `_pfs_fetch_done` ends it.
     void _fetch_pfs_keys(const b33& session_id);
     std::set<b33> _pfs_fetching;
 
+    // Lookups being retried for sends that wait on them, by recipient; see PFS_FETCH_RETRY_FIRST.
+    // An entry lives from the first failure until a lookup succeeds or no send waits any longer.
+    struct PfsFetchRetry {
+        std::chrono::milliseconds backoff = PFS_FETCH_RETRY_FIRST;
+        // When the scheduled retry fires; unset while none is.
+        std::optional<sys_ms> due;
+    };
+    std::map<b33, PfsFetchRetry> _pfs_retries;
+    void _schedule_pfs_retry(const b33& session_id);
+    void _retry_pfs_fetch(const b33& session_id);
+
     // Monotonic message ID counter for send_dm().
     int64_t _next_message_id{1};
 
-    // Queued sends waiting for a PFS key fetch to complete.
+    // Queued sends waiting for a PFS key fetch to complete.  Only touched on the loop.
     struct PendingSend {
         int64_t id;
         std::array<std::byte, 33> recipient;
@@ -585,10 +598,11 @@ class Core {
     // Drains pending sends whose PFS key fetch has completed.
     void _flush_pending_sends(std::span<const std::byte, 33> session_id);
 
-    // Called on every terminal outcome of a PFS key fetch: notifies the application and then
-    // releases any sends that were queued waiting on those keys.  All fetch completion paths must
-    // go through here rather than firing the callback directly, or queued sends for that recipient
-    // are never dispatched.
+    // Called on every outcome of a PFS key fetch, after any keys or empty answer it brought have
+    // been stored; a failure it records itself.  Notifies the application, then releases the sends
+    // queued waiting on those keys or, when the fetch failed with no key to fall back on, schedules
+    // a retry for them.  All fetch completion paths must go through here rather than firing the
+    // callback directly, or queued sends for that recipient are never dispatched.
     void _pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetch result);
 
     // Encrypts, envelopes, and dispatches a single DM.  Called from send_dm() and from
@@ -729,38 +743,54 @@ class Core {
     static constexpr std::chrono::milliseconds POLL_RETRY_FIRST = 10s;
     static constexpr std::chrono::milliseconds POLL_RETRY_MAX = 5min;
 
-    /// How long a cached PFS key is considered fresh (no re-fetch needed).
-    static constexpr auto PFS_KEY_FRESH_DURATION = 24h;
-    /// How long a cached PFS key is usable as a fallback before it expires entirely.
-    static constexpr auto PFS_KEY_EXPIRY_DURATION = 48h;
-    /// How long a NAK (successful fetch that returned no keys) suppresses re-fetching.
-    static constexpr auto PFS_KEY_NAK_DURATION = 1h;
+    /// How long a contact's key found by a lookup is used before the next lookup is due.  Short, so
+    /// that a contact who has lost their account key (a restore onto a new device group, whose old
+    /// keys went with the lost device) stops receiving messages they cannot read within hours.
+    static constexpr auto PFS_KEY_REFRESH = 6h;
+    /// How long a lookup that found no key answers for before the next is due, whether it
+    /// re-confirmed a key held or left none.
+    static constexpr auto PFS_KEY_EMPTY_HOLD = 1h;
+    /// How long a held key is used after a failed lookup before the next is due: long enough that
+    /// a burst of sends makes one lookup rather than one each, short enough to retry soon.
+    static constexpr auto PFS_KEY_FAILED_HOLD = 1min;
+    /// How long after its `confirmed_at` a held key is still used when a lookup fails.  Past this a
+    /// send waits for a lookup that succeeds.
+    static constexpr auto PFS_KEY_FAILED_GRACE = 48h;
+    /// How long after its `confirmed_at` a held key survives a lookup that finds nothing, and is
+    /// re-confirmed by it.  The account's keys are published with a TTL of
+    /// `Devices::ACCOUNT_PUBKEY_TTL`, and an account replacing its key publishes the new one, so
+    /// finding nothing means nothing was published within that TTL: a key confirmed more recently
+    /// is still the account's -- its devices have only been offline too long to republish it.  A
+    /// day less than the TTL as margin for clocks and for the swarm's expiry.  Past it the key is
+    /// dropped and sends use the non-PFS encryption.
+    static constexpr auto PFS_KEY_EMPTY_GRACE = Devices::ACCOUNT_PUBKEY_TTL - 24h;
+    /// How long a send waiting on a contact's keys, with none held to fall back on, waits before
+    /// looking them up again after a lookup fails: the first, doubling with each failure in a row
+    /// up to the most.  Separate from POLL_RETRY_* although the values match: one is a lookup on a
+    /// contact's swarm on behalf of a send, the other a poll of our own.
+    static constexpr std::chrono::milliseconds PFS_FETCH_RETRY_FIRST = 10s;
+    static constexpr std::chrono::milliseconds PFS_FETCH_RETRY_MAX = 5min;
 
-    /// Checks and/or initiates a background fetch of the X25519 and ML-KEM-768 account public keys
-    /// for the given remote session_id (33-byte 0x05-prefixed X25519 pubkey), caching the result
-    /// in the pfs_key_cache table.
+    /// Looks up the X25519 and ML-KEM-768 account public keys of a contact (33-byte 0x05-prefixed
+    /// session ID) if the cache says one is due -- `none` or `refresh_due` -- and none is already
+    /// in flight, so that a send started soon after does not wait on it: for when the user begins
+    /// a message to them.  Completes through `pfs_keys_fetched`.
     ///
-    /// Returns a PfsKeyStatus value describing the current cache state:
-    /// - fresh   -- cached key is less than PFS_KEY_FRESH_DURATION (24h) old; no fetch initiated.
-    /// - stale   -- cached key is 24–48h old; a background re-fetch has been initiated and the
-    ///              pfs_keys_fetched callback will fire when it completes.
-    /// - fetching -- no usable key is cached; a background fetch has been initiated and the
-    ///              pfs_keys_fetched callback will fire when it completes.
-    /// - nak     -- a recent fetch returned no keys; re-fetching is suppressed for
-    ///              PFS_KEY_NAK_DURATION (1h).
-    PfsKeyStatus prefetch_pfs_keys(std::span<const std::byte, 33> session_id);
+    /// Returns the state the cache was in when called, which is the state it stays in until a
+    /// lookup started by this or anything else completes.  Callable from any thread.  Throws
+    /// std::logic_error if no network is attached.
+    PfsKeyState prefetch_pfs_keys(std::span<const std::byte, 33> session_id);
 
-    /// What this device has cached of a contact's PFS/PQ keys, by the same thresholds
-    /// `prefetch_pfs_keys` judges them by -- for showing, not for deciding to fetch: a plain read,
-    /// which fetches nothing, safe from any thread.  The keys are there whenever any were ever
-    /// fetched, expired ones included, since they are what this device last saw the contact
-    /// publish.
+    /// What this device holds of a contact's PFS/PQ keys and where they stand; see PfsKeyInfo.  For
+    /// showing, not for deciding to look up: a plain read, which looks up nothing.  Callable from
+    /// any thread.
     PfsKeyInfo pfs_key_info(std::span<const std::byte, 33> session_id);
 
-    /// Fetches a contact's PFS/PQ keys now, however fresh what is cached, and however recently a
-    /// fetch found none: for a user asking to refresh them.  Completes through `pfs_keys_fetched`
-    /// as a prefetch does, and is the same fetch as one already in flight for that contact, from
-    /// either.  Callable from any thread.  Throws std::logic_error if no network is attached.
+    /// Looks up a contact's PFS/PQ keys now, whatever the cache says: for a user asking to refresh
+    /// them.  Its outcome sets the cache exactly as any lookup's does, completes through
+    /// `pfs_keys_fetched`, and is the same lookup as one already in flight for that contact,
+    /// whatever started that.  Callable from any thread.  Throws std::logic_error if no network is
+    /// attached.
     void refetch_pfs_keys(std::span<const std::byte, 33> session_id);
 
     /// Sets the polling interval used when a network object is attached.  The default is 20s.
@@ -845,15 +875,17 @@ class Core {
     /// Encrypt and send a direct message to the given recipient.
     ///
     /// Returns a unique message_id that will later be reported via the message_send_status
-    /// callback.
+    /// callback.  Callable from any thread: the work is done on Core's loop, and the first status
+    /// is reported before this returns.
     ///
-    /// Version selection:
-    /// - If fresh/stale PFS+PQ account keys are cached for the recipient, a v2 PFS message is
-    ///   sent.
-    /// - If no keys are cached (NAK) and force_v2 is false, falls back to a v1 message.
-    /// - If no keys are cached and force_v2 is true, sends a v2 non-PFS message.
-    /// - If a key fetch is in progress, the send is queued and dispatched when the fetch
-    ///   completes, using the above rules.
+    /// Version selection, by the recipient's PfsKeyState (see `pfs_key_info`):
+    /// - `usable`: a v2 PFS message, encrypted to the key held.
+    /// - `nak`: a v1 message, or a v2 non-PFS message when force_v2 is true.
+    /// - `none` or `refresh_due`: the send waits (`awaiting_keys`) while the keys are looked up,
+    ///   and is then encrypted by the state the lookup leaves, a held key being used as the
+    ///   PFS_KEY_* constants say.  If the lookup fails with no key to fall back on, the send keeps
+    ///   waiting (`retrying`) while the lookup is retried, for as long as it takes; a send made
+    ///   while such a retry is scheduled waits for it, reporting `retrying` from the start.
     ///
     /// Parameters:
     /// - recipient_session_id -- 33-byte 0x05-prefixed session ID of the recipient

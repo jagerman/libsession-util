@@ -1019,19 +1019,51 @@ a client's devices are offline for an extended period, the keys remain available
 attempting to contact them.  (Account keys would not rotate with such an extended outage of all
 account devices, but this is preferred to falling back to the long-term key).
 
-Clients are expected to re-fetch this key outbox before sending messages if their cached copy is no
-longer fresh.  A cached entry passes through three states:
+Clients look this outbox up when sending to a contact, and cache what they find.  A contact's cache
+entry holds the keys last found, if any; `confirmed_at`, the last time a lookup said those keys are
+current; and `cache_expiry`, when the next lookup is due.  Every outcome of a lookup does no more than
+set these:
 
-- **fresh** -- less than 24h old.  Usable directly; no fetch is made.
-- **stale** -- between 24h and 48h old.  Still usable, but a background re-fetch is started at the
-  same time, so a send is never blocked waiting on the network for a key we already have.
-- **expired** -- more than 48h old.  Not usable; a fetch must complete before a PFS message can be
-  sent.  Until it does, the sender falls back as described in "Non-PFS fallback" below.
+- **Within `cache_expiry`**, a send uses what the entry says, with no lookup: its keys for a PFS+PQ
+  message, or with none, a message as described in "Non-PFS fallback" below.
+- **Past it**, or with no entry, a send looks the keys up first and waits for the outcome:
+  - *Keys found:* they are stored, `confirmed_at = now` and `cache_expiry = now + 6h`, and the
+    message is encrypted to them.
+  - *Nothing found:* if the entry holds keys confirmed within the last 29 days, they are still the
+    account's, as below: `confirmed_at = now`, `cache_expiry = now + 1h`, and they are used.
+    Otherwise any keys are dropped, `cache_expiry = now + 1h`, and the message is sent non-PFS.
+  - *The lookup failed:* if the entry holds keys confirmed within the last 48h,
+    `cache_expiry = now + 1m` and they are used.  The minute keeps a burst of sends from making a
+    lookup each while still trying again soon, and since `confirmed_at` is untouched the fallback
+    runs out 48h after the last confirmation.  Otherwise the message is not sent: a client that
+    cannot reach the contact's swarm to look the keys up cannot deposit a message there either.  It
+    waits, and the lookup is retried with a backoff (10s, doubling to 5 minutes) until one succeeds
+    or finds nothing.
 
-A fetch that completes successfully but finds no valid keys published for the account records a
-negative result ("NAK") rather than nothing at all, which suppresses further fetch attempts for that
-account for 1h.  Without this, every message to an account that has not published keys would incur a
-fresh (and futile) network round trip.
+The 6h refresh bounds how long contacts go on sending to a key the account can no longer read.  An
+account restored onto a new device group starts with a new account key when its old keys were only on
+devices that were lost, and every message encrypted to the old key until a contact looks again is
+unreadable.  Clients should look up ahead of the send, when the user starts writing to the contact,
+so that a send is not held up; a client with no such moment, such as a bot, looks up immediately
+before the send, over the connection it opens to deposit the message anyway.
+
+Finding nothing does not mean a held key is gone.  The outbox message lives for 30 days and a
+rotation publishes a replacement, so an empty answer means nothing was published in the last 30
+days: the account has not rotated since then, and a key confirmed within that window is still its
+current one.  Its devices have only been offline too long to republish it.  The 29 days are that TTL
+less a day, as margin for clocks and for the swarm's expiry.  Each such answer re-confirms the key,
+so a client that looks at least every 29 days goes on using it however long the account stays
+offline, which is correct: no rotation can have happened unseen.
+
+There is deliberately no hard expiry on a held key.  An account whose devices are all offline does
+not rotate, so an old key is still the current one, and the only alternative is the non-PFS
+encryption, whose key never rotates at all.  Non-PFS is for a sender holding no key it can still
+use: the account never published one, or the sender confirmed the one it holds more than 29 days
+before a lookup that found nothing.
+
+An entry with no keys within its `cache_expiry` is the record of a lookup that found nothing.
+Without it, every message to an account that has not published keys would incur a fresh (and
+futile) network round trip.
 
 This signed key payload should be rotated periodically by any of the clients; how rotation works
 specifically is discussed later.
@@ -1056,9 +1088,9 @@ material, thus maintaining Ed25519's fully deterministic signature generation.)
 Encryption keys used to encrypt DMs, given a set of published ML-KEM-768 and X25519 pubkeys, is
 constructed as follows:
 
-0. If the cached keys for the account are no longer fresh (see "Account keys" above), keys for the
-   contact are refreshed.  Clients should generally initiate this preemptively, such as when opening a
-   conversation with stale keys, to avoid the extra fetch latency when actually sending a message.
+0. If the contact's cache entry is past its `cache_expiry` (see "Account keys" above), the contact's
+   keys are looked up first.  Clients should generally do this preemptively, such as when the user
+   starts writing to the contact, to avoid the extra lookup latency when actually sending a message.
 
    This provides the recipient's current account pubkeys, M (ML-KEM-768) and X (X25519).
 
@@ -1257,16 +1289,17 @@ new message replaces an existing one (if present), and so clients will only see 
 rotation attempt must preserve *both* keys to account for the brief window where some client may
 have fetched the quickly replaced key.
 
-Account keys in general must be preserved (in the device group config) for at least 15 days (the
-1-to-1 message max TTL of 14 days plus an allowance of up to 24h since the sender last re-fetched
-account pubkeys) *after* they have been rotated away so that an offline device is able to encrypt
-any incoming messages that may still be in the swarm.  We use 16 days to include an extra 24h safety
-buffer.
+Account keys in general must be preserved (in the device group config) for 16 days *after* they
+have been rotated away so that an offline device is able to decrypt any incoming messages that may
+still be in the swarm: the 1-to-1 message max TTL of 14 days, plus how long a sender may go on
+encrypting to a key after it is replaced.  That is normally under the 6h refresh, but up to 48h for
+a sender whose lookups keep failing (see "Account keys").
 
 ### Rotating early
 
-An account key can be replaced before its time, though not retired: contacts cache it for up to
-48h and every device keeps it for 16 days after it is rotated away.  Replacing it early buys one
+An account key can be replaced before its time, though not retired: contacts go on using it until
+they next look (within 6h, or up to 48h for one whose lookups fail) and every device keeps it for 16
+days after it is rotated away.  Replacing it early buys one
 thing, that link requests stop being honoured under it (see "Initiating a device link"), and is done
 for one reason: **the current account key was delivered to a device that is no longer a member**.
 
@@ -1325,10 +1358,11 @@ back and rotate.
 
 # Non-PFS fallback (post transition)
 
-When a client seeks to contact another Session account that does *not* have PFS keys available (for
-example, because the client has been offline for too long, or because the client has not published
-its PFS+PQ keys, or because the current client failed to parse the published PFS+PQ pubkey data, the
-client sends a message using the receiver's long term key.
+When a client seeks to contact another Session account for which it holds no PFS+PQ keys it can use
+(see "Account keys": the account has not published any, or the client's lookup found none and the
+key it held was confirmed too long ago to trust, or what was published could not be parsed), the
+client sends a message using the receiver's long term key.  A lookup that *failed* is not such a
+case: the message waits for one that succeeds, unless a recently confirmed key can be used.
 
 During the transition period, these messages are backwards compatible "v1" direct messages (see
 the Transition Period section below) as the client may be communicating with a client that has not

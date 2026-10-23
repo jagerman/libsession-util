@@ -14,48 +14,60 @@ namespace session::core {
 
 class Core;
 
-/// Return value of prefetch_pfs_keys() describing the current cache state at the time of the call.
-enum class PfsKeyStatus {
-    fresh,     ///< A fresh cached key exists; no fetch was initiated
-    stale,     ///< A usable but stale key exists; a background re-fetch was initiated.
-               ///< The pfs_keys_fetched callback will fire when the fetch completes.
-    fetching,  ///< No usable key is cached; a background fetch was initiated.
-               ///< The pfs_keys_fetched callback will fire when the fetch completes.
-    nak,       ///< An unexpired NAK suppresses fetching; no usable key exists
-};
-
-/// Result passed to the pfs_keys_fetched callback when a background fetch completes.
-/// Where a contact's cached PFS/PQ keys stand, as `Core::pfs_key_info` reports them without
-/// fetching anything.
+/// Where a contact's PFS/PQ keys stand on this device, by the rule the spec's "Account keys" sets
+/// out: until the cache entry's expiry a send uses what the entry says, and past it the next send
+/// or prefetch looks the keys up first.  Reported by `Core::pfs_key_info` and returned by
+/// `Core::prefetch_pfs_keys`.
 enum class PfsKeyState {
-    none,     ///< Nothing cached: never fetched, or a NAK that has lapsed.
-    nak,      ///< The last fetch found no keys, within PFS_KEY_NAK_DURATION.
-    fresh,    ///< Keys fetched within PFS_KEY_FRESH_DURATION.
-    stale,    ///< Keys fetched within PFS_KEY_EXPIRY_DURATION, but no longer fresh.
-    expired,  ///< Keys fetched longer ago than PFS_KEY_EXPIRY_DURATION.
+    /// No key held, and no lookup answering for now: never looked up, a lookup that found nothing
+    /// longer ago than `Core::PFS_KEY_EMPTY_HOLD`, or one that failed.  A send looks up first and
+    /// waits for the answer.
+    none,
+    /// A key held, within the entry's expiry: sends are PFS/PQ encrypted with it, with no lookup.
+    usable,
+    /// A key held, past the entry's expiry: the next send or prefetch looks up first, and the key
+    /// is still used if the lookup brings no other -- after a failed lookup only within
+    /// `Core::PFS_KEY_FAILED_GRACE` of `confirmed_at`, and after one that found nothing only within
+    /// `Core::PFS_KEY_EMPTY_GRACE`.
+    refresh_due,
+    /// No key held, within the entry's expiry after a lookup that found none: sends use the
+    /// non-PFS encryption until then, with no lookup.
+    nak,
 };
 
-/// What `Core::pfs_key_info` reports of a contact's cached PFS/PQ keys.
+/// What `Core::pfs_key_info` reports of a contact's PFS/PQ keys.
 ///
-/// `fetched_at` and `nak_at` are stamped by Core's clock (`session::clock_now`, which corrects for
-/// the network's offset from this machine's), so compare them with that and never with
-/// `std::chrono::system_clock`: the two can differ by however far off this machine's clock is.
+/// - `checked_at` is when the last lookup of this contact's keys completed, whatever it found: a
+///   key, nothing, or no answer at all because it failed.  With no key held it is what "checked
+///   <time>, no PFS/PQ keys" reports.
+/// - `confirmed_at` is the last time a lookup said this key is current: when it was fetched, or
+///   when a later lookup found nothing while the key was recent enough that the account cannot
+///   have replaced it (see `Core::PFS_KEY_EMPTY_GRACE`).  Set exactly when a key is held.
+/// - `cache_expiry` is when the next lookup is due.
+/// - `fetching` is whether a lookup of this contact is in flight, whatever started it: a prefetch,
+///   a refetch, or a send waiting on the keys.
+///
+/// The times are unset when no lookup of the contact has completed.  They are stamped by Core's
+/// clock (`session::clock_now`, which corrects for the network's offset from this machine's), so
+/// compare them with that and never with `std::chrono::system_clock`: the two can differ by however
+/// far off this machine's clock is.
 struct PfsKeyInfo {
-    PfsKeyState state;
-    /// The keys last fetched, whatever their age: what this device last saw the contact publish.
+    PfsKeyState state = PfsKeyState::none;
+    /// The keys held, which sends encrypt to as `state` says; unset when none are.
     std::optional<std::array<std::byte, 32>> x25519_pub;
     std::optional<std::array<std::byte, 1184>> mlkem768_pub;
-    /// When those keys were fetched.
-    std::optional<std::chrono::sys_seconds> fetched_at;
-    /// When a fetch last found no keys at all.
-    std::optional<std::chrono::sys_seconds> nak_at;
+    std::optional<std::chrono::sys_seconds> checked_at;
+    std::optional<std::chrono::sys_seconds> confirmed_at;
+    std::optional<std::chrono::sys_seconds> cache_expiry;
+    bool fetching = false;
 };
 
+/// Result passed to the pfs_keys_fetched callback when a lookup of a contact's keys completes.
 enum class PfsKeyFetch {
     new_key,    ///< A key was retrieved and stored (new or changed from the previous cache entry)
     unchanged,  ///< Keys were retrieved but match what was already cached
     not_found,  ///< The fetch succeeded but the remote account pubkey namespace held no valid keys
-    failed,     ///< The network request failed (swarm lookup or send_request)
+    failed,     ///< No answer: the request failed, or its response could not be read
 };
 
 /// Reason code passed to the message_decrypt_failed callback.
@@ -83,9 +95,10 @@ struct ReceivedMessage {
 enum class MessageSendStatus {
     awaiting_keys,   ///< Waiting for a PFS+PQ pubkey fetch to complete before encrypting.
     sending,         ///< Encryption complete; the store request has been dispatched.
-    retrying,        ///< A previous send attempt failed; retrying.  (Not yet implemented:
-                     ///< currently a failed send goes directly to network_error.  TODO:
-                     ///< implement automatic retry with a maximum retry count.)
+    retrying,        ///< Still waiting for the recipient's keys after a lookup of them failed with
+                     ///< no key held to fall back on: the lookup is retried with backoff (see
+                     ///< `Core::PFS_FETCH_RETRY_FIRST`) for as long as the send waits.  A failed
+                     ///< store is not retried, and goes directly to network_error.
     success,         ///< The store request was accepted by a swarm node.
     network_error,   ///< The swarm lookup or store request failed (terminal).
     no_network,      ///< No network object is attached.
@@ -164,9 +177,9 @@ struct callbacks {
     /// device linking of its own to show.  Must outlive the Core.
     DeviceEvents* devices = nullptr;
 
-    /// Callback invoked when a background PFS key fetch initiated by prefetch_pfs_keys() completes.
-    /// Not invoked for cache hits or NAK suppressions (i.e. only fires when prefetch_pfs_keys()
-    /// returns stale or fetching).
+    /// Callback invoked when a lookup of a contact's PFS/PQ keys completes, whatever started it: a
+    /// prefetch, a refetch, a send waiting on the keys, or a retry of a lookup that failed.  Not
+    /// invoked when the cache answered without one.
     ///
     /// Parameters:
     /// - session_id -- 33-byte session ID (0x05 prefix + X25519 pubkey) of the remote user

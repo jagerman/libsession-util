@@ -1405,72 +1405,133 @@ void Core::_handle_server_push(std::string_view endpoint, std::span<const std::b
 
 namespace {
 
-    // How a pfs_key_cache row stands now: the one place the cache's thresholds are applied.
-    PfsKeyState pfs_key_state(std::optional<int64_t> fetched_at, std::optional<int64_t> nak_at) {
-        auto now = clock_now_s();
-        if (fetched_at) {
-            auto age = now - from_epoch_s(*fetched_at);
-            return age < Core::PFS_KEY_FRESH_DURATION  ? PfsKeyState::fresh
-                 : age < Core::PFS_KEY_EXPIRY_DURATION ? PfsKeyState::stale
-                                                       : PfsKeyState::expired;
+    using mlkem768_pubkey = std::array<std::byte, MLKEM768_PUBLICKEYBYTES>;
+
+    // A contact's pfs_key_cache row.  The keys and confirmed_at are present or absent together, as
+    // the table's CHECKs require.
+    struct PfsCacheRow {
+        std::chrono::sys_seconds checked_at;
+        std::optional<std::chrono::sys_seconds> confirmed_at;
+        std::chrono::sys_seconds cache_expiry;
+        std::optional<b32> x25519_pub;
+        std::optional<mlkem768_pubkey> mlkem768_pub;
+
+        bool has_key() const { return x25519_pub.has_value(); }
+
+        void drop_key() {
+            confirmed_at.reset();
+            x25519_pub.reset();
+            mlkem768_pub.reset();
         }
-        if (nak_at && now - from_epoch_s(*nak_at) < Core::PFS_KEY_NAK_DURATION)
-            return PfsKeyState::nak;
-        return PfsKeyState::none;
+
+        // The one place the cache's rule is read; see PfsKeyState.
+        PfsKeyState state() const {
+            bool due = clock_now_s() >= cache_expiry;
+            if (has_key())
+                return due ? PfsKeyState::refresh_due : PfsKeyState::usable;
+            return due ? PfsKeyState::none : PfsKeyState::nak;
+        }
+    };
+
+    std::optional<PfsCacheRow> read_pfs_row(
+            sqlite::Connection& conn, std::span<const std::byte, 33> session_id) {
+        using X = sqlite::blob_guts<b32>;
+        using M = sqlite::blob_guts<mlkem768_pubkey>;
+        auto row = conn.prepared_maybe_get<
+                int64_t,
+                std::optional<int64_t>,
+                int64_t,
+                std::optional<X>,
+                std::optional<M>>(
+                "SELECT checked_at, confirmed_at, cache_expiry, pubkey_x25519, pubkey_mlkem768"
+                " FROM pfs_key_cache WHERE session_id = ?",
+                session_id);
+        if (!row)
+            return std::nullopt;
+        auto& [checked_at, confirmed_at, cache_expiry, pk_x, pk_m] = *row;
+        PfsCacheRow r{
+                .checked_at = from_epoch_s(checked_at), .cache_expiry = from_epoch_s(cache_expiry)};
+        if (confirmed_at && pk_x && pk_m) {
+            r.confirmed_at = from_epoch_s(*confirmed_at);
+            r.x25519_pub = static_cast<const b32&>(*pk_x);
+            r.mlkem768_pub = static_cast<const mlkem768_pubkey&>(*pk_m);
+        }
+        return r;
+    }
+
+    void write_pfs_row(
+            sqlite::Connection& conn,
+            std::span<const std::byte, 33> session_id,
+            const PfsCacheRow& r) {
+        conn.prepared_exec(
+                "INSERT OR REPLACE INTO pfs_key_cache (session_id, checked_at, confirmed_at,"
+                " cache_expiry, pubkey_x25519, pubkey_mlkem768) VALUES (?, ?, ?, ?, ?, ?)",
+                session_id,
+                epoch_seconds(r.checked_at),
+                r.confirmed_at ? std::optional{epoch_seconds(*r.confirmed_at)} : std::nullopt,
+                epoch_seconds(r.cache_expiry),
+                r.x25519_pub,
+                r.mlkem768_pub);
+    }
+
+    // Reads `session_id`'s row, has `update` say what it becomes, and writes that back, as one
+    // transaction.  IMMEDIATE because it reads before writing: a deferred transaction that has read
+    // cannot wait for the write lock -- SQLite fails the upgrade at once with SQLITE_BUSY rather
+    // than calling the busy handler -- so any other connection's write in that moment fails it.
+    template <std::invocable<const std::optional<PfsCacheRow>&> F>
+    void update_pfs_row(
+            sqlite::Connection& conn, std::span<const std::byte, 33> session_id, F&& update) {
+        SQLite::Transaction tx{conn.sql, SQLite::TransactionBehavior::IMMEDIATE};
+        write_pfs_row(conn, session_id, update(read_pfs_row(conn, session_id)));
+        tx.commit();
+    }
+
+    PfsKeyState pfs_key_state(const std::optional<PfsCacheRow>& row) {
+        return row ? row->state() : PfsKeyState::none;
+    }
+
+    bool lookup_due(PfsKeyState state) {
+        return state == PfsKeyState::none || state == PfsKeyState::refresh_due;
+    }
+
+    // Matches the pending sends to `recipient`, which must outlive the predicate.
+    auto sends_to(std::span<const std::byte, 33> recipient) {
+        return [recipient](const auto& pending) {
+            return std::ranges::equal(pending.recipient, recipient);
+        };
     }
 
 }  // namespace
 
-PfsKeyStatus Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
+PfsKeyState Core::prefetch_pfs_keys(std::span<const std::byte, 33> session_id) {
     if (!_network)
         throw std::logic_error{"prefetch_pfs_keys called without a network object"};
 
     b33 sid;
     std::ranges::copy(session_id, sid.begin());
-
-    std::optional<int64_t> fetched_at, nak_at;
-    if (auto row = db.conn().prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
-                "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?", sid))
-        std::tie(fetched_at, nak_at) = *row;
-
-    // Skip the fetch if the cached entry is still fresh, or a recent NAK suppresses retrying.  A
-    // key past fresh, however old, is reported stale: it is what a send uses until the fetch
-    // replaces it.
-    auto state = pfs_key_state(fetched_at, nak_at);
-    if (state == PfsKeyState::fresh || state == PfsKeyState::nak) {
-        log::debug(cat, "prefetch_pfs_keys: fresh key or recent NAK for {}, skipping", session_id);
-        return state == PfsKeyState::fresh ? PfsKeyStatus::fresh : PfsKeyStatus::nak;
+    auto conn = db.conn();
+    auto state = pfs_key_state(read_pfs_row(conn, sid));
+    if (lookup_due(state)) {
+        log::debug(cat, "prefetch_pfs_keys: a lookup of {} is due", session_id);
+        call_get([this, &sid] { _fetch_pfs_keys(sid); });
     }
-    log::debug(cat, "prefetch_pfs_keys: nothing fresh cached for {}, fetching", session_id);
-    call_get([this, &sid] { _fetch_pfs_keys(sid); });
-    return state == PfsKeyState::none ? PfsKeyStatus::fetching : PfsKeyStatus::stale;
+    return state;
 }
 
 PfsKeyInfo Core::pfs_key_info(std::span<const std::byte, 33> session_id) {
-    using X = sqlite::blob_guts<b32>;
-    using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
-    PfsKeyInfo info{.state = PfsKeyState::none};
-    auto row = db.conn()
-                       .prepared_maybe_get<
-                               std::optional<int64_t>,
-                               std::optional<int64_t>,
-                               std::optional<X>,
-                               std::optional<M>>(
-                               "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
-                               " FROM pfs_key_cache WHERE session_id = ?",
-                               session_id);
+    b33 sid;
+    std::ranges::copy(session_id, sid.begin());
+    PfsKeyInfo info{.fetching = call_get([this, &sid] { return _pfs_fetching.contains(sid); })};
+    auto conn = db.conn();
+    auto row = read_pfs_row(conn, sid);
     if (!row)
         return info;
-    auto& [fetched_at, nak_at, pk_x, pk_m] = *row;
-    info.state = pfs_key_state(fetched_at, nak_at);
-    if (pk_x && pk_m) {
-        info.x25519_pub = static_cast<const b32&>(*pk_x);
-        info.mlkem768_pub = static_cast<const std::array<std::byte, 1184>&>(*pk_m);
-    }
-    if (fetched_at)
-        info.fetched_at = from_epoch_s(*fetched_at);
-    if (nak_at)
-        info.nak_at = from_epoch_s(*nak_at);
+    info.state = row->state();
+    info.x25519_pub = row->x25519_pub;
+    info.mlkem768_pub = row->mlkem768_pub;
+    info.checked_at = row->checked_at;
+    info.confirmed_at = row->confirmed_at;
+    info.cache_expiry = row->cache_expiry;
     return info;
 }
 
@@ -1523,76 +1584,84 @@ bool Core::_store_pfs_keys(
         std::span<const std::byte, 33> session_id,
         std::span<const std::byte, 32> x25519_pub,
         std::span<const std::byte, 1184> mlkem768_pub) {
-    auto now_s = epoch_seconds(clock_now_s());
+    auto now = clock_now_s();
+    bool changed = false;
     auto conn = db.conn();
-    SQLite::Transaction tx{conn.sql};
-
-    bool is_unchanged = conn.prepared_maybe_get<int>(
-                                    R"(
-SELECT 1 FROM pfs_key_cache
-WHERE session_id = ? AND pubkey_x25519 = ? AND pubkey_mlkem768 = ?
-)",
-                                    session_id,
-                                    x25519_pub,
-                                    mlkem768_pub)
-                                .has_value();
-
-    conn.prepared_exec(
-            R"(
-INSERT INTO pfs_key_cache (session_id, fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768)
-VALUES (?, ?, NULL, ?, ?)
-ON CONFLICT(session_id) DO UPDATE SET
-    fetched_at = excluded.fetched_at,
-    pubkey_x25519 = excluded.pubkey_x25519,
-    pubkey_mlkem768 = excluded.pubkey_mlkem768
-)",
-            session_id,
-            now_s,
-            x25519_pub,
-            mlkem768_pub);
-    tx.commit();
-    return !is_unchanged;
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        changed = !held || !held->has_key() || !std::ranges::equal(*held->x25519_pub, x25519_pub) ||
+                  !std::ranges::equal(*held->mlkem768_pub, mlkem768_pub);
+        PfsCacheRow row{
+                .checked_at = now,
+                .confirmed_at = now,
+                .cache_expiry = now + PFS_KEY_REFRESH,
+                .x25519_pub = b32{},
+                .mlkem768_pub = mlkem768_pubkey{}};
+        std::ranges::copy(x25519_pub, row.x25519_pub->begin());
+        std::ranges::copy(mlkem768_pub, row.mlkem768_pub->begin());
+        return row;
+    });
+    return changed;
 }
 
-void Core::_store_pfs_nak(std::span<const std::byte, 33> session_id) {
-    auto now_s = epoch_seconds(clock_now_s());
-    db.conn().prepared_exec(
-            R"(
-INSERT INTO pfs_key_cache (session_id, fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768)
-VALUES (?, NULL, ?, NULL, NULL)
-ON CONFLICT(session_id) DO UPDATE SET nak_at = excluded.nak_at
-)",
-            session_id,
-            now_s);
+void Core::_store_pfs_empty(std::span<const std::byte, 33> session_id) {
+    auto now = clock_now_s();
+    auto conn = db.conn();
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        auto row = held.value_or(PfsCacheRow{});
+        if (row.has_key() && now - *row.confirmed_at < PFS_KEY_EMPTY_GRACE)
+            row.confirmed_at = now;
+        else
+            row.drop_key();
+        row.checked_at = now;
+        row.cache_expiry = now + PFS_KEY_EMPTY_HOLD;
+        return row;
+    });
 }
 
-void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string body) {
-    try {
+bool Core::_store_pfs_failed(std::span<const std::byte, 33> session_id) {
+    auto now = clock_now_s();
+    bool usable = false;
+    auto conn = db.conn();
+    update_pfs_row(conn, session_id, [&](const std::optional<PfsCacheRow>& held) {
+        // A new row records only that a lookup was made: created already due, so that the state
+        // stays `none`.  A keyless row's expiry is left alone, since what an earlier empty answer
+        // said still holds.  A held key past the grace is made due at once: a refetch can fail
+        // inside its expiry.
+        auto row = held.value_or(PfsCacheRow{.cache_expiry = now});
+        usable = row.has_key() && now - *row.confirmed_at < PFS_KEY_FAILED_GRACE;
+        if (usable)
+            row.cache_expiry = now + PFS_KEY_FAILED_HOLD;
+        else if (row.has_key())
+            row.cache_expiry = std::min(row.cache_expiry, now);
+        row.checked_at = now;
+        return row;
+    });
+    return usable;
+}
+
+namespace {
+
+    struct AccountPubkeys {
+        b32 x25519;
+        mlkem768_pubkey mlkem768;
+    };
+
+    // The last validly signed keys in a retrieve of `sid`'s AccountPubkeys namespace, or nullopt
+    // when it holds none.  Throws when the response cannot be read at all, which is a failed lookup
+    // rather than an empty one.
+    std::optional<AccountPubkeys> parse_account_pubkeys(
+            std::span<const std::byte, 33> sid, std::string_view body) {
         auto json = nlohmann::json::parse(body);
         auto msgs_it = json.find("messages");
-        if (msgs_it == json.end() || !msgs_it->is_array()) {
-            log::warning(
-                    cat,
-                    "prefetch_pfs_keys: response missing or invalid "
-                    "'messages' array");
-            return;
-        }
+        if (msgs_it == json.end() || !msgs_it->is_array())
+            throw std::runtime_error{"response missing or invalid 'messages' array"};
 
-        // Strip the 0x05 prefix to get the x25519 pubkey for
-        // signature verification.
         auto x25519_pub = sid.subspan<1>();
-
-        // Track the most recently valid pubkeys seen across all messages.
-        std::optional<std::array<std::byte, 32>> pk_x25519;
-        std::optional<std::array<std::byte, MLKEM768_PUBLICKEYBYTES>> pk_mlkem768;
-
+        std::optional<AccountPubkeys> found;
         for (const auto& msg : *msgs_it) {
             auto data_it = msg.find("data");
             if (data_it == msg.end() || !data_it->is_string()) {
-                log::warning(
-                        cat,
-                        "prefetch_pfs_keys: message missing or "
-                        "non-string 'data' field");
+                log::warning(cat, "PFS key fetch: message missing or non-string 'data' field");
                 continue;
             }
             auto b64 = data_it->get<std::string_view>();
@@ -1611,32 +1680,33 @@ void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string 
                                 !xed25519::verify(sig.first<64>(), x25519_pub, b))
                                 throw std::runtime_error{"signature verification failed"};
                         });
-                std::ranges::copy(X, pk_x25519.emplace().begin());
-                std::ranges::copy(M, pk_mlkem768.emplace().begin());
+                auto& keys = found.emplace();
+                std::ranges::copy(X, keys.x25519.begin());
+                std::ranges::copy(M, keys.mlkem768.begin());
             } catch (const std::exception& e) {
-                log::warning(
-                        cat,
-                        "Ignoring malformed remote account pubkey "
-                        "message: {}",
-                        e.what());
+                log::warning(cat, "Ignoring malformed remote account pubkey message: {}", e.what());
             }
         }
-
-        if (!pk_x25519 || !pk_mlkem768) {
-            log::debug(
-                    cat,
-                    "prefetch_pfs_keys: no valid account pubkey message "
-                    "found in response");
-            _store_pfs_nak(sid);
-            _pfs_fetch_done(sid, PfsKeyFetch::not_found);
-            return;
-        }
-
-        bool changed = _store_pfs_keys(sid, *pk_x25519, *pk_mlkem768);
-        _pfs_fetch_done(sid, changed ? PfsKeyFetch::new_key : PfsKeyFetch::unchanged);
-    } catch (const std::exception& e) {
-        log::warning(cat, "Failed to process PFS key fetch response: {}", e.what());
+        return found;
     }
+
+}  // namespace
+
+void Core::_handle_pfs_response(std::span<const std::byte, 33> sid, std::string body) {
+    auto result = PfsKeyFetch::failed;
+    try {
+        if (auto keys = parse_account_pubkeys(sid, body)) {
+            result = _store_pfs_keys(sid, keys->x25519, keys->mlkem768) ? PfsKeyFetch::new_key
+                                                                        : PfsKeyFetch::unchanged;
+        } else {
+            log::debug(cat, "PFS key fetch: no valid account pubkey message for {}", sid);
+            _store_pfs_empty(sid);
+            result = PfsKeyFetch::not_found;
+        }
+    } catch (const std::exception& e) {
+        log::warning(cat, "Failed to process PFS key fetch response for {}: {}", sid, e.what());
+    }
+    _pfs_fetch_done(sid, result);
 }
 
 void Core::delete_from_swarm(
@@ -1820,28 +1890,12 @@ void Core::_do_send_dm(
         }
     };
 
-    // Look up cached PFS keys for the recipient.
-    using X = sqlite::blob_guts<b32>;
-    using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
-    auto row = db.conn()
-                       .prepared_maybe_get<
-                               std::optional<int64_t>,
-                               std::optional<int64_t>,
-                               std::optional<X>,
-                               std::optional<M>>(
-                               "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
-                               " FROM pfs_key_cache WHERE session_id = ?",
-                               recipient);
-
-    const b32* pfs_x25519 = nullptr;
-    const std::array<std::byte, 1184>* pfs_mlkem768 = nullptr;
-    if (row) {
-        auto& [fetched_at, nak_at, pk_x, pk_m] = *row;
-        if (fetched_at && pk_x && pk_m) {
-            pfs_x25519 = &static_cast<const b32&>(*pk_x);
-            pfs_mlkem768 = &static_cast<const std::array<std::byte, 1184>&>(*pk_m);
-        }
-    }
+    // Whatever key the row holds is one the rule says to send with: send_dm sends at once only when
+    // the row is `usable` or `nak`, and _pfs_fetch_done releases a waiting send only once the
+    // lookup's outcome has left it holding a key to use, or none.
+    auto conn = db.conn();
+    auto row = read_pfs_row(conn, recipient);
+    bool pfs = row && row->has_key();
 
     // Encrypt the message.  v2 (PFS or nopfs) produces the complete wire format directly
     // (0x00 0x02 | ki | E | mlkem_ct | encrypted_inner) — no protobuf wrapping.  v1 uses
@@ -1852,9 +1906,9 @@ void Core::_do_send_dm(
         auto seed = globals.account_seed();
         auto ed_sec = seed.ed25519_secret();
 
-        if (pfs_x25519) {
+        if (pfs) {
             payload = encrypt_for_recipient_v2(
-                    ed_sec, recipient, *pfs_x25519, *pfs_mlkem768, content, pro_privkey);
+                    ed_sec, recipient, *row->x25519_pub, *row->mlkem768_pub, content, pro_privkey);
             encryption = MessageEncryption::v2_pfs;
         } else if (force_v2) {
             payload = encrypt_for_recipient_v2_nopfs(ed_sec, recipient, content, pro_privkey);
@@ -1910,6 +1964,18 @@ void Core::_do_send_dm(
 void Core::_pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetch result) {
     b33 sid;
     std::ranges::copy(session_id, sid.begin());
+
+    // Recorded before the lookup stops counting as in flight, so that nothing reads the row a
+    // lookup is about to replace as though none were coming.
+    bool release = true;
+    if (result == PfsKeyFetch::failed) {
+        try {
+            release = _store_pfs_failed(sid);
+        } catch (const std::exception& e) {
+            log::error(cat, "Unable to record a failed PFS key fetch for {}: {}", sid, e.what());
+            release = false;
+        }
+    }
     _pfs_fetching.erase(sid);
 
     if (callbacks.pfs_keys_fetched) {
@@ -1920,28 +1986,89 @@ void Core::_pfs_fetch_done(std::span<const std::byte, 33> session_id, PfsKeyFetc
             log::error(cat, "pfs_keys_fetched callback threw: {}", e.what());
         }
     }
-    _flush_pending_sends(session_id);
+
+    if (release) {
+        _pfs_retries.erase(sid);
+        _flush_pending_sends(session_id);
+    } else {
+        _schedule_pfs_retry(sid);
+    }
+}
+
+void Core::_schedule_pfs_retry(const b33& session_id) {
+    // Ids rather than the sends, since a status callback may queue another send.
+    std::vector<int64_t> waiting;
+    for (const auto& p : _pending_sends | std::views::filter(sends_to(session_id)))
+        waiting.push_back(p.id);
+    if (waiting.empty()) {
+        _pfs_retries.erase(session_id);
+        return;
+    }
+    if (callbacks.message_send_status)
+        for (auto id : waiting) {
+            try {
+                callbacks.message_send_status(
+                        id, MessageSendStatus::retrying, std::nullopt, std::nullopt);
+            } catch (const std::exception& e) {
+                log::error(cat, "message_send_status callback threw: {}", e.what());
+            }
+        }
+
+    auto& retry = _pfs_retries[session_id];
+    if (retry.due)
+        return;
+    log::info(
+            cat,
+            "PFS key fetch for {} failed with sends waiting on it; retrying in {}",
+            session_id,
+            retry.backoff);
+    auto due = clock_now_ms() + retry.backoff;
+    retry.due = due;
+    // A retry superseded meanwhile -- by a lookup that succeeded, or one fired early -- finds a
+    // different `due`, or none, and does nothing.
+    _jq.call_later(retry.backoff, [this, session_id, due] {
+        if (auto it = _pfs_retries.find(session_id);
+            it != _pfs_retries.end() && it->second.due == due)
+            _retry_pfs_fetch(session_id);
+    });
+    retry.backoff = std::min(retry.backoff * 2, PFS_FETCH_RETRY_MAX);
+}
+
+void Core::_retry_pfs_fetch(const b33& session_id) {
+    auto it = _pfs_retries.find(session_id);
+    if (it == _pfs_retries.end())
+        return;
+    it->second.due.reset();
+    if (std::ranges::none_of(_pending_sends, sends_to(session_id))) {
+        _pfs_retries.erase(it);
+        return;
+    }
+    log::debug(cat, "Retrying the PFS key fetch for {}", session_id);
+    _fetch_pfs_keys(session_id);
 }
 
 void Core::_flush_pending_sends(std::span<const std::byte, 33> session_id) {
-    auto it = _pending_sends.begin();
-    while (it != _pending_sends.end()) {
-        if (std::ranges::equal(it->recipient, session_id)) {
-            auto pending = std::move(*it);
+    // Taken out before any is sent: a send's status callback may queue another.
+    std::vector<PendingSend> ready;
+    auto is_ready = sends_to(session_id);
+    for (auto it = _pending_sends.begin(); it != _pending_sends.end();) {
+        if (is_ready(*it)) {
+            ready.push_back(std::move(*it));
             it = _pending_sends.erase(it);
-            _do_send_dm(
-                    pending.id,
-                    pending.recipient,
-                    pending.content,
-                    pending.sent_timestamp,
-                    pending.pro_privkey ? ed25519::OptionalPrivKeySpan{*pending.pro_privkey}
-                                        : ed25519::OptionalPrivKeySpan{},
-                    pending.ttl,
-                    pending.force_v2);
         } else {
             ++it;
         }
     }
+    for (auto& pending : ready)
+        _do_send_dm(
+                pending.id,
+                pending.recipient,
+                pending.content,
+                pending.sent_timestamp,
+                pending.pro_privkey ? ed25519::OptionalPrivKeySpan{*pending.pro_privkey}
+                                    : ed25519::OptionalPrivKeySpan{},
+                pending.ttl,
+                pending.force_v2);
 }
 
 int64_t Core::send_dm(
@@ -1951,39 +2078,31 @@ int64_t Core::send_dm(
         const ed25519::OptionalPrivKeySpan& pro_privkey,
         std::chrono::milliseconds ttl,
         bool force_v2) {
-    auto id = _next_message_id++;
+    // On the loop, which owns the pending sends and the lookups they wait on.
+    return call_get([&] {
+        auto id = _next_message_id++;
 
-    log::debug(
-            cat,
-            "send_dm: message {} to {} ({}B content)",
-            id,
-            oxenc::to_hex(recipient_session_id),
-            content.size());
+        log::debug(
+                cat,
+                "send_dm: message {} to {} ({}B content)",
+                id,
+                oxenc::to_hex(recipient_session_id),
+                content.size());
 
-    // Check cache state to decide whether we can send immediately or must queue.
-    auto conn = db.conn();
-    auto row = conn.prepared_maybe_get<std::optional<int64_t>, std::optional<int64_t>>(
-            "SELECT fetched_at, nak_at FROM pfs_key_cache WHERE session_id = ?",
-            recipient_session_id);
+        auto conn = db.conn();
+        if (!lookup_due(pfs_key_state(read_pfs_row(conn, recipient_session_id)))) {
+            _do_send_dm(
+                    id, recipient_session_id, content, sent_timestamp, pro_privkey, ttl, force_v2);
+            return id;
+        }
+        if (!_network) {
+            if (callbacks.message_send_status)
+                callbacks.message_send_status(
+                        id, MessageSendStatus::no_network, std::nullopt, std::nullopt);
+            return id;
+        }
 
-    bool have_cached_key = false;
-    bool is_nak = false;
-
-    if (row) {
-        auto& [fetched_at, nak_at] = *row;
-        if (fetched_at)
-            have_cached_key = true;
-        else if (nak_at)
-            is_nak = true;
-    }
-
-    if (have_cached_key || is_nak) {
-        // Can send immediately: either we have keys (use v2 PFS) or it's a NAK (use v1 or v2
-        // nopfs).
-        _do_send_dm(id, recipient_session_id, content, sent_timestamp, pro_privkey, ttl, force_v2);
-    } else if (_network) {
-        // No cache entry at all: need to fetch keys first.  Queue the send and initiate a
-        // prefetch; _pfs_fetch_done() releases it when the fetch settles, whatever the outcome.
+        // _pfs_fetch_done releases it once the lookup's outcome says how to encrypt it.
         PendingSend pending;
         pending.id = id;
         std::ranges::copy(recipient_session_id, pending.recipient.begin());
@@ -1997,19 +2116,22 @@ int64_t Core::send_dm(
         pending.force_v2 = force_v2;
         _pending_sends.push_back(std::move(pending));
 
+        // One arriving while a failed lookup's retry is scheduled waits for that retry, so that a
+        // burst of sends cannot undo the backoff.
+        b33 sid;
+        std::ranges::copy(recipient_session_id, sid.begin());
+        auto retry = _pfs_retries.find(sid);
+        bool join_retry = retry != _pfs_retries.end() && retry->second.due;
         if (callbacks.message_send_status)
             callbacks.message_send_status(
-                    id, MessageSendStatus::awaiting_keys, std::nullopt, std::nullopt);
-
-        prefetch_pfs_keys(recipient_session_id);
-    } else {
-        // No cache and no network: fire immediate failure.
-        if (callbacks.message_send_status)
-            callbacks.message_send_status(
-                    id, MessageSendStatus::no_network, std::nullopt, std::nullopt);
-    }
-
-    return id;
+                    id,
+                    join_retry ? MessageSendStatus::retrying : MessageSendStatus::awaiting_keys,
+                    std::nullopt,
+                    std::nullopt);
+        if (!join_retry)
+            _fetch_pfs_keys(sid);
+        return id;
+    });
 }
 
 int64_t Core::send_dm(

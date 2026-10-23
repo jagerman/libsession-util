@@ -407,13 +407,16 @@ TEST_CASE(
     REQUIRE(net->sent_requests.size() == 1);
     CHECK(net->sent_requests[0].request.endpoint == "retrieve");
 
-    // A *failed* fetch must still release the send rather than stranding it forever.
+    // A failed fetch holds it, with no key to fall back on, until a retry settles it.
     REQUIRE(fail_retrieves(*net) == 1);
+    CHECK(stores(*net).empty());
+    CHECK(statuses.back() == MessageSendStatus::retrying);
 
-    REQUIRE(fetches.size() == 1);
-    CHECK(fetches[0] == PfsKeyFetch::failed);
+    TestHelper::fire_pfs_retry(*sender, DUMMY_SID);
+    REQUIRE(answer_retrieves(*net) == 1);
+
+    CHECK(fetches == std::vector{PfsKeyFetch::failed, PfsKeyFetch::not_found});
     REQUIRE(accept_stores(*net) == 1);
-    REQUIRE(statuses.size() >= 2);
     CHECK(statuses.back() == MessageSendStatus::success);
 }
 
@@ -438,7 +441,7 @@ TEST_CASE(
 
     // Settling one fetch drains the whole queue for that recipient, even though each send asked
     // for the keys in its own right.
-    REQUIRE(fail_retrieves(*net, 1) == 1);
+    REQUIRE(answer_retrieves(*net, {}, 1) == 1);
 
     CHECK(stores(*net).size() == 3);
     CHECK(fetches.size() == 1);
@@ -460,6 +463,6 @@ TEST_CASE(
     sender->send_dm(DUMMY_SID, content_bytes(), clock_now_ms());
     REQUIRE(!net->sent_requests.empty());
 
-    CHECK_NOTHROW(fail_retrieves(*net));
+    CHECK_NOTHROW(answer_retrieves(*net));
     CHECK(stores(*net).size() == 1);
 }

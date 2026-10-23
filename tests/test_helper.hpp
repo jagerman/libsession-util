@@ -466,7 +466,26 @@ inline size_t accept_stores(MockNetwork& net) {
     return answer_stores(net, true);
 }
 
-/// Times out captured key fetches, which is what releases a send queued behind one.
+/// Answers captured key fetches with these AccountPubkeys messages, or with none: the lookup that
+/// found nothing, which releases a send queued behind it with the non-PFS encryption when no key is
+/// held.
+inline size_t answer_retrieves(
+        MockNetwork& net,
+        const std::vector<std::vector<std::byte>>& messages = {},
+        size_t max = std::numeric_limits<size_t>::max()) {
+    return answer_requests(
+            net,
+            "retrieve",
+            [&](MockNetwork::SentRequest& r) {
+                auto body = retrieved_body();
+                for (const auto& m : messages)
+                    body["messages"].push_back(retrieved_message(m, "pubkeys"));
+                r.callback(true, false, 200, {}, body.dump());
+            },
+            max);
+}
+
+/// Times out captured key fetches: a failed lookup.
 inline size_t fail_retrieves(MockNetwork& net, size_t max = std::numeric_limits<size_t>::max()) {
     return answer_requests(
             net,
@@ -954,15 +973,6 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return {x25519, mlkem768};
     }
 
-    // Cached PFS key entry as stored in the pfs_key_cache table.
-    // fetched_at and pubkeys are nullopt when the entry is a NAK (no valid keys).
-    struct PfsCacheEntry {
-        std::optional<int64_t> fetched_at;
-        std::optional<int64_t> nak_at;
-        std::optional<std::array<std::byte, 32>> pubkey_x25519;
-        std::optional<std::array<std::byte, 1184>> pubkey_mlkem768;
-    };
-
     // Returns true if any swarm node has handed us a hash in the given namespace.  Used by live
     // tests to detect that a poll completed and delivered at least one message.
     static bool has_any_namespace_sync(core::Core& core, config::Namespace ns) {
@@ -971,7 +981,8 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         return count > 0;
     }
 
-    // Seeds the pfs_key_cache with PFS keys for a remote session_id.
+    // Records a lookup of `remote_session_id` that found these keys: `usable` for
+    // PFS_KEY_REFRESH.
     static void seed_pfs_cache(
             core::Core& core,
             std::span<const std::byte, 33> remote_session_id,
@@ -980,34 +991,28 @@ SELECT h.expiry FROM swarm_hashes h JOIN swarm_nodes n ON n.id = h.node
         core._store_pfs_keys(remote_session_id, x25519_pub, mlkem768_pub);
     }
 
-    // Seeds a NAK entry in the pfs_key_cache (remote has no published PFS keys).
+    // Records a lookup of `remote_session_id` that found nothing: `nak` for PFS_KEY_EMPTY_HOLD,
+    // so that sends to them go out at once with the non-PFS encryption.  With a key already held
+    // it re-confirms that instead, as the real outcome does.
     static void seed_pfs_nak(core::Core& core, std::span<const std::byte, 33> remote_session_id) {
-        core._store_pfs_nak(remote_session_id);
+        core._store_pfs_empty(remote_session_id);
     }
 
-    // Returns the pfs_key_cache entry for the given session_id, or nullopt if absent.
-    static std::optional<PfsCacheEntry> pfs_cache_entry(
+    // The scheduled retry of a failed lookup of `session_id` that sends wait on, if any.
+    static std::optional<sys_ms> pfs_retry_due(
             core::Core& core, std::span<const std::byte, 33> session_id) {
-        using X = sqlite::blob_guts<std::array<std::byte, 32>>;
-        using M = sqlite::blob_guts<std::array<std::byte, 1184>>;
-        auto row = core.db.conn()
-                           .prepared_maybe_get<
-                                   std::optional<int64_t>,
-                                   std::optional<int64_t>,
-                                   std::optional<X>,
-                                   std::optional<M>>(
-                                   "SELECT fetched_at, nak_at, pubkey_x25519, pubkey_mlkem768"
-                                   " FROM pfs_key_cache WHERE session_id = ?",
-                                   session_id);
-        if (!row)
-            return std::nullopt;
-        auto [fetched_at, nak_at, pk_x25519, pk_mlkem768] = *row;
-        return PfsCacheEntry{
-                fetched_at,
-                nak_at,
-                pk_x25519 ? std::optional{(std::array<std::byte, 32>)*pk_x25519} : std::nullopt,
-                pk_mlkem768 ? std::optional{(std::array<std::byte, 1184>)*pk_mlkem768}
-                            : std::nullopt};
+        b33 sid;
+        std::ranges::copy(session_id, sid.begin());
+        return core.call_get([&]() -> std::optional<sys_ms> {
+            auto it = core._pfs_retries.find(sid);
+            return it == core._pfs_retries.end() ? std::nullopt : it->second.due;
+        });
+    }
+    // Runs the scheduled retry now rather than after its backoff.
+    static void fire_pfs_retry(core::Core& core, std::span<const std::byte, 33> session_id) {
+        b33 sid;
+        std::ranges::copy(session_id, sid.begin());
+        core.call_get([&] { core._retry_pfs_fetch(sid); });
     }
 };
 

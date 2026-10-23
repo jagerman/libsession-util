@@ -114,9 +114,9 @@ class update_throttle {
 
 static SendState state_for(core::MessageSendStatus status) {
     switch (status) {
-        case core::MessageSendStatus::awaiting_keys: return SendState::pending;
-        case core::MessageSendStatus::sending:
-        case core::MessageSendStatus::retrying: return SendState::sending;
+        case core::MessageSendStatus::awaiting_keys:
+        case core::MessageSendStatus::retrying: return SendState::pending;
+        case core::MessageSendStatus::sending: return SendState::sending;
         case core::MessageSendStatus::success: return SendState::sent;
         case core::MessageSendStatus::network_error:
         case core::MessageSendStatus::no_network:
