@@ -40,6 +40,15 @@ never retries a message on its own — `MessageSendStatus::retrying` is declared
 implemented — so the policy belongs to the client. Only while the bot runs, though: a reply still
 unsent when it exits is left alone on the next start.
 
+The bot publishes its account's PFS/PQ keys, so a client that supports them messages it with
+forward-secret, post-quantum encryption; older clients carry on as before.  A new account has this
+from the start, and the bot turns it on for an older one too.  Only a member of the account's
+device group publishes the keys, so a bot with no group in its swarm starts one, with itself as
+the only device.  Any other group state it finds -- a group it is not in, or one that has dropped
+it -- means another copy of the account is in use somewhere: the bot logs a warning and does not
+publish, since starting a group over the other copy's would dissolve it, and which copy is the
+real bot is for whoever runs it to decide.
+
 `authorized = ALL` in place of a session ID lets anyone who messages the bot run the command.
 
 No shell is involved: the message body is split into arguments (with shell-style quoting, so

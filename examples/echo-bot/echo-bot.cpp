@@ -58,6 +58,7 @@ using session::client::Client;
 using session::client::ConversationId;
 using session::client::Message;
 using session::client::SendState;
+namespace device = session::core::device;
 
 auto cat = oxen::log::Cat("echo-bot");
 
@@ -429,7 +430,10 @@ std::string format_reply(const CommandResult& r, std::chrono::seconds timeout) {
 
 // -- The bot --------------------------------------------------------------------------------
 
-class EchoBot {
+/// Also the Client's device-group handler: publishing the account's PFS/PQ keys is done only by a
+/// member of the account's device group, so the bot -- its account's only device -- has to see to
+/// being in one.
+class EchoBot : session::core::DeviceEvents {
   public:
     explicit EchoBot(Config config) : _config{std::move(config)} {
         _client = std::make_unique<Client>(
@@ -445,7 +449,22 @@ class EchoBot {
                                     for (auto& msg : msgs)
                                         _on_send_state(std::move(msg));
                                 },
+                        .devices = this,
+                        .rogue_account_key =
+                                [] {
+                                    oxen::log::warning(
+                                            cat,
+                                            "Someone else is publishing PFS/PQ keys for this "
+                                            "account: another copy of its database or seed is in "
+                                            "use elsewhere");
+                                },
                 });
+
+        // An account created since new accounts started out with PFS/PQ already has it; this is
+        // for one older than that.  Nothing argues for holding it back: what that waits on is the
+        // user confirming no device of theirs is too old to read the messages, and the bot is its
+        // account's only device.
+        _client->core.enable_pfs();
 
         fmt::print("Session ID: {}\n", _client->core.globals.session_id_hex());
         fmt::print(
@@ -491,6 +510,66 @@ class EchoBot {
         std::string conversation;  // For the log line only; the message knows where it belongs.
         int attempt;
     };
+
+    // -- Device group, on Core's event loop --
+    //
+    // Every state but `InGroup` and `NoGroup` means some other device holds this account's seed --
+    // a copy of the database, say -- since the bot never asks to join a group or admits anyone to
+    // its own.  Resolving that means deciding which copy is the bot, which is the operator's call:
+    // starting a group over the other's would dissolve it, so the bot reports it and does nothing.
+
+    void membership_changed(device::Membership m) override {
+        using enum device::Membership;
+        if (m == InGroup) {
+            oxen::log::info(cat, "In the account's device group: PFS/PQ keys are published");
+            return;
+        }
+        if (m != NoGroup) {
+            oxen::log::warning(
+                    cat,
+                    "Device group membership is {}: another copy of this account is in use, and "
+                    "this one will not publish PFS/PQ keys until that is resolved",
+                    membership_name(m));
+            return;
+        }
+        // No group in the swarm, so starting one dissolves nothing.  An account made before device
+        // groups never had one, and a group expires from the swarm if the bot is down long enough.
+        oxen::log::info(cat, "No device group in the swarm; starting one to publish PFS/PQ keys");
+        _client->core.devices.start_device_group({}, [](session::Expected<device::GroupId> r) {
+            if (!r)
+                oxen::log::error(cat, "Unable to start a device group: {}", r.error().message);
+        });
+    }
+
+    void link_request_added(device::LinkRequest req) override {
+        oxen::log::warning(
+                cat,
+                "Ignoring a request from device \"{}\" to link to this account: only a holder of "
+                "its seed can make one",
+                req.device.description);
+    }
+
+    void link_request_ended(int, device::LinkRequestEnd) override {}
+    void devices_replaced(device::map) override {}
+    void device_membership_changed(device::Info) override {}
+
+    static std::string_view membership_name(device::Membership m) {
+        using enum device::Membership;
+        switch (m) {
+            case Unknown: return "Unknown";
+            case InGroup: return "InGroup";
+            case NoGroup: return "NoGroup";
+            case DeviceGroupVisible: return "DeviceGroupVisible";
+            case Requesting: return "Requesting";
+            case Approved: return "Approved";
+            case Removed: return "Removed";
+            case Displaced: return "Displaced";
+            case Dissolved: return "Dissolved";
+            case Forked: return "Forked";
+            case Dropped: return "Dropped";
+        }
+        return "?";
+    }
 
     /// Runs on Core's event loop, so it only decides what to do and hands it to the worker:
     /// running a command and waiting for the reply to be sent would stop Core polling, sending and
