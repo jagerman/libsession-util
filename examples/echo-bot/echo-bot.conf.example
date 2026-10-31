@@ -10,6 +10,11 @@ database = echo-bot.db
 # Where the network layer caches its service node pool.  Defaults to "<database>.cache".
 #cache_dir = echo-bot.db.cache
 
+# The bot's profile name: what people messaging it see it called.  Set on every start, so changing
+# it here and restarting renames the bot; an empty `name =` clears it.  Leave it unset and the bot
+# keeps whatever name its account already has.
+#name = Echo Bot
+
 # The command to run for messages from an authorized sender: a binary (looked up in $PATH if it is
 # not a path) and any arguments to pass it, quoted as in a shell.  No shell is involved in running
 # it, though: the arguments go to the binary directly, so shell syntax here or in a message means

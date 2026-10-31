@@ -39,6 +39,7 @@
 #include <mutex>
 #include <oxen/log.hpp>
 #include <session/client.hpp>
+#include <session/config/contacts.hpp>
 #include <session/network/network_opt.hpp>
 #include <session/network/session_network.hpp>
 #include <string>
@@ -79,6 +80,9 @@ constexpr auto AUTHORIZE_ALL = "ALL"sv;
 struct Config {
     fs::path database = "echo-bot.db";
     fs::path cache_dir;  // Defaults to "<database>.cache"
+    /// The profile name to set at startup; unset leaves whatever the account has alone, and empty
+    /// clears it.
+    std::optional<std::string> name;
     /// The command to run, already split into arguments.  A bare `ARGS` argument among them is
     /// where the message's own arguments go; with none, the message is only the trigger and the
     /// command runs with exactly what is configured here.
@@ -196,7 +200,16 @@ Config parse_config(const fs::path& path) {
                 cfg.database = value;
             else if (key == "cache_dir")
                 cfg.cache_dir = value;
-            else if (key == "command")
+            else if (key == "name") {
+                // Checked here rather than left to the profile to refuse, so that a name too long
+                // fails at startup with the line it came from.
+                if (value.size() > session::config::contact_info::MAX_NAME_LENGTH)
+                    throw std::runtime_error{fmt::format(
+                            "name is {} bytes; the most a profile name can be is {}",
+                            value.size(),
+                            session::config::contact_info::MAX_NAME_LENGTH)};
+                cfg.name = value;
+            } else if (key == "command")
                 cfg.command = split_args(value);
             else if (key == "authorized") {
                 if (value == AUTHORIZE_ALL)
@@ -466,9 +479,16 @@ class EchoBot : session::core::DeviceEvents {
         // account's only device.
         _client->core.enable_pfs();
 
+        // Set every run rather than only when it differs: setting the name it already has changes
+        // nothing and pushes nothing.
+        if (_config.name)
+            _client->set_display_name(*_config.name, await);
+
+        auto name = _client->display_name(await);
         fmt::print("Session ID: {}\n", _client->core.globals.session_id_hex());
         fmt::print(
-                "Database:   {}\nCommand:    {}{}\nAuthorized: {}\n",
+                "Name:       {}\nDatabase:   {}\nCommand:    {}{}\nAuthorized: {}\n",
+                name.empty() ? "(none)" : name,
                 _config.database,
                 fmt::join(_config.command, " "),
                 _config.uses_args ? "" : "  (message arguments not passed: no ARGS)",

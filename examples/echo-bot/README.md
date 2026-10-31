@@ -40,6 +40,8 @@ never retries a message on its own — `MessageSendStatus::retrying` is declared
 implemented — so the policy belongs to the client. Only while the bot runs, though: a reply still
 unsent when it exits is left alone on the next start.
 
+`name` sets the bot's profile name at every start, so editing it and restarting renames the bot.
+
 The bot publishes its account's PFS/PQ keys, so a client that supports them messages it with
 forward-secret, post-quantum encryption; older clients carry on as before.  A new account has this
 from the start, and the bot turns it on for an older one too.  Only a member of the account's
